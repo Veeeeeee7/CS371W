@@ -1,0 +1,50 @@
+# columns a model may use. everything else in dataset_*.parquet is an
+# identifier or provenance metadata and must stay out.
+# split on tile_50km (or tile_100km), never on block_id or point level.
+# StreamCat metrics are catchment areal means, constant across a
+# ~1-3 km2 catchment -- catchment context, not point measurements.
+slope
+aspect_sin
+aspect_cos
+curvature
+tpi_300
+tri_300
+hand
+log10_upa
+tpi_broad
+landcover
+impervious
+gsw_occurrence
+water_frac_900m
+catch_area_km2
+nearest_stream_order
+drainage_density
+bfiws
+bficat
+hydrlcondws
+hydrlcondcat
+wetindexcat
+wetindexws
+kffactcat
+kffactws
+precip8110ws
+tmean8110ws
+tmean8110cat
+precip8110cat
+runoffws
+runoffcat
+clayws
+sandcat
+claycat
+sandws
+permcat
+permws
+log10_dist_river
+log10_dist_coast
+log10_upstream_area
+p100_24hr
+p100_60min
+p100_4day
+p2_24hr
+growth_100_2
+channel_slope

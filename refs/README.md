@@ -3,7 +3,9 @@
 40 papers, grouped by the role they play in the project. Filenames are
 `Short-Name__arXiv-ID.pdf`. ★ = read first.
 
-Companion file: **`LITERATURE-REVIEW.md`** — one paragraph per paper covering
+Companion files: **`FLOOD-DATASETS.md`** — flood modeling tasks, datasets and
+how they would fit this project (papers in `06-flood-modeling/`).
+**`LITERATURE-REVIEW.md`** — one paragraph per paper covering
 motivation, method, results and limitations, plus a synthesis of what the 40
 together establish. This file is the *why it matters here* index; that one is the
 papers on their own terms.

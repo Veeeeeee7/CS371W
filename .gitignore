@@ -1,3 +1,9 @@
 .obsidian/
 .DS_Store
 .venv/
+Claude outputs/
+docs/
+refs/
+CS371_Cho_Li/
+data/interim/
+data/raw/
