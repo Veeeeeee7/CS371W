@@ -1,0 +1,19 @@
+[aotil] date=2026-09-19 cells=FL:band:AE:0
+[aotil] scratch=/scratch/vmli3/cs371w
+[aotil] data=/scratch/vmli3/cs371w/data/processed  cells_dir=/scratch/vmli3/cs371w/aotil/cells  results=results/2026-09-19/aotil
+[aotil] models=300 device=cuda n_jobs=16 graph=knn knn=10
+[aotil] mus=0,0.1,0.3,1,3,10 fracs=0.05,0.10,0.25 iters=400 restarts=4
+[aotil] phases: zoo=1 gate=1 E0=1 E1=1 E2=1
+NVIDIA L4, 23034 MiB
+NVIDIA L4, 23034 MiB
+NVIDIA L4, 23034 MiB
+NVIDIA L4, 23034 MiB
+
+================ cell FL_band_AE_s0 ================
+---- zoo FL_band_AE_s0 ----
+!! FAILED: zoo FL_band_AE_s0
+
+---- gate (all cells present) ----
+!! FAILED: gate (all cells present)
+
+FAILED phases (2): zoo FL_band_AE_s0 gate (all cells present)

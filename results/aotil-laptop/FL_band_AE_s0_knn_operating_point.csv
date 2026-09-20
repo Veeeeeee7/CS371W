@@ -1,0 +1,2 @@
+cell,tag,split,graph,knn,frac,k,mu,method,n_sel_models,n_rep_models,r_full,r,p,rho,r_train,r_val,purity,P_hard,n_cc,largest_cc_frac,tiles,blocks,moran_I,jaccard_vs_smallest,reached_purity
+FL_band_AE_s0,FL_band_AE_s0_mu0_knn,random-split,knn,10,0.05,470,0.0,oodselect,14,6,0.6648520148243476,-0.20889149666058987,0.6912203138977508,-0.3142857142857143,-0.8407037572427939,0.47779063525642496,0.5109703274753338,0.5778723404255319,74,0.26382978723404255,15,72,0.4822685719724265,39.05106382978723,True

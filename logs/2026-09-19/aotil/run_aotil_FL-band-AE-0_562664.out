@@ -1,0 +1,135 @@
+[aotil] date=2026-09-19 cells=FL:band:AE:0
+[aotil] scratch=/scratch/vmli3/cs371w
+[aotil] data=/scratch/vmli3/cs371w/data/processed  cells_dir=/scratch/vmli3/cs371w/aotil/cells  results=results/2026-09-19/aotil
+[aotil] models=300 device=cuda n_jobs=16 graph=knn knn=10
+[aotil] mus=0,0.1,0.3,1,3,10 fracs=0.05,0.10,0.25 iters=400 restarts=4
+[aotil] phases: zoo=1 gate=1 E0=1 E1=1 E2=1
+NVIDIA L4, 23034 MiB
+NVIDIA L4, 23034 MiB
+NVIDIA L4, 23034 MiB
+NVIDIA L4, 23034 MiB
+
+================ cell FL_band_AE_s0 ================
+---- zoo FL_band_AE_s0 ----
+[FL] 98,578 rows | 45 features
+cell: protocol=band train=AE seed=0 models=300 device=cuda
+  train 22,658 | ID test 7,634 | OOD test 9,412 | tiles train 71 test 23
+  300 models in 35s
+saved /scratch/vmli3/cs371w/aotil/cells/FL_band_AE_s0.npz
+---- E0 FL_band_AE_s0 ----
+=== E0 point covariance: FL_band_AE_s0 (graph=knn, k=10) ===
+  n_points               9412
+  n_sel_models           180
+  c_mean                 0.0100
+  c_sd                   0.0203
+  frac_negative          0.2930
+  moran_I                0.6697
+  null_mean              0.0005
+  null_sd                0.0043
+  z                      156.3836
+  p_perm                 0.0050
+  n_blocks               312
+  n_blocks_negative      64
+  frac_blocks_negative   0.2051
+
+GO -- the per-point covariance is spatially clustered, so a coherent inverse region can exist. Proceed to the mu sweep.
+
+wrote results/2026-09-19/aotil/FL_band_AE_s0_knn_pointcov.parquet
+---- E1 FL_band_AE_s0 ----
+=== E1 mu sweep: FL_band_AE_s0 ===
+  300 models | 9,412 OOD points | graph=knn k=10 | device=cuda
+    [random-split] f=0.05 k=470 6 mu in 11s
+    [random-split] f=0.10 k=941 6 mu in 12s
+    [random-split] f=0.25 k=2,353 6 mu in 11s
+    [trees->others] f=0.05 k=470 6 mu in 9s
+    [trees->others] f=0.10 k=941 6 mu in 9s
+    [trees->others] f=0.25 k=2,353 6 mu in 9s
+    [others->trees] f=0.05 k=470 6 mu in 7s
+    [others->trees] f=0.10 k=941 6 mu in 7s
+    [others->trees] f=0.25 k=2,353 6 mu in 7s
+
+            n_cc                          purity                               r                         
+method      hard nullsel oodselect random   hard nullsel oodselect random   hard nullsel oodselect random
+frac mu                                                                                                  
+0.05 0.0   108.0   172.0     152.0  344.0  0.480   0.272     0.306  0.050 -0.296   0.056    -0.933  0.803
+     0.1   108.0   165.0     147.0  344.0  0.480   0.295     0.315  0.050 -0.296   0.045    -0.953  0.803
+     0.3   108.0   152.0     136.0  344.0  0.480   0.336     0.356  0.050 -0.296   0.081    -0.936  0.803
+     1.0   108.0   119.0     102.0  344.0  0.480   0.449     0.471  0.050 -0.296   0.162    -0.929  0.803
+     3.0   108.0    54.0      36.0  344.0  0.480   0.651     0.710  0.050 -0.296   0.308    -0.874  0.803
+     10.0  108.0    10.0      14.0  344.0  0.480   0.870     0.829  0.050 -0.296   0.392    -0.778  0.803
+0.10 0.0   186.0   184.0     116.0  489.0  0.489   0.455     0.536  0.107 -0.178   0.314    -0.774  0.819
+     0.1   186.0   172.0     111.0  489.0  0.489   0.458     0.537  0.107 -0.178   0.315    -0.774  0.819
+     0.3   186.0   179.0     111.0  489.0  0.489   0.471     0.547  0.107 -0.178   0.323    -0.771  0.819
+     1.0   186.0   160.0     100.0  489.0  0.489   0.506     0.572  0.107 -0.178   0.330    -0.765  0.819
+     3.0   186.0   109.0      79.0  489.0  0.489   0.614     0.635  0.107 -0.178   0.325    -0.742  0.819
+     10.0  186.0    37.0      30.0  489.0  0.489   0.786     0.794  0.107 -0.178   0.355    -0.665  0.819
+0.25 0.0   195.0   337.0     261.0  354.0  0.576   0.271     0.436  0.254  0.353   0.768    -0.364  0.861
+     0.1   195.0   363.0     304.0  354.0  0.576   0.275     0.435  0.254  0.353   0.804    -0.367  0.861
+     0.3   195.0   368.0     267.0  354.0  0.576   0.278     0.434  0.254  0.353   0.803    -0.387  0.861
+     1.0   195.0   372.0     287.0  354.0  0.576   0.273     0.442  0.254  0.353   0.792    -0.371  0.861
+     3.0   195.0   330.0     257.0  354.0  0.576   0.286     0.480  0.254  0.353   0.779    -0.400  0.861
+     10.0  195.0   312.0     191.0  354.0  0.576   0.351     0.593  0.254  0.353   0.698    -0.472  0.861
+
+--- coherent operating point (smallest mu with purity >= 0.5; purity is model-free, so this is not selection on the outcome) ---
+         cell  frac   mu      r  purity  n_cc  largest_cc_frac  tiles  reached_purity
+FL_band_AE_s0  0.05  3.0 -0.874   0.710    36            0.170     13            True
+FL_band_AE_s0  0.10  0.0 -0.774   0.536   116            0.157     22            True
+FL_band_AE_s0  0.25 10.0 -0.472   0.593   191            0.151     23            True
+
+wrote results/2026-09-19/aotil/FL_band_AE_s0_knn_sweep.csv
+---- E2 FL_band_AE_s0 ----
+=== E2 held-out-point transfer: FL_band_AE_s0 (graph=knn) ===
+  f=0.05 mu=0     r(H1)=-0.965 r(H2)=-0.711 random(H2)=+0.860 purity(H2)=0.668
+  f=0.05 mu=0.1   r(H1)=-0.938 r(H2)=-0.487 random(H2)=+0.860 purity(H2)=0.687
+  f=0.05 mu=0.3   r(H1)=-0.763 r(H2)=-0.587 random(H2)=+0.860 purity(H2)=0.698
+  f=0.05 mu=1     r(H1)=-0.812 r(H2)=-0.556 random(H2)=+0.860 purity(H2)=0.769
+  f=0.05 mu=3     r(H1)=-0.749 r(H2)=-0.640 random(H2)=+0.860 purity(H2)=0.820
+  f=0.05 mu=10    r(H1)=-0.709 r(H2)=-0.255 random(H2)=+0.860 purity(H2)=0.864
+  f=0.10 mu=0     r(H1)=-0.900 r(H2)=-0.689 random(H2)=+0.849 purity(H2)=0.685
+  f=0.10 mu=0.1   r(H1)=-0.901 r(H2)=-0.687 random(H2)=+0.849 purity(H2)=0.696
+  f=0.10 mu=0.3   r(H1)=-0.900 r(H2)=-0.692 random(H2)=+0.849 purity(H2)=0.697
+  f=0.10 mu=1     r(H1)=-0.888 r(H2)=-0.686 random(H2)=+0.849 purity(H2)=0.713
+  f=0.10 mu=3     r(H1)=-0.793 r(H2)=-0.633 random(H2)=+0.849 purity(H2)=0.794
+  f=0.10 mu=10    r(H1)=-0.662 r(H2)=-0.550 random(H2)=+0.849 purity(H2)=0.863
+  f=0.25 mu=0     r(H1)=-0.614 r(H2)=-0.447 random(H2)=+0.875 purity(H2)=0.827
+  f=0.25 mu=0.1   r(H1)=-0.613 r(H2)=-0.451 random(H2)=+0.875 purity(H2)=0.826
+  f=0.25 mu=0.3   r(H1)=-0.611 r(H2)=-0.448 random(H2)=+0.875 purity(H2)=0.839
+  f=0.25 mu=1     r(H1)=-0.612 r(H2)=-0.448 random(H2)=+0.875 purity(H2)=0.839
+  f=0.25 mu=3     r(H1)=-0.603 r(H2)=-0.448 random(H2)=+0.875 purity(H2)=0.846
+  f=0.25 mu=10    r(H1)=-0.571 r(H2)=-0.434 random(H2)=+0.875 purity(H2)=0.859
+
+Reading it: r(H1) is the selection's own points, r(H2) points it never saw.
+A point-type inversion collapses toward the random control at H2; a
+place-organised one survives. That collapse is itself the answer to the
+standing critique that OODSelect's subsets are fit to the points they are
+scored on.
+
+wrote results/2026-09-19/aotil/FL_band_AE_s0_knn_transfer.csv
+
+---- gate (all cells present) ----
+=== ID spread and aggregate ID->OOD correlation (full OOD set) ===
+         cell metric  n_models  id_min  id_max  id_spread  id_sd  pearson_probit  p_value
+FL_band_AE_s0   prob       300  0.5347  0.8512     0.3165 0.0775          0.8144 2.17e-72
+FL_band_AE_s0 acc@.5       300  0.5279  0.8694     0.3415 0.0765          0.7133 6.42e-48
+FL_band_AE_s0    auc       300  0.6240  0.9462     0.3222 0.0685          0.8160 6.82e-73
+
+=== GATE VERDICT (continuous per-example score) ===
+  FL_band_AE_s0          spread 0.317 ok          | r = +0.814 positive      -> OPEN
+
+=== model-count convergence (the paper's <1% rule) ===
+         cell  n_models  r_mean   r_sd  abs_delta_vs_full  converged
+FL_band_AE_s0        25  0.8339 0.0831             0.0195      False
+FL_band_AE_s0        50  0.8267 0.0636             0.0124      False
+FL_band_AE_s0        75  0.8222 0.0400             0.0078       True
+FL_band_AE_s0       100  0.7993 0.0304             0.0151      False
+FL_band_AE_s0       150  0.8155 0.0223             0.0011       True
+FL_band_AE_s0       225  0.8121 0.0125             0.0023       True
+
+Smallest population within 1% of the full-population correlation:
+         cell  models_needed
+FL_band_AE_s0             75
+Past this point more models buy precision in the SELECTION, not in the correlation -- size the sweep on that, not on the paper's 4,200.
+
+Done.
+  results (repo, comes down with --date):  results/2026-09-19/aotil
+  cells   (scratch, purgeable, refittable): /scratch/vmli3/cs371w/aotil/cells

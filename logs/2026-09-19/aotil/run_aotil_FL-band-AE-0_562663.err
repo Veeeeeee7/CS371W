@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/users/vmli3/cs371w/aotil/zoo.py", line 38, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+ERROR conda.cli.main_run:execute(142): `conda run python3 -u aotil/zoo.py --state FL --protocol band --train-dom AE --seed 0 --n-models 300 --data /scratch/vmli3/cs371w/data/processed --out /scratch/vmli3/cs371w/aotil/cells --n-jobs 16 --device cuda` failed. (See above for error)
+Traceback (most recent call last):
+  File "/users/vmli3/cs371w/aotil/gate.py", line 16, in <module>
+    import numpy as np, pandas as pd
+ModuleNotFoundError: No module named 'numpy'
+ERROR conda.cli.main_run:execute(142): `conda run python3 -u aotil/gate.py --cells /scratch/vmli3/cs371w/aotil/cells` failed. (See above for error)

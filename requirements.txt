@@ -1,0 +1,17 @@
+# aotil -- spatially regularized OODSelect
+#
+# numpy/scipy/scikit-learn/pandas are required. Everything below them is
+# optional: the code runs without each one, more slowly or with a fallback, and
+# says which it is at startup.
+numpy>=1.24
+scipy>=1.11
+scikit-learn>=1.3
+pandas>=2.0
+pyarrow>=14          # reading data/processed/*.parquet
+joblib>=1.3          # parallel model fitting -- the wall clock of a cell
+# --- optional ---
+torch>=2.0           # --device cuda; batches restarts x mu into one mat-vec
+xgboost>=2.0         # one more learner family, and the only GPU-capable one
+pyproj>=3.6          # proper lon/lat projection; without it an equirectangular
+                     # approximation is used, fine for kNN ordering
+matplotlib>=3.7      # figures
