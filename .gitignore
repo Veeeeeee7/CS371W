@@ -7,3 +7,6 @@ CS371_Cho_Li/
 data/interim/
 data/raw/
 __pycache__/
+logs/
+results/
+figures/

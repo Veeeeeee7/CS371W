@@ -58,6 +58,10 @@ Requests are made once per 10 km `block_id`, at the mean position of that block'
 own points rather than the grid centroid, so every request lands inside the data.
 That is 16,397 requests, about 70 minutes, instead of 878,336.
 
+A block already in the cache is never fetched again, so after a resample its
+value stays the one requested at the earlier build's mean position (always
+inside the same block); only blocks new to the cache use the current points.
+
 Atlas 14's own grids are 800 m, so this coarsens them roughly 12x. `--validate`
 measures what that costs: it pulls a sample of individual points and compares each
 to its block value, and reports the error distribution rather than assuming it is
@@ -67,9 +71,11 @@ USAGE
 =====
     python pull_atlas14.py --selftest       # 2 known points, checked against print
     python pull_atlas14.py                  # all blocks, resumable
+    python pull_atlas14.py FL               # one state's blocks only
     python pull_atlas14.py --status
     python pull_atlas14.py --validate 200   # block value vs true point value
     python pull_atlas14.py --merge          # into data/processed/dataset_{ST}.parquet
+    python pull_atlas14.py --merge FL       # rewrites dataset_FL.parquet only
 """
 from __future__ import annotations
 
@@ -156,14 +162,14 @@ def fetch(s: requests.Session, lat: float, lon: float) -> dict:
     return parse(r.text)
 
 
-def block_targets() -> pd.DataFrame:
+def block_targets(states: list[str]) -> pd.DataFrame:
     """One request location per 10 km block: the mean position of its own points.
 
     A grid centroid could fall in the ocean or outside Atlas 14's project area; the
     mean of the block's actual points cannot.
     """
     frames = []
-    for st in STATES:
+    for st in states:
         p = PROC / f"dataset_{st}.parquet"
         if not p.exists():
             continue
@@ -188,9 +194,9 @@ def load_cache() -> pd.DataFrame:
     return pd.DataFrame(columns=["state", "block_id"] + BANDS)
 
 
-def pull(limit: int | None, workers: int) -> int:
+def pull(states: list[str], limit: int | None, workers: int) -> int:
     CACHE.mkdir(parents=True, exist_ok=True)
-    tgt = block_targets()
+    tgt = block_targets(states)
     have = load_cache()
     done = set(zip(have.state, have.block_id)) if len(have) else set()
     todo = tgt[~tgt.apply(lambda r: (r.state, r.block_id) in done, axis=1)]
@@ -242,8 +248,8 @@ def pull(limit: int | None, workers: int) -> int:
     return 0
 
 
-def status() -> int:
-    tgt = block_targets()
+def status(states: list[str]) -> int:
+    tgt = block_targets(states)
     have = load_cache()
     if not len(have):
         print("nothing cached yet")
@@ -263,13 +269,13 @@ def status() -> int:
     return 0
 
 
-def validate(n: int, workers: int) -> int:
+def validate(states: list[str], n: int, workers: int) -> int:
     """Block value vs the true value at individual points inside that block."""
     have = load_cache()
     if not len(have):
         sys.exit("nothing cached -- run the pull first")
     frames = []
-    for st in STATES:
+    for st in states:
         p = PROC / f"dataset_{st}.parquet"
         if p.exists():
             frames.append(pd.read_parquet(
@@ -364,16 +370,16 @@ def atomic_write_text(text: str, path) -> None:
     os.replace(tmp, path)
 
 
-def merge() -> int:
+def merge(states: list[str]) -> int:
     with MergeLock():
-        return _merge_body()
+        return _merge_body(states)
 
 
-def _merge_body() -> int:
+def _merge_body(states: list[str]) -> int:
     have = load_cache()
     if not len(have):
         sys.exit("nothing cached -- run the pull first")
-    for st in STATES:
+    for st in states:
         p = PROC / f"dataset_{st}.parquet"
         if not p.exists():
             continue
@@ -392,8 +398,12 @@ def _merge_body() -> int:
     # retire the proxy columns if a previous pull_climate.py run added them
     proxy = {"pr_annmax_mean", "pr_annmax_sd", "pr_100yr_gumbel",
              "pr_annual_mean", "pr_wettest5day"}
+    retire = proxy & set(base)
     base = [b for b in base if b not in proxy]
     new = [b for b in BANDS if b not in base]
+    if not new and not retire:
+        print(f"\nFEATURES.txt already lists every Atlas 14 band -- left as is")
+        return 0
     atomic_write_text(
         "# columns a model may use. everything else in dataset_*.parquet is an\n"
         "# identifier or provenance metadata and must stay out.\n"
@@ -404,8 +414,8 @@ def _merge_body() -> int:
         "# result that leans on one.\n"
         + "\n".join(base + new) + "\n", f)
     print(f"\nFEATURES.txt: {len(base)+len(new)} features; added {new}")
-    if proxy & set(base):
-        print(f"retired GRIDMET proxy columns: {sorted(proxy)}")
+    if retire:
+        print(f"retired GRIDMET proxy columns: {sorted(retire)}")
     print("\nNext: python baselines.py   then   python baselines.py --null")
     return 0
 
@@ -438,6 +448,7 @@ def selftest(workers: int) -> int:
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("states", nargs="*", help="default: all ten")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--merge", action="store_true")
@@ -445,20 +456,24 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--limit", type=int, help="fetch only N blocks, for a dry run")
     ap.add_argument("--workers", type=int, default=WORKERS)
     a = ap.parse_args(argv)
+    states = a.states or STATES
+    bad = [s for s in states if s not in STATES]
+    if bad:
+        sys.exit(f"unknown states: {bad}")
 
     if a.selftest:
         return selftest(a.workers)
     if a.status:
-        return status()
+        return status(states)
     if a.merge:
-        return merge()
+        return merge(states)
     if a.validate:
-        return validate(a.validate, a.workers)
-    rc = pull(a.limit, a.workers)
+        return validate(states, a.validate, a.workers)
+    rc = pull(states, a.limit, a.workers)
     print()
-    status()
-    print("\nThen:  python pull_atlas14.py --validate 200")
-    print("       python pull_atlas14.py --merge")
+    status(states)
+    print(f"\nThen:  python pull_atlas14.py --validate 200 {' '.join(states)}")
+    print(f"       python pull_atlas14.py --merge {' '.join(states)}")
     return rc
 
 

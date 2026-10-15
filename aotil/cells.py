@@ -23,8 +23,12 @@ import pandas as pd
 # ablation, and it is the control that decides whether a result is real.
 TREE_FAMILIES = {"hgb", "rf", "et", "dt", "xgb"}
 
-SPATIAL_COLS = ["lon", "lat", "block_id", "tile_50km", "county_fips",
+# Per-OOD-point arrays (zoo.SPATIAL_COLS) and the ID half's keys (zoo.ID_COLS,
+# stored as <col>_id, plus its labels y_id). Absent keys load as None: the v1
+# cells of 2026-09-24 carry y_id but no point_id, point_id_id, lon_id or lat_id.
+SPATIAL_COLS = ["point_id", "lon", "lat", "block_id", "tile_50km", "county_fips",
                 "meta_comid", "meta_source_cit"]
+ID_KEYS = ["point_id_id", "lon_id", "lat_id", "y_id"]
 
 
 class Cell:
@@ -37,7 +41,7 @@ class Cell:
         self.y_ood = npz["y_ood"]
         self.models = models
         self.n_models, self.d = self.S_ood.shape
-        for c in SPATIAL_COLS + ["tiles_ood"]:
+        for c in SPATIAL_COLS + ID_KEYS + ["tiles_ood"]:
             setattr(self, c, np.asarray(npz[c]) if c in npz.files else None)
         if self.tile_50km is None and self.tiles_ood is not None:
             self.tile_50km = self.tiles_ood       # pilot-era cells
@@ -98,7 +102,15 @@ def load_cell(cells_dir: str | Path, tag: str) -> Cell:
         raise SystemExit(f"missing cell {npz_p} -- run zoo.py for this cell first")
     if not csv_p.exists():
         raise SystemExit(f"missing {csv_p} (the model table that pairs with the npz)")
-    return Cell(tag, np.load(npz_p, allow_pickle=True), pd.read_csv(csv_p))
+    try:
+        models = pd.read_csv(csv_p)
+    except pd.errors.EmptyDataError:
+        # zoo.py before 2026-10-14 wrote such a cell when no model could be
+        # fitted (a protocol with no negatives); it now refuses to.
+        raise SystemExit(f"{csv_p} is empty: a 0-model cell, of no use to any reader. "
+                         f"Delete {npz_p.name} and its table; the current zoo.py "
+                         f"refuses such a cell and says why") from None
+    return Cell(tag, np.load(npz_p, allow_pickle=True), models)
 
 
 def list_cells(cells_dir: str | Path) -> list[str]:

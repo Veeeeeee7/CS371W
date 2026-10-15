@@ -1,7 +1,17 @@
 # Spatially regularized OODSelect — method and the full Florida run
 
+> **Status 2026-10-13 (`docs/PROJECT-PLAN.md` v4, aligned with the paper).** The paper uses
+> the authors' released OODSelect (`aotil/oodselect_paper.py`) with this file's Laplacian term
+> (§3.1–3.3) at μ = 3, k = 10. Still current: §3 (the term, the graph), §4 (coherence metrics),
+> §6 (validation rules), §9 (pitfalls). Out of date: the line "Nothing here has been implemented
+> yet" (all of §3–§4 is in `aotil/`); §1–§2 (the cells exist, 300 models, seed 0); the E2
+> expectation that μ = 0 collapses (it transfers at every μ); E3/E4 (replaced by the boundary
+> analysis, G1 in `docs/REGION-ANALYSIS-FLORIDA.md`); E5/E6 (out of scope). The μ sweep the
+> paper needs is now a paper-protocol sweep (v4 §3, O4).
+
 **v1, 2026-09-19** · companion to `docs/PROJECT-PLAN.md` v3 §5 Stage 3 · pilot in
-`aotil/README.md` · abstract in the Project doc `claude/project-abstract.md`
+`aotil/README.md` · abstract in the Project doc `claude/project-abstract.md` ·
+**E3/E4 in detail: `docs/REGION-ANALYSIS.md` (2026-09-26)**
 
 This is the implementation plan for the run that follows the Florida pilot. It
 says what to change, why, and how hard each piece is, in the order to do it.
@@ -225,6 +235,17 @@ that its subsets are fit to the very points they are evaluated on.
 
 ### E3 — Characterise the regions
 
+> **Superseded in detail by `docs/REGION-ANALYSIS.md` (v1, 2026-09-26).** The
+> membership model below is kept there as R7 and repositioned: it tests whether the
+> inverse points are *different places* and works as well on scattered points, so it
+> cannot justify the spatial term. The analyses that need regions — along-network
+> break alignment (R1), whole-unit coverage (R2), Zone A polygon geometry (R3),
+> residual run structure and commission/omission direction (R4), FEMA quality
+> metadata (R5), unit-level excision retraining (R6) — are specified there, each with
+> its null (matched-growth on the same kNN graph) and its reading. Every question runs
+> on three region sets: classic, spatial μ = 3, and smoothed-classic (the post-hoc
+> ablation promised in the Discussion).
+
 `characterise.py` on the constrained masks, per connected component as well as
 pooled, with the metadata columns extended by `meta_source_cit`,
 `meta_eff_date`, `county_fips`, `meta_comid`, `meta_fld_ar_id`. Then the
@@ -245,6 +266,10 @@ Provenance beating terrain at equal coherence is RQ3 answered in the
 project's favour; the reverse is the honest alternative.
 
 ### E4 — GIS context of each region
+
+> Kept as R8 in `docs/REGION-ANALYSIS.md`, with two overlays added: the R1 break
+> catalogue (map-production vs landscape breaks along the corridor) and the R4
+> residual sign per point; the one-row summary gains the R1–R5 numbers.
 
 Per connected component: a map with NHDPlus flowlines, coastline, county
 boundaries and FIRM panel boundaries (`S_FIRM_PAN`), flood polygons coloured by

@@ -30,6 +30,77 @@ Tiles (tile_50km) are split once, 70/30, and every model in the population sees
 the identical split. Test tiles are restricted to those holding BOTH domains, so
 ID and OOD are scored on the same geography -- the same commitment baselines.py
 makes. Points are never split individually.
+
+WHAT A CELL STORES
+------------------
+<tag>.npz
+    S_ood, S_id    (n_models, n_points) true-class scores; rows in the order of
+                   <tag>_models.csv, columns in dataset row order of each half.
+    y_ood, y_id    labels of the two halves.
+    SPATIAL_COLS   one value per OOD column: point_id, lon, lat, block_id,
+                   tile_50km, county_fips, meta_comid, meta_source_cit (plus
+                   tiles_ood, kept for older readers).
+    <c>_id         point_id_id, lon_id, lat_id: one value per ID column.
+point_id is the join key back to the point table and, through meta_fld_ar_id /
+meta_src_row_id, to the polygons. Cells written before it was stored can only be
+re-aligned by re-running split_tiles + subset on the identical dataset, or joined
+on rounded lon/lat, and neither survives a rebuild of the sample.
+
+<tag>_models.csv, one row per fitted model
+    idx, kind, feat_frac, row_frac, n_feat, score/acc/auc on ID and OOD   (as before)
+    seed           the model's own seed from zoo_specs
+    n_train        rows in its training subsample
+    features       ';'-joined names of the features it actually used (after the
+                   constant-column drop in fit_one)
+    acc/auc_train_sub   on its own training subsample
+    acc/auc_train_all   on every training-tile row of the training domain
+    hp_<name>      one column per key of its kw dict, i.e. per setting zoo_specs
+                   varies. An empty cell means the parameter is not varied
+                   through kw for that family: build() fixes it or the library
+                   default applies (list below). None (unlimited depth) is
+                   written "none" -- not "None", which pandas.read_csv turns into
+                   NaN -- so it cannot be confused with an empty cell; tuples
+                   are written as their repr, e.g. "(64, 32)".
+The training metrics are for the label-noise check in Related Work: Sanyal et al.
+(2025) get an inverse line only from models that INTERPOLATE noisy labels, so the
+paper has to show whether ours do. _train_sub is what the model was fitted on;
+_train_all adds the training rows it never saw, from the same tiles. Both use the
+same conventions as the ID/OOD columns (score_rows: accuracy = score > 0.5, AUC
+ranked on the raw p).
+
+AUCs in cells written before 2026-10-14 (the 2026-09-24 v1 cells) were ranked
+on p rebuilt from the scores, which breaks ties between positives and negatives
+(score_rows says how); their dt rows are off by up to 0.095. The S matrices,
+score_* and acc_* are unaffected.
+
+Fixed in build(), the same for every model of a family. random_state is the
+model's seed in every family but nb; anything not listed and not in kw is the
+installed library's default (e.g. XGBoost's learning_rate, 0.3).
+    xgb      tree_method="hist", n_jobs=1, verbosity=0, device from --device;
+             NaN handled natively
+    hgb      early_stopping=False; NaN handled natively
+    rf, et   median imputation, n_jobs=1
+    dt       median imputation
+    lr       median imputation, StandardScaler, max_iter=400
+    mlp      median imputation, StandardScaler
+    nb       median imputation, GaussianNB defaults
+
+DETERMINISM
+-----------
+Each model draws its feature subset, row subsample and estimator seed from its
+own spec seed, so a cell is a pure function of (dataset, seed) and any single
+model can be refitted alone: audit_cell.py does exactly that through cell_data +
+fit_one. The training metrics are computed after the fit and draw no random
+numbers, so adding them changed no stored score. Thread counts are the one
+other input: parallel workers are pinned to one BLAS/OpenMP thread (run_cell),
+and a --n-jobs 1 run needs the same from its environment, as below.
+
+USAGE (repo root)
+-----
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \\
+    .venv/bin/python -u aotil/zoo.py --state FL --protocol band --train-dom AE \\
+        --seed 0 --n-models 300 --data data/processed \\
+        --out data/interim/aotil/cells --n-jobs -1
 """
 from __future__ import annotations
 import argparse, json, sys, time, warnings
@@ -61,18 +132,27 @@ warnings.filterwarnings("ignore")
 TILE = "tile_50km"
 MIN_TRAIN = 500
 
-# Written into every cell alongside the scores. lon/lat build the spatial graph;
-# the rest are the grouping keys for the restricted graphs (block, catchment,
-# provenance) and for the characterisation.
-SPATIAL_COLS = ["lon", "lat", "block_id", "tile_50km", "county_fips",
+# Written into every cell alongside the scores. point_id is the join key back to
+# the point table; lon/lat build the spatial graph; the rest are the grouping
+# keys for the restricted graphs (block, catchment, provenance) and for the
+# characterisation.
+SPATIAL_COLS = ["point_id", "lon", "lat", "block_id", "tile_50km", "county_fips",
                 "meta_comid", "meta_source_cit"]
+# The ID half, stored as <col>_id. Enough to join it (point_id) and to map it
+# (lon/lat) without rebuilding the split.
+ID_COLS = ["point_id", "lon", "lat"]
 
 
 # ----------------------------------------------------------------- data
-def load(state: str, data_dir: Path) -> tuple[pd.DataFrame, list[str]]:
-    feats = [l.strip() for l in (data_dir / "FEATURES.txt").read_text().splitlines()
+def read_features(path: Path) -> list[str]:
+    """FEATURES.txt -> column names (comments and blank lines dropped)."""
+    feats = [l.strip() for l in Path(path).read_text().splitlines()
              if l.strip() and not l.startswith("#")]
-    feats = [f for tok in feats for f in tok.split()]
+    return [f for tok in feats for f in tok.split()]
+
+
+def load(state: str, data_dir: Path) -> tuple[pd.DataFrame, list[str]]:
+    feats = read_features(data_dir / "FEATURES.txt")
     df = pd.read_parquet(data_dir / f"dataset_{state}.parquet")
     feats = [f for f in feats if f in df.columns]
     return df, feats
@@ -187,101 +267,183 @@ def build(kind: str, kw: dict, seed: int, device: str = "cpu"):
     raise ValueError(kind)
 
 
-def true_class_prob(model, X: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Per-example predicted probability of the observed class. Higher = better."""
+def score_rows(model, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """(true-class scores, accuracy at 0.5, AUC) of a fitted model on one set of
+    rows: the one convention every S row and every score_* / acc_* / auc_*
+    column of the model table uses.
+
+    The score is the predicted probability of the observed class (p if y=1 else
+    1-p), higher = better. The AUC is ranked on p itself, never on p rebuilt
+    from the scores: for a negative that is 1 - (1 - p), up to an ulp off p, so
+    a positive and a negative that share a p stop being a tie (half a pair) and
+    are counted as ordered. Trees predict few distinct p, so ties are most
+    pairs: a depth-2 tree (idx 24 of the 2026-09-24 cell) has OOD AUC 0.812 on
+    p and 0.717 on the rebuilt p. The scores themselves are unchanged by this.
+    """
     p = model.predict_proba(X)[:, 1]
-    return np.where(y == 1, p, 1.0 - p)
+    s = np.where(y == 1, p, 1.0 - p)
+    return s, float((s > .5).mean()), float(roc_auc_score(y, p))
+
+
+def hp_value(v):
+    """A kw value as a model-table cell: None -> "none" (read_csv keeps it a
+    string; "None" would come back as NaN), tuple -> its repr."""
+    if v is None:
+        return "none"
+    if isinstance(v, (tuple, list)):
+        return repr(tuple(v))
+    return v
 
 
 # ----------------------------------------------------------------- run
-def run_cell(df, feats, protocol, train_dom, n_models, seed,
-             n_jobs: int = 1, device: str = "cpu"):
+def cell_data(df, feats, protocol, train_dom, seed) -> dict:
+    """The cell's three halves and their arrays, in the row order the cell stores.
+
+    Shared by run_cell and audit_cell.py, so a refit sees exactly the rows and
+    the feature order the population was fitted on.
+    """
     eval_dom = "AE" if train_dom == "A" else "A"
     tr_tiles, te_tiles = split_tiles(df, seed)
 
     tr = subset(df, train_dom, protocol); tr = tr[tr[TILE].isin(tr_tiles)]
     id_te = subset(df, train_dom, protocol); id_te = id_te[id_te[TILE].isin(te_tiles)]
     ood_te = subset(df, eval_dom, protocol); ood_te = ood_te[ood_te[TILE].isin(te_tiles)]
+    arrays = dict(Xtr=tr[feats].to_numpy(float), ytr=tr.label.to_numpy(),
+                  Xid=id_te[feats].to_numpy(float), yid=id_te.label.to_numpy(),
+                  Xod=ood_te[feats].to_numpy(float), yod=ood_te.label.to_numpy())
+    return dict(eval_dom=eval_dom, tr_tiles=tr_tiles, te_tiles=te_tiles,
+                tr=tr, id_te=id_te, ood_te=ood_te, arrays=arrays)
+
+
+def fit_one(sp: dict, A: dict, device: str = "cpu") -> dict | None:
+    """One model of the population. Returns None when the draw is unusable.
+
+    Module-level so the population can be fitted in parallel (the models are
+    independent by construction and the fits are the whole wall-clock cost of a
+    cell; the selection that follows is seconds) and so audit_cell.py can refit
+    any single model through the identical code path. A is cell_data's arrays.
+    """
+    Xtr, ytr = A["Xtr"], A["ytr"]
+    n_feats = Xtr.shape[1]
+    rng = np.random.default_rng(sp["seed"])
+    cols = np.sort(rng.choice(n_feats,
+                              max(3, int(n_feats * sp["feat_frac"])), replace=False))
+    n = max(MIN_TRAIN, int(len(Xtr) * sp["row_frac"]))
+    ridx = rng.choice(len(Xtr), min(n, len(Xtr)), replace=False)
+    Xs, ys = Xtr[np.ix_(ridx, cols)], ytr[ridx]
+    if len(np.unique(ys)) < 2:
+        return None
+    keep = [j for j in range(Xs.shape[1])
+            if np.isfinite(Xs[:, j]).sum() >= 2 and np.unique(Xs[np.isfinite(Xs[:, j]), j]).size >= 2]
+    if len(keep) < 2:
+        return None
+    cols, Xs = cols[keep], Xs[:, keep]
+    try:
+        m = build(sp["kind"], sp["kw"], sp["seed"], device=device); m.fit(Xs, ys)
+        s_id, *m_id = score_rows(m, A["Xid"][:, cols], A["yid"])
+        s_od, *m_od = score_rows(m, A["Xod"][:, cols], A["yod"])
+        # Training fit, after the test scores and without touching the RNG:
+        # how close each model comes to interpolating its labels.
+        _, *m_sub = score_rows(m, Xs, ys)
+        _, *m_all = score_rows(m, Xtr[:, cols], ytr)
+    except Exception as e:
+        print(f"    [skip {sp['kind']}] {type(e).__name__}: {e}", flush=True)
+        return None
+    # Each metric pair is (accuracy at 0.5, AUC).
+    return dict(sp=sp, cols=cols, n_train=len(ridx), s_id=s_id, s_od=s_od,
+                id=tuple(m_id), ood=tuple(m_od),
+                train_sub=tuple(m_sub), train_all=tuple(m_all))
+
+
+def model_row(got: dict, feats: list[str]) -> dict:
+    """One row of <tag>_models.csv from a fit_one result."""
+    sp, cols, s_id, s_od = got["sp"], got["cols"], got["s_id"], got["s_od"]
+    (acc_id, auc_id), (acc_od, auc_od) = got["id"], got["ood"]
+    row = dict(
+        idx=sp["idx"], kind=sp["kind"], feat_frac=sp["feat_frac"], row_frac=sp["row_frac"],
+        n_feat=len(cols),
+        score_id=float(s_id.mean()), score_ood=float(s_od.mean()),
+        acc_id=acc_id, acc_ood=acc_od, auc_id=auc_id, auc_ood=auc_od,
+        seed=sp["seed"], n_train=got["n_train"],
+        features=";".join(feats[j] for j in cols),
+        acc_train_sub=got["train_sub"][0], auc_train_sub=got["train_sub"][1],
+        acc_train_all=got["train_all"][0], auc_train_all=got["train_all"][1],
+    )
+    row.update({f"hp_{k}": hp_value(v) for k, v in sp["kw"].items()})
+    return row
+
+
+def run_cell(df, feats, protocol, train_dom, n_models, seed,
+             n_jobs: int = 1, device: str = "cpu"):
+    d = cell_data(df, feats, protocol, train_dom, seed)
+    tr, id_te, ood_te, A = d["tr"], d["id_te"], d["ood_te"], d["arrays"]
     if len(tr) < MIN_TRAIN or id_te.empty or ood_te.empty:
         return None
 
-    Xtr_all = tr[feats].to_numpy(float); ytr = tr.label.to_numpy()
-    Xid = id_te[feats].to_numpy(float);  yid = id_te.label.to_numpy()
-    Xod = ood_te[feats].to_numpy(float); yod = ood_te.label.to_numpy()
-
     print(f"  train {len(tr):,} | ID test {len(id_te):,} | OOD test {len(ood_te):,} "
-          f"| tiles train {len(tr_tiles)} test {len(te_tiles)}", flush=True)
-
-    def fit_one(sp):
-        """One model of the population. Returns None when the draw is unusable.
-
-        Isolated into a function so the population can be fitted in parallel:
-        the models are independent by construction and the fits are the whole
-        wall-clock cost of a cell (the selection that follows is seconds).
-        """
-        rng = np.random.default_rng(sp["seed"])
-        cols = np.sort(rng.choice(len(feats),
-                                  max(3, int(len(feats) * sp["feat_frac"])), replace=False))
-        n = max(MIN_TRAIN, int(len(tr) * sp["row_frac"]))
-        ridx = rng.choice(len(tr), min(n, len(tr)), replace=False)
-        Xs, ys = Xtr_all[np.ix_(ridx, cols)], ytr[ridx]
-        if len(np.unique(ys)) < 2:
-            return None
-        keep = [j for j in range(Xs.shape[1])
-                if np.isfinite(Xs[:, j]).sum() >= 2 and np.unique(Xs[np.isfinite(Xs[:, j]), j]).size >= 2]
-        if len(keep) < 2:
-            return None
-        cols, Xs = cols[keep], Xs[:, keep]
-        try:
-            m = build(sp["kind"], sp["kw"], sp["seed"], device=device); m.fit(Xs, ys)
-            s_id = true_class_prob(m, Xid[:, cols], yid)
-            s_od = true_class_prob(m, Xod[:, cols], yod)
-        except Exception as e:
-            print(f"    [skip {sp['kind']}] {type(e).__name__}: {e}", flush=True)
-            return None
-        return sp, cols, s_id, s_od
+          f"| tiles train {len(d['tr_tiles'])} test {len(d['te_tiles'])}", flush=True)
+    # A protocol with no negatives in the dataset (shadedX on the band-only v2
+    # sample) leaves every set positives-only. No model can be fitted or
+    # scored on one label, and a cell with zero models would be written and
+    # then break every reader, so it is refused here, before 300 empty fits.
+    one_label = [h for h, y in (("train", A["ytr"]), ("ID test", A["yid"]),
+                                ("OOD test", A["yod"])) if len(np.unique(y)) < 2]
+    if one_label:
+        print(f"  one label only in {', '.join(one_label)} (protocol {protocol}): "
+              f"no model can be fitted or scored", flush=True)
+        return None
 
     t0 = time.time()
     specs = zoo_specs(n_models, seed)
     if n_jobs == 1:
-        fitted = [fit_one(sp) for sp in specs]
+        fitted = [fit_one(sp, A, device) for sp in specs]
     else:
-        from joblib import Parallel, delayed
-        fitted = Parallel(n_jobs=n_jobs, backend="loky", verbose=0)(
-            delayed(fit_one)(sp) for sp in specs)
+        # One BLAS/OpenMP thread per worker whatever n_jobs is. joblib otherwise
+        # gives each worker cpu_count // n_jobs threads for every variable the
+        # parent leaves unset, and Apple Accelerate (numpy's BLAS on the laptop,
+        # invisible to threadpoolctl) moves LogisticRegression's scores by up to
+        # ~1e-11 between thread counts, so the cell would depend on --n-jobs.
+        # With 1 thread a --n-jobs 4 cell equals the 2026-09-24 --n-jobs -1 one.
+        from joblib import Parallel, delayed, parallel_config
+        with parallel_config(backend="loky", inner_max_num_threads=1):
+            fitted = Parallel(n_jobs=n_jobs, verbose=0)(
+                delayed(fit_one)(sp, A, device) for sp in specs)
 
     rows, S_ood, S_id = [], [], []
     for got in fitted:
         if got is None:
             continue
-        sp, cols, s_id, s_od = got
-        S_id.append(s_id); S_ood.append(s_od)
-        rows.append(dict(
-            idx=sp["idx"], kind=sp["kind"], feat_frac=sp["feat_frac"], row_frac=sp["row_frac"],
-            n_feat=len(cols),
-            score_id=float(s_id.mean()), score_ood=float(s_od.mean()),
-            acc_id=float(((s_id > .5)).mean()), acc_ood=float(((s_od > .5)).mean()),
-            auc_id=float(roc_auc_score(yid, np.where(yid == 1, s_id, 1 - s_id))),
-            auc_ood=float(roc_auc_score(yod, np.where(yod == 1, s_od, 1 - s_od))),
-        ))
+        S_id.append(got["s_id"]); S_ood.append(got["s_od"])
+        rows.append(model_row(got, feats))
     print(f"  {len(rows)} models in {time.time()-t0:.0f}s", flush=True)
+    if not rows:                 # every draw unusable: same refusal as above
+        return None
+    models = pd.DataFrame(rows)
+    hp = sorted(c for c in models.columns if c.startswith("hp_"))
+    models = models[[c for c in models.columns if not c.startswith("hp_")] + hp]
+    print(f"  training accuracy on own subsample: median {models.acc_train_sub.median():.3f}"
+          f" | >= 0.99 in {(models.acc_train_sub >= .99).sum()} of {len(models)} models"
+          f" | on all training rows: median {models.acc_train_all.median():.3f}",
+          flush=True)
 
     # The spatial columns travel WITH the scores. The pilot stored only tiles,
     # which is why none of its cells can be used for the graph work: lon/lat are
     # join keys rather than features, so they are absent from FEATURES.txt and
     # were never carried through. Anything the graph or the characterisation
     # needs is written here, at the one point where the row order is still
-    # guaranteed to match S_ood's columns.
+    # guaranteed to match S_ood's (and S_id's) columns.
     spatial = {c: ood_te[c].to_numpy() for c in SPATIAL_COLS if c in ood_te}
-    missing = [c for c in SPATIAL_COLS if c not in ood_te]
+    id_cols = {f"{c}_id": id_te[c].to_numpy() for c in ID_COLS if c in id_te}
+    missing = ([c for c in SPATIAL_COLS if c not in ood_te]
+               + [f"{c}_id" for c in ID_COLS if c not in id_te])
     if missing:
         print(f"  note: not in this dataset, omitted from the cell: {missing}",
               flush=True)
-    return dict(models=pd.DataFrame(rows),
+    return dict(models=models,
                 S_ood=np.asarray(S_ood), S_id=np.asarray(S_id),
-                y_ood=yod, tiles_ood=ood_te[TILE].to_numpy(),
-                spatial=spatial,
-                protocol=protocol, train_dom=train_dom, eval_dom=eval_dom)
+                y_ood=A["yod"], y_id=A["yid"], tiles_ood=ood_te[TILE].to_numpy(),
+                spatial=spatial, id_cols=id_cols,
+                protocol=protocol, train_dom=train_dom, eval_dom=d["eval_dom"])
 
 
 def main() -> int:
@@ -317,16 +479,21 @@ def main() -> int:
     r = run_cell(df, feats, a.protocol, a.train_dom, a.n_models, a.seed,
                  n_jobs=a.n_jobs, device=a.device)
     if r is None:
-        print("cell unusable"); return 1
+        print("cell unusable: nothing written"); return 1
 
     out.mkdir(parents=True, exist_ok=True)
-    payload = dict(S_ood=r["S_ood"], S_id=r["S_id"], y_ood=r["y_ood"],
+    # y_id lets a consumer recover exact argmax correctness on the ID half
+    # (oodselect_paper.py needs it for ties at p = 0.5).
+    payload = dict(S_ood=r["S_ood"], S_id=r["S_id"], y_ood=r["y_ood"], y_id=r["y_id"],
                    tiles_ood=r["tiles_ood"].astype(str))
-    for c, v in r["spatial"].items():
+    for c, v in {**r["spatial"], **r["id_cols"]}.items():
         payload[c] = v.astype(str) if v.dtype.kind in "OU" else v
     np.savez_compressed(out / f"{tag}.npz", **payload)
     r["models"].to_csv(out / f"{tag}_models.csv", index=False)
-    print(f"saved {out}/{tag}.npz")
+    print(f"saved {out}/{tag}.npz  (S_ood {r['S_ood'].shape}, S_id {r['S_id'].shape}; "
+          f"keys: {', '.join(payload)})")
+    print(f"saved {out}/{tag}_models.csv  ({len(r['models'])} rows x "
+          f"{r['models'].shape[1]} columns)")
     return 0
 
 

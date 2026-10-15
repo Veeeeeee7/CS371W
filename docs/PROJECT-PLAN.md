@@ -1,350 +1,342 @@
-# Project plan — Label provenance as distribution shift in flood susceptibility
+# Project plan: label provenance as distribution shift in flood susceptibility
 
-**v3, 2026-09-19** · supersedes v2 (2026-09-16, in git)
-**Scope:** AI Research Practicum, 8 weeks from mid-September
-**Anchor:** Salaudeen et al., *Aggregation Hides OOD Generalization Failures from
-Spurious Correlations*, NeurIPS 2025 · arXiv:2510.24884 ·
-github.com/olawalesalaudeen/OODSELECT
-**Companions:** `docs/SPATIAL-OODSELECT.md` (the method and the full Florida run),
-`aotil/README.md` (the pilot), `docs/COVARIATES.md`, `docs/SAMPLING-RESULTS.md`,
-`docs/COVARIATE-AUDIT.md`, `docs/LABELING-PROBLEMS.md`
+**v4, 2026-10-13** (sampling protocol v2 added the same evening, §2a) · supersedes v3 (2026-09-19, in git history) · aligned with the paper draft
+`CS371_Cho_Li/acl_latex.tex` as uploaded 2026-10-13 (introduction, five anticipated outcomes,
+three contributions, related work; Methods and Results not written yet)
+**Scope:** AI Research Practicum (CS371W), Kevin Cho and Victor Li; assumed to end mid-November 2026
+**Companions:** `docs/REGION-ANALYSIS-FLORIDA.md` (v2, the boundary analysis in full),
+`docs/SPATIAL-OODSELECT.md` (the Laplacian term and the coherence metrics), `aotil/README.md`
+(run order), `docs/TASK-DATA-AUDIT.md` (the data-audit brief for Claude Code)
 
----
-
-## 0. What changed in v3
-
-The data and the pilot are done, and the pilot changed the method.
-
-OODSelect finds accuracy-on-the-inverse-line in the Zone A / Zone AE benchmark:
-under the `band` protocol, r = −0.80 to −0.90 on held-out models, the
-most-misclassified baseline stays positive, the permutation null sits near zero,
-and it holds across family-disjoint model splits (`results/aotil_controls_FL.csv`).
-The subsets are describable from quarantined provenance metadata — but they are
-**geographically scattered**, touching 15–22 of 23 evaluation tiles at the 5–10%
-budget. The GIS analysis this project promised reads hydrological and land-use
-context off a *place*, so Stage 3 becomes a **spatially regularized OODSelect**
-(a graph-Laplacian smoothness penalty on the selection weights), evaluated as a
-coherence–inversion tradeoff against the unconstrained method and every control.
-
-Also in v3: the OOD>ID objective from v2 is dropped; RQ4 (observed flooding) is
-deferred out of the deliverable; Florida is the primary case and Iowa/Missouri
-the regime contrast if time allows; `band` is the primary negative protocol and
-`shadedX` the sensitivity arm; §3–§4 now describe the data as built rather than
-as planned.
+When this plan and the paper disagree, the paper wins and this file gets fixed.
 
 ---
 
-## 1. The idea
+## 0. What changed in v4
 
-FEMA's National Flood Hazard Layer draws the 1%-annual-chance floodplain two
-different ways. **Zone AE** boundaries come from detailed hydraulic studies with
-published Base Flood Elevations. **Zone A** boundaries come from approximate
-methods — no hydraulic model, no BFE. Same risk designation, same regulatory
-consequence, completely different evidentiary basis.
+The paper now fixes the experiment. This version cuts the plan down to what the paper
+claims, says what each claim needs, and lists the data that is still missing (§4).
 
-Anyone training an ML model on NFHL polygons is therefore fitting a label
-produced by two different processes, and which process was used is spatially
-patterned. A model trained on AE areas learns to approximate *hydraulic
-modelling output*. A model trained on A areas learns to approximate *a rough
-terrain heuristic*. Those are different target functions sharing a column name.
-
-> **Thesis.** Label provenance is itself a distribution shift. It is invisible in
-> aggregate, it is recorded in the data, and it can be mistaken for geographic
-> shift. We use a spatially regularized OODSelect to find *where* it bites, as
-> regions, and provenance metadata against terrain, hydrology, climate and
-> urbanicity — with GIS context for each region — to explain them.
-
-**Why this version.** Geography confounds everything at once — terrain, climate,
-land use and mapping practice all move together. Provenance changes one thing
-while holding the rest closer to fixed, which makes it a near-natural experiment
-rather than a correlational study. It is also the kind of selection-induced split
-that Salaudeen et al. (arXiv:2504.00186) argue is the only kind that tests
-robustness at all: their audit found selection-induced splits like CivilComments
-well-specified at R = −0.47, while PACS (0.84), Camelyon (0.78) and FMoW (0.87)
-all failed.
-
-**Why regions.** A subset that is a place can be validated on points the
-selection never saw, mapped against flowlines, coastlines, counties and FIRM
-panels, and described in the terms a hydrologist and a floodplain manager both
-use. A subset scattered across a state can only be described by the metadata of
-its points. The constraint costs inversion strength; how much is itself a result.
+| | v3 (2026-09-19) | v4 (from the paper) |
+|---|---|---|
+| scope | Florida primary; Iowa/Missouri if time; ten-state dataset | **Florida only** |
+| direction | both (AE→A and A→AE) | **AE→A**: train on Zone AE, evaluate on Zone A. The A→AE results stay on disk but are not in the paper |
+| selection | aotil sweep (continuous scores, μ sweep) | **OODSelect as the authors released it** (`aotil/oodselect_paper.py`), classic vs. with the Laplacian penalty |
+| model population | ≥ 300, seven families | **300 models, eight families** (dt, et, hgb, lr, mlp, nb, rf, xgb), described as tabular learners chosen in OODSelect's style; the count is not cited to Salaudeen et al. |
+| explanation | membership model of "in region" on provenance / terrain / climate groups (RQ3, E3) | **boundary-agreement analysis**: do the Zone A boundaries inside each region follow terrain, or pre-existing lines the model never saw (soil-survey lines, county lines, map-sheet edges)? This is G1 of `REGION-ANALYSIS-FLORIDA.md` |
+| map | E4 per-region maps | **Contribution 3**: one map of Florida showing where approximate studies differ from detailed ones |
+| dropped | RQ4 | RQ4; IA/MO (E6); provenance graph (E5); full ponding analysis (G2 §4.2); DISDE; R6 excision; shadedX. All optional at most (§5) |
 
 ---
 
-## 2. Research questions
+## 1. The claim, as the paper states it
 
-**RQ1 — Does provenance shift exist?** Does a model trained on Zone AE degrade
-on Zone A (and vice versa) beyond what urbanicity explains?
-*Status:* the Florida pilot says yes under `band`; the pooled attribution found
-the `band` gap carried by provenance and the `shadedX` gap by terrain
-(`results/`, `aotil/README.md`). Re-confirm on the 2026-09-19 dataset.
+Zone A and Zone AE share one definition (the 1% annual chance floodplain) but not one
+procedure. Zone AE boundaries come from base flood elevations computed in detailed hydrologic
+studies. Zone A boundaries come from approximate studies built on soil maps, high-water
+profiles, aerial photos of past floods and topographic maps. Prior work pools both into one
+label and assumes the model absorbs the difference. **Hypothesis: it cannot, and the
+difference appears as a distribution shift wherever the approximate method diverges from the
+detailed study.**
 
-**RQ2 — Is the degradation concentrated, and where?** Unconstrained OODSelect
-answers the first half: yes, in a point type. The second half is new — does a
-spatially regularized selection find geographically coherent regions where the
-line inverts, at what cost in inversion strength, and does the inversion survive
-transfer to held-out points inside the region?
-
-**RQ3 — Can the regions be named?** Do they align with provenance (study regime,
-panel scale, BFE density, zone subtype, source study, effective date) better than
-with terrain, hydrology, climate, urbanicity or processing artifacts — measured
-against a block permutation null, not eyeballed — and what does the GIS context
-of each region say?
-
-**RQ4 — Which side is right?** *Deferred, out of the practicum deliverable.*
-Where observed flooding is available, does an AE-trained model predict it better
-in Zone A areas than the Zone A map does? Data pointers kept in §3.5.
+The test. If models absorb the shift, accuracy-on-the-line holds: across models, out-of-domain
+(Zone A) accuracy tracks in-domain (Zone AE) accuracy. OODSelect searches for Zone A subsets
+where that correlation inverts. The graph-Laplacian penalty makes those subsets spatially
+coherent regions. A boundary analysis of each region then asks whether the label there follows
+something the covariates cannot see.
 
 ---
 
-## 3. Data — as built
+## 2. Setup as the paper states it, checked against the repo
 
-### 3.1 Label
+Checked 2026-10-13 from `dataset_FL.parquet` and the `FL_band_AE_s0` cell. These are the **v1
+sample** now on disk. §2a lists what the rebuild changes.
 
-Binary `label` from NFHL Special Flood Hazard Area polygons, ten states,
-**878,336 points in 16,397 blocks**, every stratum balanced between domains.
+| paper says | where it comes from | status |
+|---|---|---|
+| "98,578 points across Florida" | `data/processed/dataset_FL.parquet` | 98,578 rows ✓. **But 36,000 of them are shadedX negatives, which the band experiment does not use.** The band subset is 62,578 (19,963 positives and 11,326 band negatives per zone). After the seed-0 50 km tile split: train 22,658 · ID test 7,634 · OOD test 9,412. Decide which count Methods reports |
+| "45 covariates" | `data/processed/FEATURES.txt` | 45 ✓ |
+| "seven public sources" | pull scripts | expected: USGS 3DEP, MERIT Hydro, NLCD, JRC Global Surface Water, NHDPlus V2, EPA StreamCat, NOAA Atlas 14. `log10_dist_coast` comes from NHDPlus V2 Coastline features (`pull_hydro.py`), so seven looks right. **Not verified per feature**; audit item |
+| labels from FEMA zones; negatives sampled outside the mapped area | `sample_points.py`; `band` protocol | ✓, but the code samples outside the mapped *floodplain* and inside the mapped *area*. Band rule: ring 500–5,000 m around the polygons that supplied that zone's positives; keep a point only if its nearest SFHA of any zone is 500–5,000 m away and it lies inside a FIRM panel; 200 m thinning. A negative's zone is the zone of the polygons whose ring produced it, so a "Zone A" negative's nearest floodplain can be Zone AE. Florida: 11,326 per zone, 0.57 per positive (supply-limited below the 2:1 cap). Source: NFHL `S_Fld_Haz_Ar` and `S_FIRM_Pan` only |
+| spatially contiguous blocks held out | `tile_50km`, one 70/30 split per seed, test tiles must hold both zones | ✓ (71 train / 23 test tiles at seed 0) |
+| 300 models, eight families | `aotil/zoo.py`; cells in `data/interim/aotil/cells/` | ✓ dt 38, et 38, hgb 38, lr 38, mlp 37, nb 37, rf 37, xgb 37 |
+| train on Zone AE, evaluate on Zone A | cell `FL_band_AE_s0` | ✓, seed 0 only |
+| kNN graph over Zone A points, Laplacian penalty, connected regions extracted from the relaxed solution | `aotil/oodselect_paper.py` with μ = 3, k = 10; regions = connected components of the top-S mask on the 10-NN graph | seed 0, μ = 3 only. **No region-extraction script in the repo**; the component tables of 2026-09-27 were computed ad hoc |
 
-- **Positives:** points inside the SFHA, 200 m minimum separation, inside the
-  ~110–130 m-wide zone ribbons.
-- **Negatives:** two protocols, both provenance-blind, carried in `neg_protocol`.
-  `band` (a fixed distance band outside the boundary) is **primary**; `shadedX`
-  (0.2%-chance polygons) is the **sensitivity arm**. The 0.15 AUC gap between
-  them is itself a result: the negative-sampling sensitivity the labelling
-  literature puts at 0.13–0.24 AUC, reproduced on one footprint with everything
-  else fixed. Detail in `docs/SAMPLING-RESULTS.md` and `docs/LABELING-PROBLEMS.md`.
+## 2a. Sampling protocol v2 (decided 2026-10-13)
 
-### 3.2 Features — the model sees only these
+Victor's decisions after each sampling setting was checked against the literature. The files on
+disk, and every number in §2 and §3, are still the v1 sample until `docs/TASK-DATA-AUDIT.md`
+Part A rebuilds Florida. The audit fills in the "achieved" column.
 
-`data/processed/FEATURES.txt` is the authoritative list (45 columns as of
-2026-09-19): GEE terrain minus absolute elevation (`slope`, aspect sin/cos,
-curvature, `tpi_300`, `tri_300`, `tpi_broad`), `hand`, `log10_upa`, surface
-(`landcover`, `impervious`, `gsw_occurrence`, `water_frac_900m`), NHDPlus
-catchment context (`catch_area_km2`, `nearest_stream_order`, `drainage_density`,
-`channel_slope`, `log10_dist_river`, `log10_dist_coast`, `log10_upstream_area`),
-StreamCat catchment/watershed means (BFI, hydraulic conductivity, wetness index,
-K-factor, precipitation, temperature, runoff, clay/sand, permeability), and
-NOAA Atlas 14 depths (`p100_*`, `p2_24hr`, `growth_100_2`).
+| setting | v1 (built 2026-09-18) | v2 | reason / citation | achieved |
+|---|---|---|---|---|
+| minimum spacing between points of the same class | 200 m | **100 m** | Mundayatt et al. 2026 (`mundayatt2026`, arXiv:2608.08321, p. 12): "A minimum spacing of 100 m is maintained among the generated locations to reduce excessive cluttering". PDF in `refs/cited/` | 100 m: 0 pairs under 100 m, minimum nearest-neighbour distance 100.114 m (EPSG:5070), median 431 m (real build 2026-10-14, `docs/DATA-AUDIT-2026-10-14.md` §2) |
+| minimum spacing across classes | 100 m (half the floor) | **100 m** | same paper, same page: non-occurrences are kept "if they are at least 100 m from known occurrence locations" | 100 m: one whole-state pass at the full floor; 0 pairs under 100 m across any class or zone |
+| positives per zone | 20,000 target (19,963 achieved) | **exactly 20,000** | a size budget; not cited | 20,000 A / 20,000 AE (3% surplus cut after the whole-state pass) |
+| band negatives per positive | up to 2 (0.57 achieved) | **exactly 1:1** (20,000 per zone) | 1:1 is the common choice: Gu et al. 2024 (`gu2024`), Sinčić et al. 2025 (`sincic2025`), Collins et al. 2022 (`collins2022`, PDF to fetch). Acknowledged as a choice, not an optimum: Woznicki et al. 2019 chose about 1:4 after testing several ratios (`woznicki2019`, p. 5), and Jia et al. 2026 report 1:2 beats 1:1 (`jia2026`, PDF to fetch) | 1.00: 20,000 per zone (`--ring-oversample 6`: 32,998 A and 48,212 AE candidates after thinning, for 20,600 needed) |
+| shadedX negatives | 18,000 per zone | **not built for Florida** | not in the paper (§5) | not built (`--protocols band`) |
+| Florida total | 98,578 | **80,000** (4 × 20,000) | | 80,000 |
+| unchanged | area-proportional draw over the polygons; ≤ 2% of a zone's points from one polygon; band 500–5,000 m from any SFHA; inside a FIRM panel; 10 km blocks; 50 km tiles; seed | | | unchanged, plus one rule added by decision: band negatives must lie inside Florida (`--state-polygons`, TIGER 2026 counties; the real build's mask removed 2,609 A and 1,092 AE candidates; a scratch build without it had 4.4% of band negatives in AL/GA). Largest polygon 2.23% A / 2.09% AE of a zone's positives (the 2% cap applies to the candidate pool, so final shares can exceed it, as in v1); band 500–4,965 m, 40,000/40,000 inside a panel; 1,664 blocks, 102 tiles |
 
-Three commitments from `docs/COVARIATE-AUDIT.md`: **absolute elevation is out**
-(it identifies the state at 58% vs a 10% baseline and supplied 0.26 of the
-A-vs-AE AUC; relative elevation is carried by `hand` and the TPIs); **TWI and
-SPI are unusable** from this stack (`docs/COVARIATES.md` §4); **`lon`/`lat` and
-every `meta_*` column are never features.**
+Consequences:
+- **Everything downstream is rebuilt**: the covariates for the new points, the cell, the
+  selections, the regions. §3's seed-0 numbers and the regions in `REGION-ANALYSIS-FLORIDA.md`
+  §2 are v1 results and will be replaced. The paper's "98,578 points" becomes 80,000 if the
+  rebuild reaches its targets.
+- **1:1 should remove most of O1's base-rate problem** (v1: ID half 0.53 positive, OOD half
+  0.64). The audit checks the new halves.
+- **At 100 m, two points can occasionally share one ~90 m MERIT Hydro cell** (HAND, upstream
+  area), so "one point per raster cell" is no longer the stated reason for the spacing; the cited
+  reason is de-cluttering. The audit counts how often it happens.
+- **NHDPlus V2 raw data is not on disk** (`data/raw/` holds only the NFHL), and
+  `pull_hydro.py` needs catchments and flowlines to place new points. The rebuild needs at least
+  the Florida units (03N, 03S, 03W).
+- **Citations to fetch into `refs/cited/`** (found by web search; confirm the statements in the
+  PDFs before writing prose from them): `collins2022` (Collins et al. 2022, *Environ. Res. Lett.*
+  17:034006, doi:10.1088/1748-9326/ac4f0f; 1:1 pseudo-absences chosen after a sensitivity test)
+  and `jia2026` (Jia et al. 2026, *JRMGE* 18(4):2859–2880, doi:10.1016/j.jrmge.2025.12.011; 1:2
+  better than 1:1, read from the abstract only).
 
-### 3.3 Metadata — carried, never fed to the model
+---
 
-| Field | Use |
+## 3. Experiments, one per anticipated outcome
+
+> All numbers in this section are from the v1 sample (200 m spacing, 0.57:1 band negatives).
+> They are replaced once the v2 rebuild (§2a) and the seed-0 re-run are done.
+
+"Have" means in the repo now. "Need" means still to run or build.
+
+### O1. The distribution shift is real
+
+> "A model trained on the detailed Zone AE labels scores lower on the approximate Zone A labels
+> than on held-out Zone AE labels."
+
+- **Measure.** Per model: score on held-out Zone AE (ID half) vs. on Zone A (OOD half), both
+  on the same test tiles. **Report AUC (or balanced accuracy), not plain accuracy.** The two
+  halves have different positive shares (ID 0.53, OOD 0.64 at seed 0), so an accuracy gap
+  mixes the shift with the base rate.
+- **Have.** `FL_band_AE_s0_models.csv`. Mean AUC drop 0.033 (median 0.036; a quarter of models
+  lose less than 0.007). Mean accuracy drop 0.021, and about a quarter of models are *more*
+  accurate on Zone A. The T4 check (`results/2026-09-26/aef_checks`, 90 models, one seed) puts
+  Zone A AUC at 0.84 against ID AUC of 0.90–0.94 for the stronger models.
+- **Need.** Seeds 1–2; a tile-bootstrap interval on the gap. The aggregate drop is modest. That
+  suits the paper's argument (aggregation hides the failure), but O1 should not promise a large
+  drop.
+
+### O2. Accuracy-on-the-line holds in aggregate
+
+- **Measure.** Pearson r of probit ID accuracy vs. probit OOD accuracy across models, on the
+  full Zone A set; plus the paper's model-count rule (adding models changes r by < 1%).
+- **Have.** r = +0.78 on the 60 test models (`report_paper.py`, seed 0). The count rule is met
+  by 20 models.
+- **Need.** Seeds 1–2.
+
+### O3. OODSelect finds inverted subsets, but they are scattered
+
+- **Measure.** Classic (μ = 0) paper-protocol OODSelect over the budget grid 10–7,500.
+  Test-model r with Fisher 95% CI; random and most-misclassified baselines; coherence metrics
+  (kNN purity, connected components, tiles touched).
+- **Have (seed 0).** r ≤ −0.3 up to S = 5,000, i.e. 53% of the Zone A set. At S = 500:
+  r = −0.72, purity 0.26, 186 components across 22 of 23 tiles.
+- **Need.** Seeds 1–2. The two controls the first run skipped: **null-select** (run the
+  selection against shuffled ID accuracies; it must not invert) and the **family-disjoint split**
+  (select on tree models, report on the others, and the reverse). These separate a real
+  spurious-feature effect from a shared model-quality axis.
+
+### O4. The Laplacian penalty gives coherent regions at a small cost in r
+
+- **Measure.** Spatial (μ = 3, k = 10) vs. classic at each budget: change in r and in coherence.
+  The paper calls the two objectives competing, so show the tradeoff: a small paper-protocol μ
+  sweep (μ ∈ {0, 1, 3, 10}) at S = 250, 500, 1,000. Never pick μ by test r.
+- **Have (seed 0, μ = 3).** Cost 0.08–0.14 in r at S = 500–2,500; a gain at S = 250 (−0.69 vs.
+  −0.48). At S = 500: purity 0.91, 8 components, 5 tiles. A μ sweep exists only for the older
+  aotil optimizer (job 562664).
+- **Need.** Seeds 1–2; the paper-protocol μ sweep; the **smoothed-classic** ablation (smooth the
+  classic weights with the kNN operator, then take the top S), so better regions can be credited
+  to the penalty and not to smoothing in general.
+
+### Region extraction (feeds O5 and the map)
+
+- From `spatial_mu3_knn10/FL_band_AE_s*_S{250,500}_theta.npy`: top-S mask → connected
+  components on the same 10-NN graph the selection used → keep components with ≥ 20 points →
+  a region table keyed by `point_id`.
+- Seed 0, S = 500 gives four Zone A regions (`REGION-ANALYSIS-FLORIDA.md` §2.1): Santa Fe /
+  New River swamp (Bradford–Union), Fort Drum / Blue Cypress marsh (Okeechobee–Indian River),
+  Osceola swamps (Columbia), and the Everglades edge (Miami-Dade, coastal). All are
+  `NOT_POPULATED` approximate Zone A in flat wetland terrain, not river corridors.
+- **Need.** `aotil/regions.py` to do this reproducibly. Check which components recur on seeds
+  1–2 before treating any of them as an object.
+
+### O5 and Contribution 3. The regions differ from the surrounding Zone A beyond terrain
+
+> "For each region, we conduct GIS analysis that examines whether they align with terrain
+> changes or previously existing boundaries that are unknown to the model, such as soil-survey
+> lines, county lines, or the edges of map sheets using a boundary-agreement measure."
+> Outcome 5: "the selected regions differ from the surrounding unselected Zone A regions beyond
+> terrain." Contribution 3: a map of Florida, with boundary analysis against held-out maps.
+
+This is G1 of `REGION-ANALYSIS-FLORIDA.md` §3, with three choices fixed by the paper.
+
+**Terms, in CS language.** A *lobe* is one connected piece of a Zone A polygon (a multipart
+polygon exploded into parts). An *elevation level set* is a curve along which the ground
+elevation is constant, like a contour line. A detailed study's boundary is where the terrain
+meets a computed water surface, so it is close to a level set. A *FIRM panel* is one printed
+map sheet of the flood map; its edge is an arbitrary rectangle. A *SSURGO map unit* is one
+polygon of the national soil survey; the lines between map units were drawn by soil
+scientists, and no covariate in our model carries them (the StreamCat soil columns are
+catchment averages). The *displaced-edge null* shifts a real boundary by a random 300–1,000 m
+and re-measures, to estimate how often a curve lands near a soil or county line by chance.
+
+1. **The object is the Zone A boundary inside each region**, sampled every 30 m. It is not the
+   region's own outline, which the kNN graph draws through points 600–800 m apart and which has
+   no precise line. (Paper wording: "whether they align" reads as the region's outline; "whether
+   the Zone A boundaries inside them align" says what is measured.)
+2. **Reference layers (the "held-out maps").**
+   - *Terrain (class E):* elevation level sets from the 3DEP 10 m DEM. A 300 m window of boundary
+     whose elevation range is within ±½ contour interval (0.76 m) and that has a real drop across
+     it is a water surface: the rule the detailed labels teach, and learnable from HAND and TPI.
+   - *Lines the model never saw:* SSURGO soil map-unit lines (class S); county lines and FIRM
+     panel edges (class M).
+   - *Optional if time:* NWI wetland lines (class W, a different rule on partly-seen covariates),
+     PLSS section lines, roads and canals, quad-contour phase (class C).
+3. **Contrasts.**
+   - *Main comparison for O5:* size-matched unselected Zone A lobes in the same tiles.
+   - *Rule contrast:* Zone AE lobes in the same tiles. They should be level sets.
+   - *Base rate:* the displaced-edge null, 200 draws. Soil lines are dense in Florida, so every
+     number is reported as excess over this null.
+
+**Primary statistic (fix it before looking).** Share of region Zone A boundary length that is
+not a level set and lies within 100 m of an S or M line, minus the same share for matched
+unselected Zone A lobes, with its displaced-edge null percentile. "Beyond terrain" means the
+comparison is made on the part of the boundary that is not explained by a level set.
+
+**Reading.**
+- Positive: the regions are where the approximate label follows lines the covariates cannot
+  see. That is the paper's hypothesis.
+- Zero, with region lobes and unselected lobes both on S/M lines: Zone A is that kind of label
+  everywhere, and the regions are where it meets terrain the Zone AE models never saw
+  (`REGION-ANALYSIS-FLORIDA.md` §8, last row). Still reportable; outcome 5 is then not met as
+  written.
+- Region boundaries that are level sets like Zone AE's: the approximate map may be right and
+  the models wrong (Story 2 in `REGION-ANALYSIS-FLORIDA.md` §4).
+
+**The label-noise check from Related Work.** "We test whether lower-quality labels in Zone A
+explain where it inverts" (citing Sanyal et al. 2025). Their inversion needs models that
+interpolate the noisy labels. So record each model's training accuracy and check whether the
+inversion survives among models that do not interpolate (shallow trees, LR, NB). **Needs
+per-model training metrics, which the cells do not store today.**
+
+**The map (Contribution 3).** Florida with Zone A / AE, the regions from all seeds, and each
+region's boundary coloured by class. The Flood Insurance Study (FIS) reports for the region
+counties (Bradford, Union, Okeechobee, Indian River, Columbia, Miami-Dade) are the documentary
+check on how each county's Zone A was drawn.
+
+### Controls the paper needs to defend O3–O5
+
+| control | why | status |
+|---|---|---|
+| seeds 1–2 (tile split) | one seed and one search per budget; the classic curve is non-monotone | not run |
+| null-select | the optimizer can manufacture an inversion from noise | not in the paper protocol yet |
+| family-disjoint split | a random model split shares one quality axis | not in the paper protocol yet |
+| random and most-misclassified baselines | inversion is not just difficulty | have (seed 0) |
+| interpolation check | label-noise inversion requires interpolation (Sanyal et al.) | needs training accuracy per model |
+| base rate in O1 | ID 0.53 vs OOD 0.64 positives | report AUC |
+
+---
+
+## 4. Data each experiment needs
+
+This table is the checklist for `docs/TASK-DATA-AUDIT.md`. The status column is the only part
+the audit should edit.
+
+| data | used by | where | status (2026-10-15) |
+|---|---|---|---|
+| Florida sample rebuilt with protocol v2 (§2a), covariates re-pulled | all | `data/processed/dataset_FL.parquet` | done 2026-10-14: 80,000 points; Earth Engine and NHDPlus covariates re-pulled for the new points, Atlas 14 (1,629 cached blocks at v1 block-mean positions) and StreamCat (per-county cache of 2026-09-19) from caches. Atlas 14 missing for 191 points (0.24%, 35 new blocks; every request failed, PFDS answered HTTP 503 to manual checks 23:12–00:14): refill when it answers (open-water blocks may still fail), then rerun from step 7 with `--overwrite` (DATA-AUDIT §12) |
+| NHDPlus V2 catchments and flowlines for Florida (03N, 03S, 03W) | covariates for the new points | `data/raw/nhdplus/` | on disk: 03N/03S/03W (547 MB download, 2.0 GB with the extracted units and `NHDPlusV21_FL.gdb`); the gdb reproduces v1's COMIDs exactly and its distances within 7.4e-5 m (smoke test) |
+| point table: 45 features, label, domain, neg_protocol, point_id, lon/lat, tile_50km, county_fips, meta_* | all | `data/processed/dataset_FL.parquet` | done: 80,000 rows, 85 columns incl. `meta_src_row_id`, `meta_neg_rank`; audited (`results/2026-10-14/data_audit/`: 12 OK, 1 WRONG (B7: 2 AE positives up to 214 m outside the TIGER state line, accepted), 6 DECIDE (B2, B3, B4, B14, A4.2, A4.3)) |
+| feature → source → script → resolution table | Methods ("seven public sources") | — | done: `docs/FEATURE-SOURCES.md` (seven sources, 45 features) |
+| how band negatives get a zone | Methods | `sample_points.py` | done: Methods text in `docs/DATA-AUDIT-2026-10-14.md` §5 |
+| cell: per-model per-point scores on ID and OOD halves, labels, lon/lat, tile, county | O1–O4 | `data/interim/aotil/cells/FL_band_AE_s0.*` | done v2 seed 0 (audit PASS); seeds 1–2 still to run |
+| `point_id` for both halves of the cell; lon/lat for the ID half | joining regions to polygons and features without rounding lon/lat | — | done (`point_id`, `point_id_id`, `lon_id`, `lat_id` in the v2 cell) |
+| per-model hyperparameters, seed, features used, training accuracy/AUC | interpolation check; Methods appendix (model grid) | — | done in the v2 cell (`hp_*`, `seed`, `features`, `n_train`, training acc/AUC); AUC tie bug fixed |
+| selection outputs per budget (theta, result, trials, meta), classic and spatial | O3, O4, regions | `results/2026-09-24/oodselect_paper/` | done v2 seed 0, classic + spatial μ=3 (`results/2026-10-14/oodselect_paper/`, audit 33/33) |
+| region table (point_id → component, cell, variant, S, seed) | O5, map | — | done v2 seed 0 (`results/2026-10-14/regions/`; each row carries `cell`, `variant`, `S`, `seed`); v1 reproduction checked |
+| Zone A / AE polygons with geometry, FLD_AR_ID, FLD_ZONE | lobes and edges | `data/interim/prep/haz_FL_5070.parquet` (5.4 GB) | checked (`check_gis_inputs.py`) |
+| region lobes, matched unselected Zone A lobes, Zone AE lobes; 30 m edge-vertex table | O5 | — | done for spatial S = 250, 500 (`results/2026-10-14/boundary/`); the matched-lobe target (3 per region lobe) is not met in 7 of 12 components, and some regions are mostly band negatives (S = 250 Palm Beach: 0 positives) |
+| per-point extras: `meta_firm_pan`, `meta_near_fld_ar_id`, `edge_dist_m` | O5, map | — | done: `data/interim/analysis/point_extras_FL.parquet` (`meta_edge_dist_m`) |
+| 10 m DEM over the analysis areas (elevation at vertices and at displaced vertices) | O5 class E | 3DEP 1/3″ (TNM tiles or GEE `USGS/3DEP/10m`) | done: 3DEP 1/3″ rasters in `data/interim/gis/dem/`; z, z_in, z_out at every vertex; 6 tiles newer than 2024, their version against GEE `USGS/3DEP/10m_collection` unchecked |
+| SSURGO map-unit polygons + `muaggatt` (flodfreqdcd, hydclprs, drclassdcd, hydgrpdcd) | O5 class S | Soil Data Access | done: `data/interim/gis/ssurgo/` (197,241 unique polygons; lines with attribute differences); topology warnings in S = 500 components 0, 3, 6, 7 to inspect |
+| county boundaries | O5 class M | TIGER/Line | done: `data/interim/gis/county_lines_FL.parquet` (TIGER 2026) |
+| FIRM panel polygons (map-sheet edges) | O5 class M | `data/interim/nfhl_states/pan_FL.parquet` | done: `data/interim/gis/panel_edges_FL.parquet` (per DFIRM) |
+| NWI wetlands, PLSS sections, roads, canals | O5 optional classes | USFWS, BLM, Census, USGS | canals from NHDPlus in the vertex-layer table; NWI, PLSS, roads not built |
+| FIS reports, six region counties | O5 documentary check | FEMA Map Service Center | manual (Victor); the v2 regions are in nine counties: Hamilton, Miami-Dade, Palm Beach, Dixie, Okeechobee, Indian River, Marion, Nassau, Duval |
+
+---
+
+## 5. Out of scope, or not in the paper
+
+- Iowa / Missouri (E6), the provenance graph (E5), the ten-state transfer matrix.
+- The A→AE direction. Its seed-0 results are kept; nothing new is built for it unless the
+  paper adds it.
+- The full ponding analysis (`REGION-ANALYSIS-FLORIDA.md` §4.2), DISDE, R6 lobe excision. R7
+  (membership model) is cheap and can be the comparison if space allows.
+- The shadedX negative protocol (the sensitivity arm; the paper never mentions it).
+- RQ4, observed flooding.
+
+---
+
+## 6. Order of work
+
+Assumes the project ends mid-November; shift the weeks if the deadline differs.
+
+| week of | do |
 |---|---|
-| `domain` from `FLD_ZONE` (A vs AE) | **the domain variable.** `STATIC_BFE` is *not* the discriminator — AE elevations live as line features in `S_BFE` |
-| `meta_zone_subty`, `meta_study_typ`, `meta_study_regime` | label refinement; regime = classic / BLE risk-class / redelineation |
-| `meta_panel_scale`, `meta_panel_typ`, `meta_eff_date`, `meta_source_cit`, `meta_fld_ar_id` | provenance: how, when and by which study the polygon was drawn |
-| `meta_bfe_km_per_km2` | the continuous provenance gradient (40× across states) |
-| `meta_dist_to_sfha_m`, `meta_poly_area_km2`, `meta_elev` | leakage inventory — quarantined |
-| `impervious` decile | urbanicity stratum |
-| `state`, `county_fips`, `meta_comid`, `block_id`, `tile_30km/50km/100km`, `lon`, `lat` | spatial CV, graphs and mapping |
+| Oct 13 | rebuild Florida with sampling protocol v2 and re-pull its covariates; data audit; seed-0 cell and classic + spatial selections on v2; `aotil/regions.py`; the missing GIS collectors (all in `docs/TASK-DATA-AUDIT.md`) |
+| Oct 20 | seeds 1–2 cells; classic and spatial selections on them; null-select and family-disjoint split; paper-protocol μ sweep at three budgets; smoothed-classic ablation |
+| Oct 27 | boundary classification on the vertex table with the displaced-edge null; matched unselected lobes; Zone AE contrast |
+| Nov 3 | the Florida map (C3); interpolation check; FIS reading; Methods and Results draft |
+| Nov 10 | Discussion, figures, trim to length; presentation |
 
-### 3.4 Domains and scope
-
-Primary domain variable: **Zone A vs Zone AE, within state**, with the paired
-within-block contrast as the primary comparison (in eight of ten states fewer
-than a third of blocks hold both domains, so the full-state contrast alone
-confounds *where* studies are done with *how*).
-
-States in the dataset: FL, LA, IA, CO, AZ, NC, VT, TX, MN, MO. NC is excluded
-from primary analysis (0.7% Zone A). **Analysis scope for the practicum:
-Florida primary** (chosen for coverage, not gap size — `aotil/README.md`);
-**Iowa and Missouri** as the regime contrast if time allows (IA: 84% of Zone A is
-BLE risk-class, 50% of AE is redelineation; MO: BLE). Florida is one regime
-(classic, ~78% NP), so between-place provenance contrast needs IA/MO.
-
-### 3.5 Validation data (RQ4, deferred)
-
-USGS High-Water Marks, the USGS Flood Event Viewer, and the Flood Inundation
-Mapper. Sparse and biased toward events where crews deployed. Kept as a pointer.
+**Minimum viable paper:** O1–O4 on three seeds with null-select; regions on seed 0 checked for
+recurrence; the boundary statistic with the S and M layers, terrain level sets, the matched
+unselected lobes and the displaced-edge null; one map.
 
 ---
 
-## 4. The task
+## 7. Limitations to carry into the paper
 
-**One row = one sampled point.** No time axis: this predicts flood-prone
-*places*, not flood *events*.
-
-- **Input:** the columns in `FEATURES.txt`.
-- **Output:** per-point probability of being flood-prone; per-model score is the
-  predicted probability of the observed class (AUC has no per-example
-  decomposition and a 0.5 threshold means different things across cells).
-- **Splits:** on `tile_50km`, never on `block_id` or points (GroupKFold on 10 km
-  blocks is not spatial CV — A-vs-AE separability falls 0.86 → 0.69 from 10 km
-  to 100 km). Test tiles must hold both domains so ID and OOD are scored on the
-  same geography.
-- **Derived:** the A↔AE transfer matrix; the discovered regions; the coherence–
-  inversion curve; the alignment table; per-region GIS summaries.
-
-**Model population.** The `aotil/zoo.py` population: seven learner families
-(HGB, RF, ET, LR, MLP, DT, NB) × capacity × feature subset (0.3/0.6/1.0) × row
-subsample (0.15/0.5/1.0), round-robin across families so a family-disjoint
-control is possible. Pilot: 126 per cell, ID spread 0.27–0.33, aggregate ID→OOD
-r = +0.85 to +0.96. Full run: ≥ 300 per cell, stopping when the aggregate
-correlation moves < 1%.
+- **The label is a model output, not observed flooding.** The project studies agreement with
+  FEMA maps.
+- **Negatives tie the label to distance from the label.** Band negatives sit 500–5,000 m from
+  any SFHA.
+- **One state, one mapping regime.** Florida Zone A is about 80% `NOT_POPULATED` classic
+  approximate study.
+- **Pseudo-replication.** The largest 1% of polygons supply 8–26% of a zone's points.
+  Bootstrap at the tile level.
+- **Flat terrain blurs boundary position.** At the regions' 0.2–0.3° slopes, ±0.76 m of
+  vertical tolerance is ±150–200 m horizontally. Use the 100 m coincidence band and classify
+  300 m windows, never single vertices.
+- **The spatial penalty is our modification.** μ = 0 must reproduce the classic run, and μ is
+  never chosen by test r.
+- **Susceptibility is not hazard or risk.** No return period beyond the 1% label, no exposure.
 
 ---
 
-## 5. Pipeline
+## 8. Where things are
 
-**Stage 0 — Assemble.** Done. NFHL subset to ten states; points sampled and
-audited; Earth Engine, NHDPlus/StreamCat, Atlas 14 covariates merged
-(`dataset_*.parquet` regenerated 2026-09-19 13:11).
-
-**Stage 1 — Characterise the split.** Done. Flood susceptibility 0.90 AUC vs
-A-vs-AE separability 0.71–0.74 after the elevation fix; propensity overlap 68%;
-A/AE × urbanicity has support. `docs/COVARIATE-AUDIT.md`, `docs/SAMPLING-RESULTS.md`.
-
-**Stage 2 — Transfer matrix.** `baselines.py`, both directions, paired and
-unpaired, with permutation nulls (`results/baselines_*`, `tile_gaps_*`,
-`explain_*`). Re-run on the current dataset before quoting numbers.
-
-**Stage 3 — Spatially regularized OODSelect.** The paper's objective,
-`min_s corr(acc_ID, acc_s^OOD) + λ(S − ‖s‖₁)²`, reimplemented in
-`aotil/oodselect.py` and validated in the pilot with random, most-misclassified,
-permutation-null and family-disjoint controls. New: a graph-Laplacian term
-`μ · wᵀLw / (S·k)` over a kNN (or catchment, or provenance) graph on the OOD
-points, swept over μ, with every control re-run at the same μ and a
-held-out-point transfer test inside the region. **Full specification, experiments
-E0–E6, effort and pitfalls: `docs/SPATIAL-OODSELECT.md`.**
-
-**Stage 4 — Alignment battery, per region.** For each region: prevalence shift
-and membership-predictability AUC for every candidate group below, GroupKFold on
-tiles, against a block permutation null; then the GIS context — map with
-flowlines, coast, counties and FIRM panels, plus a one-row physical and
-provenance summary.
-
-| Candidate | Variables |
-|---|---|
-| Label provenance | `meta_study_regime`, `meta_study_typ`, `meta_zone_subty`, `meta_panel_scale`, `meta_panel_typ`, `meta_bfe_km_per_km2`, `meta_eff_date`, `meta_source_cit` |
-| Urbanicity / surface | `impervious`, `landcover`, `water_frac_900m`, `gsw_occurrence` |
-| Terrain / hydrology | `hand`, `slope`, TPIs, `log10_upa`, distances to river and coast, `drainage_density`, `nearest_stream_order`, StreamCat |
-| Climate | `precip8110*`, `tmean8110*`, `runoff*`, Atlas 14 depths |
-| Processing artifacts | DEM source / resolution where recorded |
-
-**Stage 5 — Decompose.** DISDE (arXiv:2303.02011) on the A↔AE gap, if time.
-Shared support measured at 68%, so it is viable.
-
-**Stage 6 — Intervene (stretch).** Regions as groups for Group DRO, or a
-re-study priority map from the regions. Improvements are not required by the
-project criteria; an explained difference is enough.
-
----
-
-## 6. Result analysis — what each outcome means
-
-| Outcome | Reading |
-|---|---|
-| A↔AE gap survives urbanicity stratification | Provenance shift is real. The headline claim. |
-| Gap vanishes under stratification | It was urbanicity. Still a clean rural/urban flood transfer result. |
-| Gap is strongly asymmetric | Report the asymmetry — direction is informative about which label set is more learnable. |
-| Inversion survives at the coherent operating point, null flat, held-out-point transfer holds | The provenance failure is place-organised; the regions are the paper's objects. |
-| Inversion survives weakened | Partly place-organised; the tradeoff curve decomposes the pilot's −0.8 into place and point-type components. |
-| Inversion dies for every μ > 0 | AoTIL here is carried by a point type present everywhere, not by places. Consistent with the thesis, reported as the negative result, curve as the figure. |
-| Provenance graph beats geometric graph at equal coherence | The shift is in how the maps were made, measured directly. |
-| Regions align with provenance | Regulatory data heterogeneity masquerading as geographic shift. Novel. |
-| Regions align with urbanicity | Rural/urban transfer paper. |
-| Regions align with terrain or climate | Conventional geographic-shift finding, solid but less novel. |
-| Regions align with DEM resolution | A processing artifact wearing a geography costume. Worth a warning to the field. |
-| Regions align with nothing | Reproduces the anchor paper's own limitation in the setting where we predicted it would not apply. Honest negative result. |
-| Intervention improves worst-region performance | The diagnosis-to-repair loop closes (stretch). |
-
-Most rows are reportable. That is the reason this project is a reasonable bet
-for the weeks that remain.
-
----
-
-## 7. Limitations
-
-**The label is a model output, not observed flooding.** Everything downstream
-inherits this. Strictly, the project studies agreement with FEMA maps, not with
-floods. RQ4 would partially escape it and is deferred; state this plainly.
-
-**Negative sampling is a free parameter with large effects.** "Did not flood" is
-never observed. The two protocols differ by 0.15 AUC on one footprint, and the
-inverse line survives the controls under `band` only — under `shadedX` it is
-inseparable from difficulty. Sanyal et al. (arXiv:2406.19049) show label noise
-plus interpolation is exactly the condition under which ID/OOD relationships
-invert. Mitigation: provenance-blind protocols, both reported, non-interpolating
-controls (shallow trees, strong regularisation) in the population.
-
-**The spatial penalty costs inversion strength by construction.** The pilot's
-−0.8 comes from one point type — Zone A positives within ~30 m of the SFHA
-boundary — picked off every ribbon in the state. A region must include interior
-points, which dilutes that signal. Report the tradeoff curve, never a single
-operating point, and never choose μ by test r.
-
-**Pseudo-replication inside a region is worse than across the state.** Points
-200 m apart in a corridor are near-duplicates and the largest 1% of polygons
-supply 8–26% of a domain. Bootstrap at tile level; validate regions on held-out
-points, not only held-out models.
-
-**Mixture arithmetic is the default null for any OOD > ID finding.** "Shift is
-Good" (arXiv:2510.25108) proves that for K≥3 subpopulations with non-constant
-learning curves, a mismatched training mixture beats a matched one for almost
-every test mixture. Rule it out before attributing anything to covariates.
-
-**Spatial autocorrelation invalidates the obvious statistics.** Random CV
-produces meaningless AUC, and any spatially clustered subset shows apparent
-alignment with any spatially clustered variable. Everything needs tile blocking
-and block permutation nulls — including the membership models in Stage 4.
-
-**Multicollinearity undermines the attribution step.** Slope, TPIs, HAND and the
-StreamCat metrics are correlated. Attribution splits credit unstably; report
-covariate *groups*, not single features.
-
-**Model-population diversity is thin on tabular data.** No pretrained backbones
-to vary. The population spreads 0.27–0.33 in ID performance, which was enough
-for the pilot; if a null result appears, check the spread first.
-
-**DISDE requires shared support.** Measured at 68% of points in [0.05, 0.95].
-
-**No prior baseline exists.** Nobody has published an A/AE transfer matrix.
-
-**The spatial penalty is our modification.** Nobody has tested it. μ = 0 must
-reproduce the pilot exactly, and the permutation null must be re-run at every μ.
-
-**Susceptibility is not hazard and not risk.** No return period, no exposure, no
-vulnerability. Do not let the writeup drift into risk language.
-
-**Findings are US- and FEMA-specific.** The mechanism generalises; the specific
-result does not.
-
----
-
-## 8. Timeline — weeks remaining
-
-Week 1 (data, viability, pilot) is done. Dates assume the eight weeks run
-mid-September to mid-November.
-
-| Week | Work |
-|---|---|
-| 2 | Cells regenerated with spatial columns, ≥300 models, 3 seeds, persisted in the repo. E0 covariance map and Moran's I — the go/no-go on regions. Laplacian term and coherence metrics implemented; μ = 0 reproduces the pilot. |
-| 3 | E1 μ sweep with all controls at every μ; tradeoff figure; coherent operating point. |
-| 4 | E2 held-out-point transfer; E3 characterisation and membership models with block permutation null. |
-| 5 | E4 maps and per-region GIS summaries; Stage 2 re-run on the current dataset; decide on E5/E6. |
-| 6 | E5 provenance-vs-geometric graph and/or E6 Iowa–Missouri; confound checks (noise controls, mixture null). |
-| 7 | Robustness across seeds and protocols; DISDE if time; figures final. |
-| 8 | Writeup and presentation. |
-
----
-
-## 9. Immediate next steps
-
-1. `zoo.py`: save `lon, lat, block_id, tile_50km, county_fips, meta_comid,
-   meta_source_cit` in the cell `.npz`; write cells to `data/interim/aotil/cells/`
-   and commit them back to the folder. Re-stage `dataset_FL.parquet` first.
-2. Regenerate the four Florida cells at 300 models, seeds 0–2; `gate.py` at 150 /
-   225 / 300 to confirm the correlation has stabilised.
-3. E0: per-point covariance map, Moran's I against 200 permutations. This decides
-   whether any μ > 0 can succeed.
-4. `oodselect.py`: `--mu`, `--graph knn|block|catchment|provenance`, `--knn 10`;
-   `aotil/graph.py` for adjacency and the §4 coherence metrics; confirm μ = 0
-   matches `results/aotil_controls_FL.csv`.
-5. `analyse.py`: sweep μ, `null-select` at the same μ, coherence metrics in every
-   row; write `results/aotil/`.
-6. Then E2–E4, then decide E5/E6 by week 5.
+- Paper: `CS371_Cho_Li/acl_latex.tex`, `custom.bib` (gitignored; Overleaf is its version
+  control). Cited PDFs in `refs/cited/`.
+- Data: `data/processed/dataset_FL.parquet` + `FEATURES.txt`; polygons
+  `data/interim/prep/haz_FL_5070.parquet`; panels, BFE lines, LOMRs
+  `data/interim/nfhl_states/{pan,s_bfe,s_lomr}_FL.parquet`; flowlines and StreamCat
+  `data/interim/hydro/`; the raw NFHL gdb `data/raw/nfhl/NFHL_Key_Layers.gdb.zip` (19 GB).
+- Models and selections: cells `data/interim/aotil/cells/FL_band_{AE,A}_s0.*`; selections
+  `results/2026-09-24/oodselect_paper/{classic,spatial_mu3_knn10}/`; harness
+  `run_oodselect_local.sh`, `submit_oodselect_{classic,spatial}.sh`.
+- Specs: `docs/REGION-ANALYSIS-FLORIDA.md` (boundary analysis), `docs/SPATIAL-OODSELECT.md`
+  (Laplacian term, coherence metrics, validation rules), `docs/COVARIATES.md`,
+  `docs/COVARIATE-AUDIT.md`, `docs/SAMPLING-RESULTS.md`, `docs/LABELING-PROBLEMS.md`.
+  `docs/REGION-ANALYSIS.md` (v1) is history.
+- claude.ai Project docs: `claude/project-index.md` (pointer doc),
+  `claude/experiment-plan.md` (mirror of this file).

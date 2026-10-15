@@ -23,7 +23,8 @@ def convergence(x: np.ndarray, a: np.ndarray, sizes, n_draw=25, seed=0) -> pd.Da
 
     Salaudeen et al. ran up to 4,200 models but state the criterion as "enough
     that adding more changes the correlation by less than 1%", and report that
-    being about ten models for VLCS and six for WILDS-Camelyon. This table finds
+    being 1,010 models for VLCS and 610 for WILDS-Camelyon (Sec. 4; Fig. 7
+    marks ~710-1,410 per dataset). This table finds
     the number for a cell instead of guessing it: fitting 300 models when 120
     have converged is compute spent on nothing. The selection itself still
     benefits from more models, so this bounds the CORRELATION estimate, not the

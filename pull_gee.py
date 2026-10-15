@@ -223,6 +223,10 @@ def do_chunk(state: str, i: int, sub: pd.DataFrame, groups: list[dict]) -> tuple
     for b in ALL_BANDS:
         if b not in merged.columns:
             merged[b] = np.nan
+    # The location travels with the values, so a merge can tell these shards
+    # from another sampling build that reissued the same point_ids.
+    merged.insert(1, "pt_lon", lon)
+    merged.insert(2, "pt_lat", lat)
     merged.to_parquet(out, index=False)
     return i, "ok"
 
@@ -356,9 +360,11 @@ def derive(out: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def merge(states: list[str]) -> None:
+def merge(states: list[str]) -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     summary = []
+    seeded = False
+    refused = 0
     for state in states:
         d = GEE_DIR / state
         shards = sorted(d.glob("chunk_*.parquet")) if d.exists() else []
@@ -371,6 +377,26 @@ def merge(states: list[str]) -> None:
         import geopandas as gpd
         pts = gpd.read_parquet(PTS_DIR / f"points_{state}.parquet")
         n_before = len(pts)
+        # point_ids are reissued on every sampling build, so shards left over from
+        # an earlier build would join onto the wrong locations without an error.
+        # Shards carry pt_lon/pt_lat for that check; older shards have only ids.
+        stale = int((~cov.point_id.isin(pts.point_id)).sum())
+        if "pt_lon" in cov.columns:
+            ll = cov[["point_id", "pt_lon", "pt_lat"]].merge(
+                pd.DataFrame({"point_id": pts.point_id.values, "lon": pts.lon.values,
+                              "lat": pts.lat.values}), on="point_id", how="inner")
+            stale += int((~(np.isclose(ll.pt_lon, ll.lon, rtol=0, atol=1e-9) &
+                            np.isclose(ll.pt_lat, ll.lat, rtol=0, atol=1e-9))).sum())
+            cov = cov.drop(columns=["pt_lon", "pt_lat"])
+        else:
+            print(f"[{state}] shards carry no locations (pulled before 2026-10-14): "
+                  f"only their point_ids can be checked")
+        if stale:
+            print(f"[{state}] {stale:,} shard rows do not match "
+                  f"points_{state}.parquet -- shards from another sampling build? "
+                  f"Move {d} aside and re-pull. Not merged.")
+            refused += 1
+            continue
         out = pts.merge(cov, on="point_id", how="left")
 
         got = out[ALL_BANDS].notna().mean().mul(100).round(1)
@@ -391,11 +417,17 @@ def merge(states: list[str]) -> None:
 
         f = OUT_DIR / f"dataset_{state}.parquet"
         out.to_parquet(f)
-        (OUT_DIR / "FEATURES.txt").write_text(
-            "# columns a model may use. everything else in dataset_*.parquet is an\n"
-            "# identifier or provenance metadata and must stay out.\n"
-            "# split on tile_50km (or tile_100km), never on block_id or at point level.\n"
-            + "\n".join(FEATURES) + "\n")
+        feats = OUT_DIR / "FEATURES.txt"
+        if not feats.exists():
+            # Seed the list on a first build only. A later merge must not cut it
+            # back to these 13: pull_hydro and pull_atlas14 extend it, and zoo.py
+            # takes the model's columns in its order.
+            feats.write_text(
+                "# columns a model may use. everything else in dataset_*.parquet is an\n"
+                "# identifier or provenance metadata and must stay out.\n"
+                "# split on tile_50km (or tile_100km), never on block_id or at point level.\n"
+                + "\n".join(FEATURES) + "\n")
+            seeded = True
         summary.append(dict(state=state, rows=len(out), feats=len(have),
                             tiles50=out.tile_50km.nunique(),
                             pct_complete=round(100*out[have].notna().all(axis=1).mean(), 1)))
@@ -403,9 +435,11 @@ def merge(states: list[str]) -> None:
 
     if summary:
         print("\n" + pd.DataFrame(summary).to_string(index=False))
-        print(f"\nfeature list written to {OUT_DIR/'FEATURES.txt'}")
+        print(f"\nfeature list {'written to' if seeded else 'left as is in'} "
+              f"{OUT_DIR/'FEATURES.txt'}")
         print("pct_complete = rows with every feature present (aspect is NaN on flat")
         print("ground by design, so use a model that handles NaN or impute at fit time)")
+    return 1 if refused else 0
 
 
 def status(states: list[str]) -> None:
@@ -477,7 +511,7 @@ def main(argv: list[str]) -> int:
     if a.status:
         status(states); return 0
     if a.merge:
-        merge(states); return 0
+        return merge(states)
 
     try:
         ee.Initialize(project=a.project) if a.project else ee.Initialize()
@@ -500,7 +534,7 @@ def main(argv: list[str]) -> int:
 
     print()
     status(states)
-    print("\nWhen every state is at 100%:  python pull_gee.py --merge")
+    print(f"\nWhen every state is at 100%:  python pull_gee.py --merge {' '.join(states)}")
     return 0
 
 

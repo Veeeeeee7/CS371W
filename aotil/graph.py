@@ -16,7 +16,8 @@ WHY kNN AND NOT A RADIUS
 Flood zones are ribbons roughly 110-130 m wide (Vermont's Zone A: 277 km of area
 against 5,103 km of perimeter). A Euclidean-radius window centred on a corridor
 point is mostly empty space; a kNN ball follows the corridor. The same fact is
-why the sampler's separation is 200 m rather than 1 km.
+why the sampler's separation is a 100 m floor between any two points rather than
+1 km.
 
 WHY THE PENALTY IS NORMALISED
 -----------------------------

@@ -23,13 +23,16 @@ WHAT THIS SCRIPT DECIDES, AND WHY
    placed in each -- exactly a uniform draw over their union -- with a per-polygon
    cap so a few enormous polygons cannot dominate a stratum.
 
-2. SEPARATION IS A DE-DUPLICATION FLOOR, NOT AN AUTOCORRELATION FIX.  The first
+2. SEPARATION IS A DE-CLUTTERING FLOOR, NOT AN AUTOCORRELATION FIX.  The first
    draft used 1 km and it was badly binding, because these zones are ribbons:
    measured on Vermont, Zone A is 277 km2 with 5,103 km of perimeter, a mean width
    of 109 m. The ceiling is corridor length, not area, and 1 km caps the entire
-   state at ~1,400 points. The default is 200 m, which is what the covariates
-   require -- MERIT Hydro 90 m, NLCD 30 m, 3DEP 10 m -- so every point sits in a
-   distinct cell of every raster with margin.
+   state at ~1,400 points. The floor is 100 m between ANY two points, whatever
+   their class or zone, measured in EPSG:5070. That follows Mundayatt et al.
+   (2026, p. 12), who keep generated locations 100 m apart "to reduce excessive
+   cluttering" and keep non-occurrences at least 100 m from occurrences. At 100 m
+   two points can occasionally share one ~90 m MERIT Hydro cell (HAND, upstream
+   area), so "one point per raster cell" is no longer the reason for the floor.
 
    Spatial autocorrelation reaches far beyond any usable spacing, so it is handled
    where it belongs: `block_id` is a 10 km grid cell and EVERY split -- train/test,
@@ -38,19 +41,28 @@ WHAT THIS SCRIPT DECIDES, AND WHY
    numbers the flood-susceptibility literature is criticised for.
 
 3. TWO NEGATIVE PROTOCOLS, BOTH PROVENANCE-BLIND.
-     band     a distance band outside every SFHA, inside the same map panel
+     band     a distance band outside every SFHA, inside a FIRM panel (any DFIRM)
      shadedX  inside Zone X '0.2 PCT ANNUAL CHANCE' polygons
    Tehrany & Jones (2017) found a 25-point non-monotonic AUC swing from the
    sampling choice alone on one flood footprint, and the labeling literature puts
    negative sampling at 0.13-0.24 AUC, second only to label definition. So the
    choice is not a hidden default: both are produced, tagged in `neg_protocol`, and
    the difference between them is a result rather than an assumption.
+   `--protocols` picks which are built. Florida under sampling protocol v2 builds
+   `band` only: shadedX is not part of the paper. Panel sheets run past the state
+   line, so a band negative can land in a neighbouring state whose floodplains
+   are not in this state's NFHL; `--state-polygons` (off by default) also
+   requires band negatives to fall inside the given polygons, e.g. the state's
+   counties from pull_gis_lines.py.
 
 4. THE TWO DOMAINS ARE FORCED TO MATCH EXACTLY.  A transfer gap between unequal
    datasets is uninterpretable. Each stratum is trimmed so n_pos(A) == n_pos(AE)
    and n_neg(A, p) == n_neg(AE, p) per protocol. The first draft skipped this and
    the global separation pass ate 36% of AE positives against 5% of A -- an
-   artefact that would have looked exactly like a finding.
+   artefact that would have looked exactly like a finding. Every stratum is now
+   drawn with a small `surplus` and cut to its target only after the whole-state
+   separation pass, so that pass can remove up to `surplus` of a stratum without
+   leaving one side short.
 
 5. LEAKAGE IS STRUCTURAL, NOT DISCIPLINARY.  Every column encoding how the map was
    made carries the `meta_` prefix and must never enter a model. This matters more
@@ -75,6 +87,24 @@ WHAT THIS SCRIPT DECIDES, AND WHY
    Florida and Texas are ~78% unpopulated with the classic reading. Pooling those
    merges three mechanisms under one label, so `meta_study_regime` keeps them apart.
 
+8. NEGATIVES PER POSITIVE IS EXACTLY 1:1.  1:1 is the common choice in
+   susceptibility work (Gu et al. 2024; Sincic et al. 2025; Collins et al. 2022).
+   It is a choice, not an optimum: Woznicki et al. (2019) settled near 1:4 after
+   testing several ratios, and Jia et al. (2026) report 1:2 beating 1:1. Each
+   negative stratum is cut to exactly round(n_pos * neg_ratio) by `meta_neg_rank`,
+   lowest kept. Positives are never trimmed to reach the ratio. When the band runs
+   short of candidates the remedy is more of them (`ring_oversample`): thinning
+   keeps the first points accepted from a random stream, so a longer stream
+   changes the run time, not the distribution. When the whole-state pass removes
+   more than the surplus, the remedy is a larger `surplus`; the error says which.
+   `--exact` makes any shortfall an error, so a short build is never written;
+   without it a supply-limited stratum keeps what it has and the achieved ratio is
+   reported.
+
+   `meta_src_row_id` is the `row_id` of the polygon behind each point: the polygon
+   that labelled a positive or shadedX negative, and the positive polygon whose
+   ring produced a band negative. FLD_AR_ID alone is not unique within a state.
+
 MEMORY
 ======
 The per-state parquets were written as a single row group -- Florida is 5.2 GB in
@@ -98,14 +128,15 @@ USAGE
     python sample_points.py VT                   # build one state
     python sample_points.py                      # build all ten
     python sample_points.py --per-domain 40000
-    python sample_points.py --neg-ratio 2        # build up to 1:2; 1:1 is a subset
-    python sample_points.py --neg-ratio 2 --enforce-ratio   # exact, smaller
+    python sample_points.py FL --protocols band --exact --ring-oversample 6
+                                                 # protocol v2: exact counts or nothing
     python sample_points.py --audit VT           # verify invariants
     python sample_points.py --report
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -137,17 +168,26 @@ ATTRS = ["DFIRM_ID", "FLD_AR_ID", "STUDY_TYP", "FLD_ZONE", "ZONE_SUBTY",
 
 DEFAULTS = dict(
     per_domain=20000,     # positives per domain (A, AE) per state
-    neg_ratio=2.0,        # MAXIMUM negatives per positive, per protocol; see note 8
-    min_sep_m=200.0,      # de-duplication floor; see note 2
+    neg_ratio=1.0,        # negatives per positive, per protocol; see note 8
+    min_sep_m=100.0,      # floor between any two points; see note 2
     block_km=10.0,        # spatial CV block edge
     poly_cap_frac=0.02,   # no polygon may supply more than this share of a domain
     band_min_m=500.0,     # negatives: nearest SFHA at least this far
     band_max_m=5000.0,    # ... and at most this far
     oversample=3.0,       # candidate multiplier before separation thinning
+    ring_oversample=2.0,  # band ring candidates = n_neg * oversample * this; note 8
+    surplus=0.03,         # extra share kept per stratum until the whole-state pass
+    protocols="band,shadedX",
+    state_polygons="",    # optional polygon file band negatives must fall inside; note 3
     seed=20260918,
 )
+PROTOCOLS = ("band", "shadedX")
 
 META_PREFIX = "meta_"   # never a feature
+
+
+class SupplyError(RuntimeError):
+    """A stratum fell short of its exact target under --exact."""
 
 
 # =========================================================================
@@ -474,10 +514,11 @@ def _attr_frame(att: pd.DataFrame, x, y, dist) -> pd.DataFrame:
         "meta_fld_ar_id": att["FLD_AR_ID"].values,
         "meta_poly_area_km2": att["area_m2"].values / 1e6,
         "meta_dist_to_sfha_m": dist,
+        "meta_src_row_id": att["row_id"].to_numpy(dtype=np.int64),
     })
 
 
-def _blank_frame(dfirm, x, y, dist) -> pd.DataFrame:
+def _blank_frame(dfirm, x, y, dist, src_row_id) -> pd.DataFrame:
     n = len(x)
     na = lambda: pd.array([pd.NA] * n, dtype="string")
     return pd.DataFrame({
@@ -487,6 +528,7 @@ def _blank_frame(dfirm, x, y, dist) -> pd.DataFrame:
         "meta_depth": np.full(n, np.nan), "meta_source_cit": na(),
         "meta_fld_ar_id": na(), "meta_poly_area_km2": np.full(n, np.nan),
         "meta_dist_to_sfha_m": dist,
+        "meta_src_row_id": np.asarray(src_row_id, dtype=np.int64),
     })
 
 
@@ -494,7 +536,8 @@ MAX_RINGS = 1500          # distinct polygons buffered for the negative band
 RING_SIMPLIFY_M = 100.0   # buffer is a candidate region; exactness is the distance filter
 
 
-def sample_band_negatives(state, src_idx, src_geoms, sfha_idx, pan_tree, n, cfg, rng):
+def sample_band_negatives(state, src_idx, src_geoms, sfha_idx, pan_tree, n, cfg, rng,
+                          state_tree=None):
     """Negatives in a distance band outside every SFHA, inside the mapped area.
 
     The band is generated from the SAME polygons that produced the positives, so
@@ -506,19 +549,24 @@ def sample_band_negatives(state, src_idx, src_geoms, sfha_idx, pan_tree, n, cfg,
     ribbons at 5 km took longer than the rest of the pipeline combined. And the
     ring is built from geometry simplified to 100 m with coarse corner segments,
     because the buffer only has to bound a candidate region -- the true distance
-    filter below is what decides membership, so the ring's own precision is
-    irrelevant. It is widened by the simplification tolerance so nothing valid is
-    excluded.
+    filter below is what decides membership. It is widened by the simplification
+    tolerance, but with quad_segs=2 its convex corners are chords that can sit up
+    to ~390 m inside the true 5 km buffer, so a sliver of the band's outer edge
+    beside sharp corners is never proposed.
     """
     if n <= 0 or len(src_geoms) == 0:
         return None
 
     bmin, bmax = cfg["band_min_m"], cfg["band_max_m"]
-    want = int(n * cfg["oversample"] * 2)
+    want = int(n * cfg["oversample"] * cfg["ring_oversample"])
 
     keep_i = np.arange(len(src_geoms))
+    flag = ""
     if len(keep_i) > MAX_RINGS:
         keep_i = rng.choice(keep_i, MAX_RINGS, replace=False)
+        flag = "   <-- RING CAP BINDING: a random subset of rings defines the band"
+    print(f"    band rings from {len(src_geoms):,} polygons "
+          f"(cap {MAX_RINGS:,}){flag}", flush=True)
     base = shapely.simplify(src_geoms[keep_i], RING_SIMPLIFY_M)
     ring = shapely.buffer(base, bmax + RING_SIMPLIFY_M, quad_segs=2)
     cap = max(4, int(np.ceil(want / max(len(ring) // 4, 1))))
@@ -529,7 +577,9 @@ def sample_band_negatives(state, src_idx, src_geoms, sfha_idx, pan_tree, n, cfg,
 
     pts = shapely.points(x, y)
     d = distances_to_sfha(state, pts, sfha_idx, bmax)
-    ok = (d >= bmin) & (d <= bmax)
+    near, far = d < bmin, d > bmax
+    ok = ~near & ~far
+    outside = np.zeros(len(pts), dtype=bool)
     if pan_tree is not None:
         # Outside a mapped panel we do not know the area was ever assessed, so
         # such a point is not evidence of absence.
@@ -537,14 +587,38 @@ def sample_band_negatives(state, src_idx, src_geoms, sfha_idx, pan_tree, n, cfg,
         hits = pan_tree.query(pts, predicate="within")
         if hits.size:
             inside[np.unique(hits[0])] = True
+        outside = ok & ~inside
         ok &= inside
+    abroad = np.zeros(len(pts), dtype=bool)
+    if state_tree is not None:
+        # The neighbouring state's floodplains are not in this state's NFHL, so
+        # across the line the distance above is measured against half the map.
+        home = np.zeros(len(pts), dtype=bool)
+        hits = state_tree.query(pts, predicate="within")
+        if hits.size:
+            home[np.unique(hits[0])] = True
+        abroad = ok & ~home
+        ok &= home
     if not ok.any():
         return None
 
     x, y, d, ri = x[ok], y[ok], d[ok], ri[ok]
-    keep = grid_thin(x, y, cfg["min_sep_m"], rng)[:n]
+    thinned = grid_thin(x, y, cfg["min_sep_m"], rng)
+    mask_note = (f", {int(abroad.sum()):,} outside the state polygons"
+                 if state_tree is not None else "")
+    print(f"    band candidates {len(pts):,}: {int(near.sum()):,} < {bmin:.0f} m, "
+          f"{int(far.sum()):,} > {bmax:.0f} m, {int(outside.sum()):,} outside a "
+          f"panel{mask_note}; {len(x):,} valid, {len(thinned):,} after thinning",
+          flush=True)
+    if len(thinned) < n:
+        print(f"    band supply short: {len(thinned):,}/{n:,}; try --ring-oversample "
+              f"{cfg['ring_oversample'] * n / max(len(thinned), 1) * 1.1:.1f}",
+              flush=True)
+    keep = thinned[:n]
     x, y, d, ri = x[keep], y[keep], d[keep], ri[keep]
-    return _blank_frame(src_idx["DFIRM_ID"].to_numpy()[keep_i[ri]], x, y, d)
+    src = keep_i[ri]
+    return _blank_frame(src_idx["DFIRM_ID"].to_numpy()[src], x, y, d,
+                        src_idx["row_id"].to_numpy()[src])
 
 
 def rank_negatives(df: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
@@ -552,24 +626,35 @@ def rank_negatives(df: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
 
     This is what turns the negative ratio into a post hoc filter. Ranks are
     assigned once, in random order, within each (domain, protocol) cell; a
-    downstream analysis selecting `neg_rank < r * n_pos` gets ratio r, and the
-    samples nest, so the 1:1 set is contained in the 1:2 set. Without this the
-    two ratios would differ in WHICH negatives they contain as well as how many,
-    and a comparison between them would not isolate the ratio.
+    downstream analysis selecting `meta_neg_rank < r * n_pos` gets ratio r, and
+    the samples nest, so a 1:2 set would contain the 1:1 set. Without this two
+    ratios would differ in WHICH negatives they contain as well as how many, and a
+    comparison between them would not isolate the ratio.
     """
     df = df.copy()
-    df["neg_rank"] = -1
+    df["meta_neg_rank"] = -1
     neg = df.label == 0
     if not neg.any():
         return df
-    key = [df["domain"], df["neg_protocol"].fillna("-")]
     order = rng.permutation(len(df))
     df["_o"] = np.argsort(np.argsort(order))
-    df.loc[neg, "neg_rank"] = (df[neg]
-                               .groupby([df.loc[neg, "domain"],
-                                         df.loc[neg, "neg_protocol"].fillna("-")])["_o"]
-                               .rank(method="first").astype(int) - 1)
+    df.loc[neg, "meta_neg_rank"] = (df[neg]
+                                    .groupby([df.loc[neg, "domain"],
+                                              df.loc[neg, "neg_protocol"].fillna("-")])["_o"]
+                                    .rank(method="first").astype(int) - 1)
     return df.drop(columns="_o")
+
+
+def dense_ranks(df: pd.DataFrame) -> pd.DataFrame:
+    """Renumber meta_neg_rank 0..n-1 within each stratum after rows were dropped."""
+    neg = df.label == 0
+    if neg.any():
+        df.loc[neg, "meta_neg_rank"] = (df[neg]
+                                        .groupby([df.loc[neg, "domain"],
+                                                  df.loc[neg, "neg_protocol"].fillna("-")])
+                                        ["meta_neg_rank"]
+                                        .rank(method="first").astype(int) - 1)
+    return df
 
 
 def achieved_ratios(df: pd.DataFrame) -> pd.DataFrame:
@@ -584,25 +669,30 @@ def achieved_ratios(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def enforce_ratio(df: pd.DataFrame, target: float) -> pd.DataFrame:
-    """Trim POSITIVES so every stratum hits the target ratio exactly.
+def trim_to_targets(df: pd.DataFrame, cfg: dict, protocols: list[str]):
+    """Cut every stratum to its target; return (df, shortfalls).
 
-    The alternative -- letting the ratio float with supply -- leaves it varying
-    by a factor of ten across states, which entangles it with the state effect
-    this design is built to hold fixed. Trimming costs sample size and buys a
-    clean comparison; which of those matters more is a choice, so it is a flag.
+    Positives keep the first `per_domain` rows of each domain in frame order,
+    which is grid_thin's random visit order, so the cut is a uniform subsample.
+    Each requested negative protocol keeps the round(n_pos * neg_ratio) rows with
+    the lowest meta_neg_rank, n_pos being the positives its domain kept. A short
+    stratum is reported, never made up by trimming positives (note 8).
     """
-    keep = []
-    for dom, g in df.groupby("domain"):
-        npos = int((g.label == 1).sum())
-        cap = npos
-        for prot, gg in g[g.label == 0].groupby(g.neg_protocol.fillna("-")):
-            cap = min(cap, int(np.floor(len(gg) / target)))
-        pos = g[g.label == 1].iloc[:cap]
+    keep, short = [], []
+    for dom in ("A", "AE"):
+        g = df[df.domain == dom]
+        pos = g[g.label == 1]
+        if len(pos) < cfg["per_domain"]:
+            short.append((dom, 1, "-", len(pos), cfg["per_domain"]))
+        pos = pos.iloc[:cfg["per_domain"]]
         keep.append(pos)
-        for prot, gg in g[g.label == 0].groupby(g.neg_protocol.fillna("-")):
-            keep.append(gg.nsmallest(int(round(cap * target)), "neg_rank"))
-    return pd.concat(keep, ignore_index=True)
+        target = int(round(len(pos) * cfg["neg_ratio"]))
+        for prot in protocols:
+            gg = g[(g.label == 0) & (g.neg_protocol.fillna("-") == prot)]
+            if len(gg) < target:
+                short.append((dom, 0, prot, len(gg), target))
+            keep.append(gg.nsmallest(target, "meta_neg_rank"))
+    return pd.concat(keep, ignore_index=True), short
 
 
 def balance_domains(df: pd.DataFrame) -> pd.DataFrame:
@@ -625,14 +715,28 @@ def balance_domains(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def attach_panel_meta(df: pd.DataFrame, pan) -> pd.DataFrame:
+    """Effective date, scale and type of the FIRM panel each point lies in.
+
+    Panels are whole printed sheets, so neighbouring counties' panels overlap and
+    about a third of Florida's points lie in two to four of them. The panel of the
+    point's own DFIRM is the map that labelled it, so it wins; another DFIRM's
+    panel is used only when the point lies in none of its own.
+    """
     for c in ("meta_eff_date", "meta_panel_scale", "meta_panel_typ"):
         df[c] = pd.NA
     if pan is None or not len(pan):
         return df
-    pts = gpd.GeoDataFrame({"_i": np.arange(len(df))},
+    pts = gpd.GeoDataFrame({"_i": np.arange(len(df)), "_dfirm": df["dfirm_id"].values},
                            geometry=gpd.points_from_xy(df.x, df.y), crs=CRS_WORK)
-    cols = [c for c in ("EFF_DATE", "SCALE", "PANEL_TYP") if c in pan.columns]
+    cols = [c for c in ("EFF_DATE", "SCALE", "PANEL_TYP", "DFIRM_ID", "FIRM_PAN")
+            if c in pan.columns]
     j = gpd.sjoin(pts, pan[cols + ["geometry"]], how="left", predicate="within")
+    if "DFIRM_ID" in j.columns:
+        # Own DFIRM first, then the lowest FIRM_PAN, the same rule
+        # pull_point_extras.py uses for meta_firm_pan.
+        j = j.assign(_own=(j["DFIRM_ID"] == j["_dfirm"]).fillna(False))
+        by = ["_own", "FIRM_PAN"] if "FIRM_PAN" in j.columns else ["_own"]
+        j = j.sort_values(by, ascending=[False] + [True] * (len(by) - 1), kind="stable")
     j = j[~j.index.duplicated(keep="first")].reindex(pts.index)
     if "EFF_DATE" in cols:
         df["meta_eff_date"] = j["EFF_DATE"].values
@@ -664,10 +768,19 @@ def bfe_density_map(state: str, sfha_idx: pd.DataFrame) -> dict:
         return {}
 
 
+def parse_protocols(s: str) -> list[str]:
+    out = [p.strip() for p in s.split(",") if p.strip()]
+    bad = [p for p in out if p not in PROTOCOLS]
+    if not out or bad:
+        sys.exit(f"--protocols must be a non-empty subset of {PROTOCOLS}, got {s!r}")
+    return out
+
+
 def build_state(state: str, cfg: dict):
     t0 = time.time()
     idx = load_index(state)
     rng = np.random.default_rng(cfg["seed"] + sum(map(ord, state)))
+    protocols = parse_protocols(cfg["protocols"])
 
     sfha_idx = idx[idx.SFHA_TF == "T"]
     pos_idx = sfha_idx[sfha_idx.FLD_ZONE.isin(["A", "AE"])]
@@ -682,6 +795,14 @@ def build_state(state: str, cfg: dict):
     pan = gpd.read_parquet(pan_p).to_crs(CRS_WORK) if pan_p.exists() else None
     pan_tree = (STRtree(np.asarray(pan.geometry.values))
                 if pan is not None and len(pan) else None)
+    state_tree = None
+    if cfg.get("state_polygons"):
+        sp_path = Path(cfg["state_polygons"])
+        stp = (gpd.read_parquet(sp_path) if sp_path.suffix == ".parquet"
+               else gpd.read_file(sp_path)).to_crs(CRS_WORK)
+        state_tree = STRtree(np.asarray(stp.geometry.values))
+        print(f"  band negatives must also lie inside {len(stp):,} polygons "
+              f"from {sp_path}")
 
     print(f"\n[{state}] A={int((pos_idx.FLD_ZONE=='A').sum()):,}  "
           f"AE={int((pos_idx.FLD_ZONE=='AE').sum()):,}  "
@@ -717,27 +838,39 @@ def build_state(state: str, cfg: dict):
             print(f"  [{domain}] sampling produced nothing")
             continue
         drawn = len(x)
-        keep = grid_thin(x, y, cfg["min_sep_m"], rng)[:n_target]
+        n_keep = n_target + int(np.ceil(n_target * cfg["surplus"]))
+        thinned = grid_thin(x, y, cfg["min_sep_m"], rng)
+        keep = thinned[:n_keep]
         x, y, pidx = x[keep], y[keep], pidx[keep]
 
         pos = _attr_frame(src.iloc[pidx], x, y, np.zeros(len(x)))
         pos["domain"], pos["label"], pos["neg_protocol"] = domain, 1, pd.NA
         frames.append(pos)
         sat = "" if len(x) >= n_target else "   <-- SUPPLY-LIMITED"
-        print(f"  [{domain}] positives {len(x):,}/{n_target:,} from {len(src):,} "
-              f"polygons, {src.iloc[pidx].DFIRM_ID.nunique()} DFIRMs "
-              f"(thinning kept {100*len(keep)/drawn:.0f}%){sat}", flush=True)
+        print(f"  [{domain}] positives {len(x):,} kept for {n_target:,} from "
+              f"{len(src):,} polygons, {src.iloc[pidx].DFIRM_ID.nunique()} DFIRMs "
+              f"(thinning kept {100*len(thinned)/drawn:.0f}% of {drawn:,}){sat}",
+              flush=True)
 
-        n_neg = int(len(x) * cfg["neg_ratio"])
+        # Negatives are sized to the positives this stratum will keep, and only
+        # those positives' polygons seed the ring: the surplus exists to absorb
+        # the whole-state pass, not to widen the band.
+        n_pos = min(len(x), n_target)
+        n_neg_target = int(round(n_pos * cfg["neg_ratio"]))
+        n_neg = n_neg_target + int(np.ceil(n_neg_target * cfg["surplus"]))
 
-        used = np.unique(pidx)
-        band = sample_band_negatives(state, src.iloc[used].reset_index(drop=True),
-                                     geoms[used], sfha_idx, pan_tree, n_neg, cfg, rng)
-        if band is not None and len(band):
-            band["domain"], band["label"], band["neg_protocol"] = domain, 0, "band"
-            frames.append(band)
-            print(f"  [{domain}] negatives band    {len(band):,}/{n_neg:,}", flush=True)
+        if "band" in protocols:
+            used = np.unique(pidx[:n_pos])
+            band = sample_band_negatives(state, src.iloc[used].reset_index(drop=True),
+                                         geoms[used], sfha_idx, pan_tree, n_neg, cfg, rng,
+                                         state_tree)
+            if band is not None and len(band):
+                band["domain"], band["label"], band["neg_protocol"] = domain, 0, "band"
+                frames.append(band)
+                print(f"  [{domain}] negatives band    {len(band):,}/{n_neg:,}", flush=True)
 
+        if "shadedX" not in protocols:
+            continue
         # Zone X 0.2%-chance polygons in the same DFIRMs. These control for
         # 'was this place mapped at all', which the distance band does not.
         sx_all = shaded_idx[shaded_idx.DFIRM_ID.isin(set(src.DFIRM_ID))]
@@ -764,20 +897,40 @@ def build_state(state: str, cfg: dict):
         return None
     df = pd.concat(frames, ignore_index=True)
 
-    # One separation pass over the whole state, so a positive and a negative cannot
-    # end up sharing a raster cell across strata. Half the within-stratum floor:
-    # cross-label pairs need only be distinguishable, not independent.
-    keep = grid_thin(df.x.values, df.y.values, cfg["min_sep_m"] * 0.5, rng)
-    if len(keep) < len(df):
-        print(f"  cross-stratum separation dropped {len(df)-len(keep):,}")
+    # One separation pass over the whole state at the full floor, so no two points
+    # are closer than min_sep_m whatever their class or zone (note 2). A band
+    # negative is at least band_min_m from every SFHA and so from every positive;
+    # what this pass separates is A from AE -- positives in adjacent polygons and
+    # band negatives in overlapping rings -- plus shadedX from the rest.
+    strata = ["domain", "label", "neg_protocol"]
+    n0 = df.fillna({"neg_protocol": "-"}).groupby(strata).size()
+    keep = grid_thin(df.x.values, df.y.values, cfg["min_sep_m"], rng)
     df = df.iloc[np.sort(keep)].reset_index(drop=True)
+    lost = n0 - df.fillna({"neg_protocol": "-"}).groupby(strata).size().reindex(
+        n0.index, fill_value=0)
+    print("  whole-state separation dropped " +
+          ", ".join(f"{d}/{l}/{p} {n:,}" for (d, l, p), n in lost.items()))
 
     df = rank_negatives(df, rng)
-    if cfg.get("enforce_ratio"):
-        n0 = len(df)
-        df = enforce_ratio(df, cfg["neg_ratio"])
-        print(f"  enforced ratio {cfg['neg_ratio']:g}:1 exactly: {n0:,} -> {len(df):,}")
-    df = balance_domains(df)
+    n1 = len(df)
+    df, short = trim_to_targets(df, cfg, protocols)
+    print(f"  trimmed surplus to targets: {n1:,} -> {len(df):,}")
+    remedies = set()
+    for dom, lab, prot, have, want in short:
+        # Enough before the whole-state pass means the pass ate the surplus;
+        # otherwise the stratum never had the candidates.
+        if int(n0.get((dom, lab, prot), 0)) >= want:
+            why, fix = "lost to the whole-state pass", "--surplus"
+        else:
+            why, fix = "supply", "--oversample" if lab == 1 else "--ring-oversample"
+        remedies.add(fix)
+        what = "positives" if lab == 1 else prot
+        print(f"  [{dom}] {what} {have:,}/{want:,}   <-- SHORT ({why}: raise {fix})")
+    if short and cfg.get("exact"):
+        raise SupplyError(
+            f"[{state}] {len(short)} strata short of the exact targets; nothing "
+            f"written. Raise {' and '.join(sorted(remedies))}.")
+    df = dense_ranks(balance_domains(df))
 
     ach = achieved_ratios(df)
     short = ach[ach.ratio < cfg["neg_ratio"] - 0.01]
@@ -815,9 +968,20 @@ def build_state(state: str, cfg: dict):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUT_DIR / f"points_{state}.parquet"
     g.to_parquet(out)
+    # The build settings travel with the file, so --audit tests what was built.
+    t = pq.read_table(out)
+    md = dict(t.schema.metadata or {})
+    md[b"sample_points"] = json.dumps(cfg, sort_keys=True).encode()
+    pq.write_table(t.replace_schema_metadata(md), out)
     print(f"[{state}] wrote {len(g):,} points, {g.block_id.nunique():,} blocks "
           f"-> {out}  ({time.time()-t0:.0f}s)")
     return g
+
+
+def build_config(path: Path) -> dict | None:
+    md = pq.read_schema(path).metadata or {}
+    raw = md.get(b"sample_points")
+    return json.loads(raw) if raw else None
 
 
 # =========================================================================
@@ -829,8 +993,12 @@ def audit(states: list[str], cfg: dict) -> None:
             print(f"[{s}] not built")
             continue
         g = gpd.read_parquet(f)
+        built = build_config(f)
+        c = built or cfg
         print(f"\n=== {s}: {len(g):,} points ===")
         print(f"  CRS {g.crs.to_epsg()} (want {CRS_WORK})")
+        print("  built with: " + (json.dumps(built, sort_keys=True) if built else
+                                  "no stored config (pre-v2 build); testing the defaults"))
 
         t = g.groupby(["domain", "label", g.neg_protocol.fillna("-")]).size()
         print("  strata:\n    " + t.to_string().replace("\n", "\n    "))
@@ -838,24 +1006,64 @@ def audit(states: list[str], cfg: dict) -> None:
             a, e = t.xs("A", level=0), t.xs("AE", level=0)
             ok = a.reindex(e.index).fillna(0).astype(int).equals(e.astype(int))
             print(f"  A/AE strata identical: {'YES' if ok else 'NO  <-- BROKEN'}")
+        if built:
+            n_neg = int(round(c["per_domain"] * c["neg_ratio"]))
+            want = {(d, 1, "-"): c["per_domain"] for d in ("A", "AE")}
+            want.update({(d, 0, p): n_neg for d in ("A", "AE")
+                         for p in parse_protocols(c["protocols"])})
+            got = {k: int(t.get(k, 0)) for k in want}
+            ok = got == want and len(t) == len(want)
+            print(f"  exact targets ({c['per_domain']:,} positives, {n_neg:,} per "
+                  f"negative protocol, per domain): {'YES' if ok else 'NO'}")
 
+        # Spacing is tested exactly, over every pair, in the working CRS.
+        sep = c["min_sep_m"]
         pts = shapely.points(g.geometry.x.values, g.geometry.y.values)
-        nn = STRtree(pts).query(pts, predicate="dwithin",
-                                distance=cfg["min_sep_m"] * 0.999)
-        off = nn[0] != nn[1]
+        tree = STRtree(pts)
+        nn = tree.query(pts, predicate="dwithin", distance=sep)
+        nn = nn[:, nn[0] < nn[1]]
+        close = shapely.distance(pts[nn[0]], pts[nn[1]]) < sep
         strat = g.groupby(["domain", "label", g.neg_protocol.fillna("-")]).ngroup().values
-        same = int((strat[nn[0]][off] == strat[nn[1]][off]).sum() // 2)
-        print(f"  pairs closer than {cfg['min_sep_m']:.0f} m: {int(off.sum()//2):,} "
-              f"({same:,} within one stratum -- must be 0)")
+        same = int((strat[nn[0]] == strat[nn[1]])[close].sum())
+        # exclusive=True skips geometries equal to the query, so exact duplicates
+        # are folded back in from the pair distances.
+        j, dist = tree.query_nearest(pts, exclusive=True, return_distance=True)
+        nearest = np.full(len(pts), np.inf)
+        np.minimum.at(nearest, j[0], dist)
+        if close.any():
+            pd_ = shapely.distance(pts[nn[0]], pts[nn[1]])
+            np.minimum.at(nearest, nn[0], pd_)
+            np.minimum.at(nearest, nn[1], pd_)
+        print(f"  pairs closer than {sep:.0f} m: {int(close.sum()):,} "
+              f"({same:,} within one stratum); minimum nearest-neighbour distance "
+              f"{nearest.min():.3f} m, median {np.median(nearest):.0f} m")
 
         pos = g[g.label == 1]
         print(f"  positives at distance 0 from SFHA: "
               f"{(pos.meta_dist_to_sfha_m == 0).mean()*100:.1f}% (want 100)")
         b = g[g.neg_protocol == "band"]
         if len(b):
-            print(f"  band negatives distance range: {b.meta_dist_to_sfha_m.min():.0f}"
-                  f"-{b.meta_dist_to_sfha_m.max():.0f} m "
-                  f"(want {cfg['band_min_m']:.0f}-{cfg['band_max_m']:.0f})")
+            d = b.meta_dist_to_sfha_m
+            off = int(((d < c["band_min_m"]) | (d > c["band_max_m"])).sum())
+            print(f"  band negatives distance range: {d.min():.0f}-{d.max():.0f} m "
+                  f"(want {c['band_min_m']:.0f}-{c['band_max_m']:.0f}; "
+                  f"{off} outside)")
+            pan_p = IN_DIR / f"pan_{s}.parquet"
+            if pan_p.exists():
+                pan = gpd.read_parquet(pan_p).to_crs(CRS_WORK)
+                hits = STRtree(np.asarray(pan.geometry.values)).query(
+                    np.asarray(b.geometry.values), predicate="within")
+                inside = np.zeros(len(b), dtype=bool)
+                inside[np.unique(hits[0])] = True
+                print(f"  band negatives inside a FIRM panel: {int(inside.sum()):,}"
+                      f"/{len(b):,}")
+        key = (["meta_src_row_id"] if "meta_src_row_id" in g.columns
+               else ["dfirm_id", "meta_fld_ar_id"])
+        for dom, p in pos.groupby("domain"):
+            share = p.groupby(key).size().sort_values(ascending=False) / len(p)
+            print(f"  [{dom}] positives from {len(share):,} polygons; largest "
+                  f"{100*share.iloc[0]:.2f}%, top 10 {100*share.iloc[:10].sum():.1f}% "
+                  f"(cap {100*c['poly_cap_frac']:.0f}% applies to candidates)")
         sx = g[g.neg_protocol == "shadedX"]
         if len(sx):
             print(f"  shadedX negatives inside an SFHA: "
@@ -896,15 +1104,16 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--audit", action="store_true")
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--enforce-ratio", action="store_true",
-                    help="trim positives so every stratum hits "
-                         "--neg-ratio exactly (uniform but smaller)")
+    ap.add_argument("--exact", action="store_true",
+                    help="fail, writing nothing, unless every stratum reaches "
+                         "per_domain positives and per_domain*neg_ratio negatives")
     for k, v in DEFAULTS.items():
         ap.add_argument(f"--{k.replace('_','-')}", type=type(v), default=v)
     a = ap.parse_args(argv)
 
     cfg = {k: getattr(a, k) for k in DEFAULTS}
-    cfg["enforce_ratio"] = a.enforce_ratio
+    cfg["exact"] = a.exact
+    parse_protocols(cfg["protocols"])
     states = a.states or STATES
     bad = [s for s in states if s not in STATES]
     if bad:
@@ -920,21 +1129,30 @@ def main(argv: list[str]) -> int:
         return 0
 
     print("config:", {k: cfg[k] for k in sorted(cfg)})
+    failed = []
     for s in states:
         out = OUT_DIR / f"points_{s}.parquet"
         if out.exists() and not a.force:
             print(f"[{s}] exists -- skipping (use --force to rebuild)")
             continue
         try:
-            build_state(s, cfg)
+            if build_state(s, cfg) is None and cfg["exact"]:
+                print(f"[{s}] FAILED: nothing built under --exact", file=sys.stderr)
+                failed.append(s)
+        except SupplyError as e:
+            print(f"[{s}] FAILED: {e}", file=sys.stderr)
+            failed.append(s)
         except Exception:
             import traceback
             print(f"[{s}] FAILED", file=sys.stderr)
             traceback.print_exc()
+            failed.append(s)
 
     print()
     report()
-    return 0
+    if failed:
+        print(f"\nfailed: {failed}", file=sys.stderr)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

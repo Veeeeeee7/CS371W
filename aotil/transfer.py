@@ -24,8 +24,9 @@ Unconstrained selection (mu = 0) has no spatial structure to carry, so its
 transfer should collapse toward the random control. That collapse is a result in
 its own right. A place-organised inversion should survive.
 
-Pseudo-replication note: points are 200 m apart inside corridors and the largest
-1% of source polygons supply 8-26% of a domain, so anything reported at the
+Pseudo-replication note: points can be as close as 100 m (the sampler's floor
+between any two points) inside corridors and the largest 1% of source polygons
+supplied 8-26% of a domain in the v1 sample, so anything reported at the
 point level is bootstrapped at the TILE level, never the point level. Inside a
 compact region this is worse, not better, which is exactly why this test exists.
 """

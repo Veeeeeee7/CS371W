@@ -110,8 +110,8 @@ queue is long, `GPUS=0 DEVICE=cpu` costs very little.
 
 Size the population with `gate.py`'s convergence table rather than the paper's
 4,200: it reports the smallest population whose correlation is within 1% of the
-full one, which is the paper's own stated criterion (about ten models for VLCS,
-six for WILDS-Camelyon). Past that point more models buy precision in the
+full one, which is the paper's own stated criterion (1,010 models for VLCS,
+610 for WILDS-Camelyon). Past that point more models buy precision in the
 *selection*, not in the correlation.
 
 ## Two deviations from the paper, both forced by this data
@@ -147,3 +147,58 @@ most-misclassified positive, null near zero, holds across family-disjoint splits
 Under `shadedX` it is not separable from difficulty, which is why `band` is
 primary and `shadedX` is the sensitivity arm. The pilot's cells carried no
 lon/lat and cannot be reused; `zoo.SPATIAL_COLS` is the fix.
+
+---
+
+## First experiment: paper-protocol OODSelect, classic vs spatial (2026-09-24)
+
+Two submissions, one worker, one difference:
+
+```bash
+./upload_to_cluster.sh && conda run -n aotil pip install 'optuna>=3.0'   # once
+./submit_oodselect_classic.sh --date YYYY-MM-DD    # OODSelect as released, mu = 0
+./submit_oodselect_spatial.sh --date YYYY-MM-DD    # + mu * z'Lz/(S k), mu = 3, k = 10
+./download_from_cluster.sh YYYY-MM-DD
+```
+
+Cells: `FL:band:AE:0` and `FL:band:A:0` (both directions). Per cell: a zoo job
+(300 models; skipped if the cell exists, shared between the two submissions),
+one array task per budget in the authors' grid (10 ... 7,500, truncated below
+the OOD set size), and a report job. `DRY_RUN=1` prints the sbatch lines.
+
+`aotil/oodselect_paper.py` follows the **authors' released code**
+(github.com/olawalesalaudeen/OODSELECT), not `aotil/oodselect.py`:
+
+| | `oodselect.py` (aotil sweep) | `oodselect_paper.py` (this experiment) |
+|---|---|---|
+| per-example score | P(observed class) | binary argmax correctness |
+| ID performance | mean P(observed class) | accuracy |
+| probit | ID side only | both sides, eps 1e-6 |
+| budget term | λ(S − Σw)², 10× linear ramp | softplus(S − Σw), cosine warm-up, one-sided |
+| optimiser | Adam, fixed lr 0.35, 400 iters, 4 restarts | Adam + CosineAnnealingLR, ≤ 50,000 epochs, early stop (patience 500) on val r |
+| hyperparameters | fixed | 100 Optuna trials over the authors' 5-D space |
+| model split | numpy permutation, seed | sklearn `train_test_split`, random_state 42 |
+| budgets | f = 0.05 / 0.10 / 0.25 | 10, 20, 50, 100, 250, 500, 750, 1000, 2500, 5000, 7500 |
+| most-misclassified | ranked on selection models | ranked on **test** models (authors); selection-model version kept as `hard_sel_r` |
+
+`aotil/test_oodselect_paper.py` runs the authors' `TestSetFinder` (copied
+verbatim) under a real Lightning `Trainer` and checks that `train_one` stops at
+the same epoch with the same validation r and the same top-S set, for both mu
+= 0 and mu = 3 (`pip install pytorch_lightning` for that check).
+
+Outputs, `results/<date>/oodselect_paper/`:
+`<variant>/<cell>_S<budget>_{result,trials}.csv`, `_theta.npy`;
+`<variant>/<cell>_summary.csv` (test r + Fisher CI, Spearman, random x100,
+most-misclassified, coherence); `<variant>/<cell>_jaccard.csv` (Eq. 6);
+`<cell>_model_convergence.csv`; `<cell>_comparison.csv` once both variants
+exist.
+
+Two things to know when reading them:
+- Under the authors' one-sided budget term the soft mass Σσ(θ) ends far above
+  S (2,800–5,300 at S = 500), so the mu term smooths a broad plateau and the
+  top-S cut is taken from it. That is why mu = 3 gives much tighter regions here
+  (purity ~0.85–0.93 at S = 500) than it did in the aotil sweep (0.71).
+  `soft_mass` and `P_soft` are logged per budget.
+- Each budget is seeded separately (`seed * 1_000_003 + S`). With one shared
+  seed the budgets came out nested by construction, which would fake the
+  paper's cross-budget consistency (Eq. 6).
