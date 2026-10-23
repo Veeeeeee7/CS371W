@@ -1,204 +1,125 @@
-# aotil — spatially regularized OODSelect
+# aotil: OODSelect with a spatial penalty, and the analyses of its regions
 
-Implementation of OODSelect (Salaudeen et al., [arXiv:2510.24884](https://arxiv.org/abs/2510.24884))
-on the FEMA Zone A / Zone AE label-provenance benchmark, with a graph-Laplacian
-smoothness term that turns its scattered subsets into physical regions.
+The model and selection code behind the paper (`CS371_Cho_Li/acl_latex.tex`). Models trained on FEMA Zone AE
+points (detailed studies) are scored on held-out Zone AE points (the in-distribution half, ID) and on Zone A
+points (approximate studies, the out-of-distribution half, OOD) in the same 50 km tiles. OODSelect (Salaudeen
+et al. 2025) searches for Zone A subsets where accuracy-on-the-line inverts: across models, higher ID accuracy
+goes with lower accuracy on the subset. A graph-Laplacian penalty on a 10-nearest-neighbour graph of the Zone A
+points makes those subsets connected regions, and the other modules describe the regions.
 
-Method spec: `docs/SPATIAL-OODSELECT.md`. Framing: `claude/project-abstract.md`.
+Terms: a *cell* is one model population, (state, negative protocol, training zone, seed), stored as `<tag>.npz`
+and `<tag>_models.csv` (e.g. `FL_band_AE_s0`). A *lobe* is one single-part flood-zone polygon. A *level set* is
+a curve of constant ground elevation, like a contour line. EPSG:5070 and EPSG:3086 are projections in metres.
 
----
+## Modules
 
-## Run this first
-
-```bash
-./run_aotil_laptop.sh          # ~2 min, no cluster, no GPU, no data needed for stage 1
-```
-
-Stage 1 is `aotil/test_aotil.py`: finite-difference checks on every hand-written
-gradient, numpy/torch backend agreement, μ behaviour, the controls, the coherence
-metrics, and an end-to-end pass on synthetic cells. Stage 2 runs a 24-model cell
-on the real Florida parquet to prove the data path.
-
-**The gradient checks are the point.** Every gradient in `oodselect.py` is derived
-by hand. A wrong one does not crash — it quietly optimises a different objective
-and returns a subset that looks like a result. If you change the objective, change
-those checks in the same edit.
-
-## Then the cluster
-
-```bash
-./upload_to_cluster.sh && ./upload_data_to_cluster.sh
-LIMIT=1 ./submit_aotil_all.sh --date $(date +%F)     # watch one job first
-./submit_aotil_all.sh --date $(date +%F)             # then the rest
-./download_from_cluster.sh $(date +%F) --cells
-```
-
-One job per **cell** = (state, protocol, train-domain, tile-split seed). Every
-output, cell and log is per-cell, so the jobs are independent.
-
----
-
-## Where things live on the cluster
-
-Two trees, split by size and by whether a loss costs a number or only compute.
-
-| | path | holds | size |
-|---|---|---|---|
-| **home** | `/users/$USER/cs371w` | code, `results/<date>/aotil/`, `logs/<date>/` | a few hundred KB of code, a few MB per run |
-| **scratch** | `/scratch/$USER/cs371w` | `data/processed/`, `aotil/cells/` | ~220 MB + ~20–40 MB per cell |
-
-Home quota is the binding constraint, and the parquets and the cells are the
-only large things involved, so both go to scratch. **Scratch is purged**, which
-is survivable exactly because both are reconstructible: the parquets re-upload
-from the laptop in minutes, and a cell refits from them. Nothing that is a
-result is ever written there — `results/` and `logs/` stay in the home checkout
-on purpose, so a purge costs compute and never costs a number.
-
-`run_aotil.sh` resolves this itself: it uses `AOTIL_ARTIFACT_ROOT` if set,
-otherwise `/scratch/$USER/cs371w` **when `/scratch` exists**, otherwise
-repo-local paths. It checks for `/scratch` rather than trusting `mkdir -p` to
-fail, because on a machine with a writable `/` that mkdir succeeds everywhere
-and would quietly put the laptop's cells somewhere nobody looks again. The
-laptop therefore runs unchanged, out of `data/processed` and
-`data/interim/aotil/cells`.
-
-Override any of it:
-
-```bash
-AOTIL_ARTIFACT_ROOT=/some/other/scratch sbatch run_aotil.sh --date <D>
-DATA_DIR=... CELLS_DIR=... sbatch run_aotil.sh --date <D>
-CS371_REMOTE_SCRATCH=/scratch/vmli3/cs371w ./upload_data_to_cluster.sh
-```
-
-The sync scripts use the same split: `upload_to_cluster.sh` sends code to home
-and creates both trees, `upload_data_to_cluster.sh` sends the parquets to
-scratch, and `download_from_cluster.sh <date>` pulls results and logs from home
-while `--cells` pulls the cells from scratch. Pull the cells once a run
-finishes — you need them to re-sweep or re-characterise without refitting the
-model population, and scratch will not keep them.
-
-## What each file does
-
-| file | role |
+| file | what it does |
 |---|---|
-| `zoo.py` | fits the heterogeneous model population and writes the cell `.npz` — the models, their per-example scores on the ID and OOD halves of the same held-out tiles, and the spatial columns |
-| `gate.py` | ID spread, the aggregate ID→OOD correlation, and the paper's model-count convergence rule |
-| `graph.py` | spatial adjacency, the Laplacian, and every coherence metric. Runnable self-test |
-| `oodselect.py` | the selection: relaxed objective, hand-written gradients, Adam + cosine annealing, restarts, μ term, numpy and torch backends |
-| `cells.py` | loading a cell and defining the model splits — in one place, so every stage splits identically |
-| `pointcov.py` | **E0**, the go/no-go: per-point covariance and its Moran's I null |
-| `analyse.py` | **E1**, the μ sweep with every control at every μ — the core result |
-| `transfer.py` | **E2**, held-out-point transfer inside the region |
-| `characterise.py` | metadata enrichment of a selected subset |
-| `test_aotil.py` | the self-test |
+| `zoo.py` | fits a cell's 300 models (dt, et, hgb, lr, mlp, nb, rf, xgb) and stores each model's probability of the true class on every ID and OOD point |
+| `cells.py` | `load_cell`, the one way every stage reads a cell; the tree families of the family-disjoint split |
+| `audit_cell.py` | re-derives a cell from the point table and the code (shapes, model table, rows, tiles, refits); PASS or FAIL |
+| `graph.py` | the kNN graph (EPSG:3086), its Laplacian and the coherence metrics (purity, cut share, components, tiles); `python aotil/graph.py` runs its built-in checks |
+| `oodselect_paper.py` | OODSelect as its authors released it, plus the optional spatial term; one run = (cell, budget S, variant) |
+| `report_paper.py` | per cell and variant: r on the held-out models with a Fisher interval, the random and most-misclassified baselines, cross-budget overlap (the paper's Eq. 6), the model-count rule, classic vs spatial |
+| `audit_selection.py` | recomputes every number a selection run stored from its θ and the cell; `--smoothed-classic` adds that ablation |
+| `o1_shift.py` | O1, the per-model AUC gap from the Zone AE half to the Zone A half (all points, land, paired land; tile bootstrap), and O2, the aggregate ID-OOD correlation |
+| `regions.py` | the connected components of a selection's top S points on the same kNN graph, one row per region |
+| `region_recurrence.py` | whether a seed's regions come back in the other seeds |
+| `lobes.py` | per region: its Zone A lobes, matched unselected Zone A lobes and Zone AE lobes in its tiles, with edge vertices every 30 m |
+| `edge_layers.py` | distance from every edge vertex to soil-survey lines, county lines, map-panel edges and canals, with coverage checks |
+| `boundary_stat.py` | O5 boundary statistic: share of Zone A edge that is not a level set and lies on a soil or map line, with a displaced-edge null |
+| `match_controls.py` | O5 S1: a terrain-matched unselected Zone A control for every region land point |
+| `region_null.py` | O5 S2: random connected patches of unselected Zone A points, grown to each region's size |
+| `o5_interpolation.py` | O5 Part A: does the inversion survive without the models that memorize their training labels? |
+| `o5_contrast.py` | O5 Part B: regions vs their terrain-matched controls on about 40 non-terrain descriptors |
+| `o5_shift_decomp.py` | O5 Part C: covariate shift or concept shift (support, label conflict, reweighting) |
+| `o5_feature_inclusion.py` | O5 Part D1: which features the models furthest below the line saw |
+| `o5_lofo.py` | O5 Part D2: leave-one-feature-out populations scored on the fixed selections |
+| `o5_polygons.py` | O5 Part E: how the region polygons were drawn (vertex spacing, straight runs, study type, panels, map revisions) |
+| `o5_pooling.py` | O5 Part F: what adding the region labels to training costs on Zone AE |
 
-## The order the phases must run in
+Not in the paper: the boundary statistic, Part E and the family-disjoint split (`CS371_Cho_Li/CHANGES-2026-10-19.md`);
+the terrain-matched controls, the matched-growth null, label conflict, pooling and leave-one-feature-out
+(`CHANGES-2026-10-19b.md` §2). The paper's region analysis uses *twins*, held-out Zone AE points matched on all
+seven inputs. Its scripts are still `results/2026-10-19/paper_figures/region_twins_ref.py`, `region_twins_summary.py`
+and `fig_twins.py`; Part B of `docs/TASK-REGION-TWINS.md`, which ports them here, is not done.
 
-`zoo` → `gate` → **E0** → E1 → E2. E0 is a gate, not a formality: if the
-per-point covariance map is inside its permutation null it is spatial white
-noise, no μ > 0 can assemble a region from it, and the sweep will spend a day
-confirming that. `STOP_ON_NOGO=1` makes the driver stop there. Read the verdict
-line in the log before queueing the rest.
+## Run order
 
-## Where the compute goes
+1. `docs/RUN-FL-V2.md`: raw inputs and the Florida point table, then a 45-feature seed-0 pass (cell, selections,
+   regions, lobes, DEM, soil lines, distances).
+2. `docs/TASK-FULL-RUN-W7.md` Part C, the seven-feature run: cells for seeds 0-2, O1/O2 (`o1_shift.py`), selections
+   and controls, regions and their recurrence, lobes and distances (RUN-FL-V2 steps 12-15), `boundary_stat.py`.
+3. `docs/TASK-O5-REGIONS.md`: S1 (`match_controls.py`), S2 (`region_null.py`), then Parts A-F (`o5_*.py`).
+4. `docs/TASK-REGION-TWINS.md`: the twins analysis.
 
-The model population is scikit-learn on CPU and is roughly 95% of the wall clock;
-the selection that follows is seconds. The GPU earns its place only because
-restarts and μ values batch into a single mat-vec (`DEVICE=cuda`), and because
-the XGBoost family can use it. **This workload does not need a B200.** If the GPU
-queue is long, `GPUS=0 DEVICE=cpu` costs very little.
+`run_oodselect_local.sh` (repo root) builds each cell in `CELLS` with `zoo.py` (skipped when it exists), runs
+`oodselect_paper.py` for every (variant, budget) as single-threaded processes, `JOBS` at a time, then
+`report_paper.py`. A budget whose `_result.csv` exists is skipped, so redo a run under a new `--date`. Its defaults
+are the 45-feature table and both directions, so the routines always set `CELLS` (the seven-feature run also
+`DATA_DIR=data/processed_w7 CELLS_DIR=data/interim/aotil/cells_w7`). Other knobs: `SEED`, `VARIANTS`, `MU_SPATIAL`
+(3), `KNN` (10), `BUDGETS`, `NULL_SEEDS`, `SPLITS`. Outputs the 2026-10-21 code review made stale: `docs/RUN-FL-V2.md`.
 
-Size the population with `gate.py`'s convergence table rather than the paper's
-4,200: it reports the smallest population whose correlation is within 1% of the
-full one, which is the paper's own stated criterion (1,010 models for VLCS,
-610 for WILDS-Camelyon). Past that point more models buy precision in the
-*selection*, not in the correlation.
+## How `oodselect_paper.py` follows the authors' code
 
-## Two deviations from the paper, both forced by this data
+It reimplements the selection from the authors' release (github.com/olawalesalaudeen/OODSELECT); each function
+names the part it mirrors. Where the paper and the code differ, it follows the code, which produced the paper's
+numbers. As in the release:
+- score: correctness of each model's argmax prediction (`extract_data`), rebuilt from the stored true-class
+  probability, a p = 0.5 tie going to class 0; ID performance is plain accuracy;
+- models split 60/20/20 into selection, validation and held-out groups by sklearn `train_test_split` at
+  `random_state=42` (`prepare_dataset`);
+- loss: the Pearson r of probit accuracies, clamped to [1e-6, 1 - 1e-6] (`PearsonRLoss`); weights `sigmoid(theta)`;
+  the subset is the top S of theta (`get_binary_selection`);
+- budget term: a one-sided `softplus(S - sum of weights)` with a cosine warm-up, not the quadratic penalty of the
+  paper's Eq. 5 (Salaudeen et al. 2025, p. 4). The soft mass ends far above S (S = 500, W7 run: 3,850-7,169 classic,
+  4,208-14,281 spatial), and the S largest weights form the subset;
+- Adam with `CosineAnnealingLR`, early stopping after 500 epochs without a better validation r (at most 50,000),
+  the theta at the stopping epoch kept; Optuna, 100 trials over the five released hyperparameters;
+- the authors' budget grid below the OOD set size, Fisher 95% intervals, r <= -0.3 counted as an inversion.
 
-1. **Continuous scores.** The paper uses binary correctness `Z_ij`. AUC has no
-   per-example decomposition, and a 0.5 threshold would mean different things
-   across cells whose achieved positive:negative ratios run 0.18 to 1.04. `S_ij`
-   is the predicted probability of the observed class; the objective is unchanged.
-2. **The spatial term.** `μ · wᵀLw / (S·k)`, normalised so P is an incoherence
-   score in [0, ~1] and a given μ means the same thing in every cell. μ = 0 is the
-   paper's objective exactly.
+Where it departs:
+- `--mu > 0` adds mu * z'Lz / (S k) to the training loss. For a 0/1 subset z'Lz counts the graph edges it cuts, so
+  the term is an incoherence score in [0, ~1]. Validation, the Optuna objective and the held-out scoring are
+  unchanged; mu = 0 is the authors' objective, and mu is fixed at 3, never tuned on r.
+- A plain loop replaces the PyTorch Lightning Trainer (same arithmetic, about 10x faster). A trial whose r turns
+  NaN is recorded as failed and the search goes on; the release stops.
+- theta's start is seeded (the release does not seed it), and each budget gets its own seed, seed * 1,000,003 + S,
+  so budgets are selected independently, as the paper's overlap measure assumes.
+- `report_paper.py` reports each budget from its own selection; the authors' plots show size n from the selection
+  made at the next larger size.
 
-## The controls are the result
+Check 1 of `test_oodselect_paper.py` runs the authors' `TestSetFinder` (copied verbatim) under Lightning against
+`train_one`. It is skipped without `pytorch_lightning`, which `.venv` lacks, so it has never run here.
 
-`random` must stay positive — that is what makes aggregate accuracy-on-the-line an
-averaging artifact. `hard` (most-misclassified, built from the **selection models
-only**) near zero or positive is what separates a spurious-correlation finding
-from "these examples are difficult". `null-select` runs the identical
-optimisation against shuffled ID performance **at the same μ**, because the
-spatial constraint changes what the optimiser can manufacture from noise; if it
-inverts, nothing else in the row means anything. The two family-disjoint model
-splits exist because a random split does not make the halves independent when the
-population varies mainly along overall quality.
+## Controls
 
-μ is chosen on **purity**, never on test r. Purity is a property of the mask and
-the graph — no model enters it — so choosing on it cannot leak the reported
-correlation.
+- **Random subsets** (`report_paper.py`; the paper's "Random"): 100 random subsets of size S per budget, scored on
+  the held-out models. They should follow the aggregate trend.
+- **Most-misclassified points** (`hard_r`; the paper's "Hardest"): the S points with the highest 1 - mean
+  correctness over the 60 held-out models, averaged over 100 random orders of the many points tied at the cut.
+  `hard_sel_r` ranks on the 180 selection models (not in the paper). An r near 0 separates an inversion from
+  plain difficulty.
+- **Null-select** (`--null-seed N`; `NULL_SEEDS="1 2 3"`, folders `<variant>_null<N>`; the paper's "Shuffled"):
+  the selection and validation models' ID accuracies are permuted, the same search runs with the same seed, and
+  the kept subset is scored against the held-out models' true accuracies.
+- **Family-disjoint splits** (`--split trees->others` or `others->trees`; `SPLITS`, folders `<variant>_trees2others`,
+  `<variant>_others2trees`): select on hgb, rf, et, dt and xgb and score on lr, mlp and nb, or the reverse; 25% of
+  the selection family is held out for validation. A random split lets both groups share one quality axis.
+- **Smoothed classic** (`audit_selection.py --smoothed-classic`; the paper's "Smoothing after search"): each point
+  takes the mean of the classic weights over its 10 nearest points (itself included) and the top S are kept, so
+  better regions can be credited to the penalty rather than to smoothing.
 
-## Carried over from the pilot
+## The owner's check scripts
 
-Under `band`, the inverse line is real (r = −0.80 to −0.90 on held-out models,
-most-misclassified positive, null near zero, holds across family-disjoint splits).
-Under `shadedX` it is not separable from difficulty, which is why `band` is
-primary and `shadedX` is the sensitivity arm. The pilot's cells carried no
-lon/lat and cannot be reused; `zoo.SPATIAL_COLS` is the fix.
-
----
-
-## First experiment: paper-protocol OODSelect, classic vs spatial (2026-09-24)
-
-Two submissions, one worker, one difference:
+Each `aotil/test_<module>.py` checks one module on synthetic cases with known answers, then recomputes its stored
+outputs where they exist; exit code 0 means every check passed. Run them from the repo root; by default they read
+the stored outputs of 2026-10-16/17, and they write nothing under `data/`, `results/` or `logs/`:
 
 ```bash
-./upload_to_cluster.sh && conda run -n aotil pip install 'optuna>=3.0'   # once
-./submit_oodselect_classic.sh --date YYYY-MM-DD    # OODSelect as released, mu = 0
-./submit_oodselect_spatial.sh --date YYYY-MM-DD    # + mu * z'Lz/(S k), mu = 3, k = 10
-./download_from_cluster.sh YYYY-MM-DD
+for f in aotil/test_*.py; do .venv/bin/python "$f" > /dev/null 2>&1 && echo "ok    $f" || echo "FAIL  $f"; done
 ```
 
-Cells: `FL:band:AE:0` and `FL:band:A:0` (both directions). Per cell: a zoo job
-(300 models; skipped if the cell exists, shared between the two submissions),
-one array task per budget in the authors' grid (10 ... 7,500, truncated below
-the OOD set size), and a report job. `DRY_RUN=1` prints the sbatch lines.
-
-`aotil/oodselect_paper.py` follows the **authors' released code**
-(github.com/olawalesalaudeen/OODSELECT), not `aotil/oodselect.py`:
-
-| | `oodselect.py` (aotil sweep) | `oodselect_paper.py` (this experiment) |
-|---|---|---|
-| per-example score | P(observed class) | binary argmax correctness |
-| ID performance | mean P(observed class) | accuracy |
-| probit | ID side only | both sides, eps 1e-6 |
-| budget term | λ(S − Σw)², 10× linear ramp | softplus(S − Σw), cosine warm-up, one-sided |
-| optimiser | Adam, fixed lr 0.35, 400 iters, 4 restarts | Adam + CosineAnnealingLR, ≤ 50,000 epochs, early stop (patience 500) on val r |
-| hyperparameters | fixed | 100 Optuna trials over the authors' 5-D space |
-| model split | numpy permutation, seed | sklearn `train_test_split`, random_state 42 |
-| budgets | f = 0.05 / 0.10 / 0.25 | 10, 20, 50, 100, 250, 500, 750, 1000, 2500, 5000, 7500 |
-| most-misclassified | ranked on selection models | ranked on **test** models (authors); selection-model version kept as `hard_sel_r` |
-
-`aotil/test_oodselect_paper.py` runs the authors' `TestSetFinder` (copied
-verbatim) under a real Lightning `Trainer` and checks that `train_one` stops at
-the same epoch with the same validation r and the same top-S set, for both mu
-= 0 and mu = 3 (`pip install pytorch_lightning` for that check).
-
-Outputs, `results/<date>/oodselect_paper/`:
-`<variant>/<cell>_S<budget>_{result,trials}.csv`, `_theta.npy`;
-`<variant>/<cell>_summary.csv` (test r + Fisher CI, Spearman, random x100,
-most-misclassified, coherence); `<variant>/<cell>_jaccard.csv` (Eq. 6);
-`<cell>_model_convergence.csv`; `<cell>_comparison.csv` once both variants
-exist.
-
-Two things to know when reading them:
-- Under the authors' one-sided budget term the soft mass Σσ(θ) ends far above
-  S (2,800–5,300 at S = 500), so the mu term smooths a broad plateau and the
-  top-S cut is taken from it. That is why mu = 3 gives much tighter regions here
-  (purity ~0.85–0.93 at S = 500) than it did in the aotil sweep (0.71).
-  `soft_mass` and `P_soft` are logged per budget.
-- Each budget is seeded separately (`seed * 1_000_003 + S`). With one shared
-  seed the budgets came out nested by construction, which would fake the
-  paper's cross-budget consistency (Eq. 6).
+Rerun a failing one alone to see the failed check. `--csv` (Parts A, D2, F), `--out-dir results/$D/o5` (S1/S2, B, C)
+and `--null-file` (E) point them at new outputs. After the review all exit 0 except `test_o5_shift_decomp.py`, whose
+stored Part C label-scope rows predate a fix; rerunning Part C of `docs/TASK-O5-REGIONS.md` clears it.

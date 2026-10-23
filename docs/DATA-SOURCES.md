@@ -103,9 +103,11 @@ ImageServer `https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevatio
 deprecated. No 1 m or 30 m asset.
 
 **Gotchas**: 1 m coverage is partial and project-based, vintages span 2014–2023
-even within one state. 10 m tiles are in geographic degrees — **computing slope
-or curvature without reprojecting to a metric CRS is wrong, and the error grows
-with latitude.** License: public domain.
+even within one state. 10 m tiles are in geographic degrees — **a hand-rolled
+kernel (`convolve`) on the 1/3-arc-second degree grid is wrong without reprojecting
+to a metric CRS, and the error grows with latitude.** In this pipeline that is only
+`curvature`, which is not a W7 feature. `ee.Terrain.slope` and `ee.Terrain.aspect`
+account for the geographic pixel size themselves. License: public domain.
 
 ---
 
@@ -204,6 +206,11 @@ constraint** — check which applies to your use.
 ---
 
 ## 6. NLCD — land cover and imperviousness
+
+**What the pipeline reads (2026-10-21):** `pull_gee.py` takes the NLCD 2021 epoch
+release (`USGS/NLCD_RELEASES/2021_REL/NLCD`, image `2021`), not Annual NLCD. Cite
+Dewitz 2023 (USGS data release, `10.5066/P9JZ7AO3`), as `FEATURE-SOURCES.md` §7
+item 9 says. The Annual NLCD notes below are background from 2026-09-16.
 
 **Current release: Annual NLCD Collection 1, v1.2, published 30 June 2026,
 covering 1985–2025, CONUS only, 30 m.** The old epoch-based NLCD
@@ -352,6 +359,9 @@ HAND and a quarter the download.
 
 ## 10. Assembly path
 
+This is the 2026-09-16 plan. The pipeline as built is in `FEATURE-SOURCES.md`: TWI and
+SPI were dropped (`COVARIATES.md` §4), and no soil group was pulled.
+
 **GEE handles six of eight covariates in one `sampleRegions` call:**
 elevation, slope, aspect, curvature (`convolve` with 3×3 kernels — no built-in),
 `upa` → TWI and SPI, `hnd`, land cover, imperviousness, and `mukey`.
@@ -361,10 +371,13 @@ elevation, slope, aspect, curvature (`convolve` with 3×3 kernels — no built-i
 | Covariate | Why | How |
 |---|---|---|
 | Distance to river | No NHD asset in GEE | GeoPandas `sjoin_nearest` in EPSG:5070 |
-| Drainage density | Needs aggregation over HUC12 | dissolve flowline length ÷ area |
+| Drainage density | NHDPlus catchment | `LENGTHKM` of the catchment's own flowline ÷ its `AreaSqKM`; 0 for a sink catchment, which has no flowline (`pull_hydro.py` `add_drainage_density`) |
 | Hydrologic soil group | `hydgrp` not in GEE | SDA REST, batched by unique mukey |
 | Design-storm rainfall | Atlas 14 not in GEE | PFDS CSV per point, or per-volume grids |
 
-**Reproject to EPSG:5070 (CONUS Albers) before any slope, curvature, distance or
-area computation.** Computing slope on 1/3 arc-sec degree cells is the most
-common error in this pipeline and it worsens northward across a 10-state span.
+**Reproject to EPSG:5070 (CONUS Albers) before any hand-rolled kernel (`convolve`),
+distance or area computation.** A hand-rolled kernel on 1/3 arc-sec degree cells is
+wrong without reprojecting, and the error worsens northward. `ee.Terrain.slope` and
+`ee.Terrain.aspect` account for the geographic pixel size. The slope error the pipeline
+did have came from sampling on a rescaled request grid (about 3%); `pull_gee.py` reads
+each source's native grid since 2026-10-21.

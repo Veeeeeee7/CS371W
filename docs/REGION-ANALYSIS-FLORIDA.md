@@ -62,8 +62,9 @@ analysis — the analysis has no object without a region — and not the other w
 - **G2 — does the terrain agree (the flood analysis).** Flat-terrain flooding is ponding and
   sheet flow, not riverine conveyance; FEMA's own method for it is a stage–storage
   (reservoir-routing) analysis on the terrain (FEMA Guidance Document 84). Cheap form: is the
-  region's Zone A edge a single water surface (edge-elevation range within FEMA's own
-  ½-contour-interval boundary standard) — this falls out of the G1 vertex table. Full form: do
+  region's Zone A edge a single water surface (edge-elevation range within the
+  ½-contour-interval boundary standard, which NRC 2007 Table 3.2 gives for risk class C,
+  covering Zones A and AE alike) — this falls out of the G1 vertex table. Full form: do
   the closed depressions the region sits in fill to the mapped edge under the 1%-annual-chance
   24-hour rainfall (`p100_24hr` is already a covariate)? G2 says *which side is wrong*; G1 says
   *why the models cannot resolve it*. (§4)
@@ -220,6 +221,15 @@ Inside each region, what does the Zone A polygon boundary coincide with? Candida
 | **C** topographic contour | 5-ft (1.524 m) contour values of the USGS quadrangle | contour interpolation on the quad | not from HAND; only from absolute elevation, which is a location fingerprint | the "topographic maps" source |
 | **M** administrative / cartographic | FIRM panel edges, county (DFIRM) lines, PLSS section lines, roads, canals | the sheet the outline was drawn on | no | R1's map-production class; Wu et al. 2026's county-line cut-offs |
 
+**As run** (2026-10-16, `aotil/edge_layers.py` and `aotil/boundary_stat.py`; updated
+2026-10-21): **S** is every SSURGO map-unit line of kind `soil_line`; the attributes that change
+across it are recorded (`soil_n_diff`, `soil_diff_attrs`) but not used, and shores and
+survey-area joins are separate layers. **M** is the per-vertex minimum of the distances to county
+lines and to FIRM panel edges (`d_county_m`, `d_panel_interior_m`, `d_panel_exterior_m`);
+canals are reported on their own. W (wetland lines), PLSS section lines and roads were not
+measured: `edge_layers.py` accepts them as optional layers, but none was pulled. The class-C
+contour-phase test was not computed.
+
 Hypotheses. **H2 (label bias, the paper's hypothesis):** region Zone A edges are W/S/C/M,
 Zone AE edges in the same tiles are E, and non-region Zone A edges lie between. **H1 (covariate
 shift):** region Zone A edges are E as much as AE edges are — the label follows terrain and the
@@ -248,8 +258,10 @@ Build once (extends R0 `aotil/regions.py`):
    region (control, matched on lobe perimeter).
 2. **Edge vertices.** Densify each lobe boundary to 30 m and write one row per vertex:
    `lobe_id, zone, in_region, s (along-edge position), lon, lat`.
-3. **Terrain at the vertex.** DEM elevation (3DEP 1/3″ via `USGS/3DEP/10m` on GEE, the existing
-   `pull_gee.py` path) at the vertex and at ±100 m along the inward and outward normals;
+3. **Terrain at the vertex.** DEM elevation (3DEP 1/3″ 1 × 1 degree tiles from The National Map,
+   `pull_dem.py fetch --source tnm --remote` and `pull_dem.py sample`; updated 2026-10-21, this
+   plan first named the Earth Engine path) at the vertex and at ±100 m along the inward and
+   outward normals;
    local across-edge drop Δz = z_out − z_in. Also `hand` (MERIT 90 m, already pulled) for
    continuity with the features.
 4. **Distances to layers.** For each vertex, distance to the nearest line of each layer:
@@ -261,9 +273,10 @@ Build once (extends R0 `aotil/regions.py`):
    attribute changes across the nearest soil line (flooding class, hydric %, drainage).
 5. **Classify each 300 m window of edge** (10 vertices) by two facts:
    - *level set?* the window's elevation range ≤ τ, with τ = ½ contour interval = 0.76 m for a
-     5-ft quad (FEMA's Floodplain Boundary Standard for approximate studies is ±½ contour
-     interval; NRC 2007 ✅) and, as a sensitivity, τ = 0.3 m (lidar-era) — and a real
-     across-edge drop (Δz > 0 on the outward side);
+     5-ft quad (NRC 2007 Table 3.2, printed p. 44: risk class C, which covers both Zones A and
+     AE, puts the boundary within ½ contour interval at 90% ✅) and, as a sensitivity, τ = 0.3 m
+     (lidar-era; the run also reports 1.5 m) — and a real across-edge drop (Δz > 0 on the
+     outward side);
    - *on a line?* the window's median distance to layer L ≤ d, d = 30 m (one vertex) and 100 m.
    The 2 × 2 of {level set} × {on layer L} per layer is the result; the cell **{not a level
    set} × {on S or M line}** is the "unresolvable" edge length, **{level set}** is the
@@ -297,6 +310,9 @@ cell per layer; excess over the displaced-edge null with its percentile; the sam
 and matched Zone A lobes on one axis. Pre-registered primary: **share of region Zone A edge
 that is not a level set and lies on an S or M line, minus the same share for Zone AE edges in
 the same tiles**, with its null percentile. Secondary: the W share; the C phase peak.
+(Superseded, updated 2026-10-21: following the status note above and
+`docs/TASK-FULL-RUN-W7.md` B3 step 5, the run used U(region) − U(matched_A) as the primary and
+U(region) − U(AE) as a secondary, where U is that share.)
 
 ### 3.4 Relation to R1 and to the literature
 
@@ -316,7 +332,8 @@ Zone A boundary was traced from, at scale, or tied that to where a model fails.
   never per vertex.
 - **Lidar under cypress canopy.** Ground returns under dense swamp canopy carry decimetre errors;
   compare A and AE lobes under the same land cover and use IQR, not range, for the level-set
-  test when `landcover ∈ {90, 95}`.
+  test when `landcover ∈ {90, 95}`. (As run: a global IQR sensitivity, `boundary_stat.py
+  --level-test iqr`, not a per-land-cover switch.)
 - **Layers are correlated.** Soil lines partly follow vegetation, which partly follows
   micro-topography. The level-set condition is what separates them: a boundary on a soil line
   *with* a terrain drop is E as much as S. Report the joint cells, not marginals.
@@ -357,7 +374,9 @@ Mapping: Shallow Flooding Analyses and Mapping*, Guidance Document 84, Dec 2020 
 
 A 1% flood in a flat basin has one water-surface elevation per ponding area. So a boundary that
 *is* a flood boundary has, per lobe, an edge-elevation range within the boundary standard
-(±½ contour interval → 1.5 m total for a 5-ft quad; 0.6 m for lidar-era work). Per lobe report
+(±½ contour interval → 1.5 m total for a 5-ft quad; 0.6 m for lidar-era work). (As run, the
+boundary analysis tests 300 m windows, not whole lobes: window range ≤ 0.76 m, half a 5-ft
+interval, with 0.3 m and 1.5 m as sensitivities.) Per lobe report
 the edge-elevation IQR and range, for region Zone A, non-region Zone A and Zone AE lobes in the
 same tiles. Zone AE lobes are the calibration: their edge sits at the published BFE and their
 spread is the measurement floor. A Zone A lobe whose edge wanders over several metres of
@@ -575,11 +594,14 @@ at 0.84: the shortfall is not a shortage of covariates."
 
 ## 10. Data and references
 
-**Data to add** (all free): 3DEP 1/3″ DEM (`USGS/3DEP/10m` on GEE); SSURGO map-unit polygons
-and `muaggatt` for four bounding boxes (Soil Data Access, `SDA_Get_Mukey_from_intersection_with_WktWgs84`
-for keys, `mupolygon` for geometry — the soilDB `SDA_spatialQuery` documentation shows the
-`mupolygon` return ✅); NWI wetlands (USFWS state download for Florida, or the Wetlands
-MapServer ✅); NLCD is already the `landcover` covariate; TIGER county lines and roads; PLSS
+**Data to add** (all free): 3DEP 1/3″ DEM (1 × 1 degree tiles from The National Map,
+`pull_dem.py fetch --source tnm --remote`; updated 2026-10-21, this list first named
+`USGS/3DEP/10m` on GEE); SSURGO map-unit polygons and `muaggatt` for four bounding boxes (Soil
+Data Access, `SDA_Get_Mupolygonkey_from_intersection_with_WktWgs84` for keys, then an inner join
+to `mupolygon` on `mupolygonkey` for geometry, as `pull_ssurgo.py` does; the `_Mukey_` function
+first named here returns map units without their polygons — the soilDB `SDA_spatialQuery`
+documentation shows the `mupolygon` return ✅); NWI wetlands (USFWS state download for Florida,
+or the Wetlands MapServer ✅); NLCD is already the `landcover` covariate; TIGER county lines and roads; PLSS
 (BLM CadNSDI); FIS reports from the MSC for eight counties; USGS OFR 74-1111 (Florida
 flood-prone-area quadrangles: Big Gum Swamp, Sanderson North/South, Taylor, Sanderson NW; 1974 ✅).
 On disk already: flood-hazard polygons with geometry (`haz_FL_5070.parquet`, 5.4 GB — the
@@ -602,8 +624,10 @@ perimeters, and whether region lobes touch Zone AE polygons — compute these fi
   Sanderson South, Taylor, Sanderson NW*. OFR 74-1111, 1974 ✅ (existence; the quads are in the
   Osceola NF / Baker–Columbia area — confirm which ones cc 4 overlaps); the delineation method
   printed on the sheets (past floods, soils, topography) ⚠ read a sheet.
-- NRC 2007. *Elevation Data for Floodplain Mapping*, ch. 3 ✅ (Floodplain Boundary Standard,
-  ±½ contour interval for approximate studies).
+- NRC 2007. *Elevation Data for Floodplain Mapping*, ch. 3 ✅ (Table 3.2, printed p. 44: boundary
+  within ±½ contour interval at 90% for risk class C, which covers both Zones A and AE; the
+  2005 floodplain boundary standard, printed p. 45, applies to approximate and detailed studies
+  alike).
 - Jacquez 1995; Fortin, Drapeau & Jacquez 1996; Jacquez, Maruca & Fortin 2000 ✅ (boundary
   overlap statistics; already in `custom.bib` as `jacquez1995`).
 - Moreno-Torres, Raeder, Alaiz-Rodríguez, Chawla & Herrera 2012. A unifying view on dataset

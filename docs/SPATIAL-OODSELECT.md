@@ -8,6 +8,16 @@
 > expectation that μ = 0 collapses (it transfers at every μ); E3/E4 (replaced by the boundary
 > analysis, G1 in `docs/REGION-ANALYSIS-FLORIDA.md`); E5/E6 (out of scope). The μ sweep the
 > paper needs is now a paper-protocol sweep (v4 §3, O4).
+>
+> **2026-10-21.** §3–§4 live in `aotil/graph.py` (graph, Laplacian, coherence metrics) and
+> `aotil/oodselect_paper.py` (`train_one` adds μ·zᵀLz/(S·k) to the training loss and PyTorch
+> differentiates it, so §3.2's hand-written gradient is not needed). The pilot-era modules this
+> plan names, `aotil/oodselect.py`, `analyse.py`, `characterise.py`, `gate.py`, `pointcov.py`
+> and `transfer.py`, were removed on 2026-10-21 (kept in `Claude outputs/removed-2026-10-21/`);
+> `aotil/explain.py` and `aotil/maps.py` were never written. The random and most-misclassified
+> controls are in `aotil/report_paper.py`: `hard_r` ranks points by misclassification over the
+> test models (`hard_sel_r` over the selection models), and since 2026-10-21 the points that
+> tie at the S-th score are ordered at random 100 times and r is averaged.
 
 **v1, 2026-09-19** · companion to `docs/PROJECT-PLAN.md` v3 §5 Stage 3 · pilot in
 `aotil/README.md` · abstract in the Project doc `claude/project-abstract.md` ·
@@ -164,13 +174,18 @@ For a hard mask M of size S with adjacency A:
 | metric | definition | random baseline |
 |---|---|---|
 | `tiles`, `blocks` | distinct `tile_50km` / `block_id` touched (tiles already reported) | ≈ all |
-| `purity` | mean over i∈M of \|N_k(i) ∩ M\| / k | ≈ S/d = f |
-| `P_hard` | cut edges / (S·k) | ≈ 1 − f |
+| `purity` | mean over i∈M of \|N_k(i) ∩ M\| / k, N_k(i) = i's own k nearest neighbours (the directed kNN graph, as the paper's equation) | ≈ S/d = f |
+| `P_hard` | cut edges / (S·k) | ≈ 1 − f; a little above it in the code, because symmetrising gives points more than k edges |
 | `n_cc`, `largest_cc_frac` | connected components of the induced subgraph A[M][:,M] (`scipy.sparse.csgraph.connected_components`); largest as a fraction of S | many; small |
 | `moran_I` (optional) | Moran's I of the indicator 1_M with weights A | ≈ 0 |
 
 A random subset of the same size is the baseline for every one of these, so the
-random control already in `analyse.py` doubles as the coherence null.
+random control already in `analyse.py` doubles as the coherence null. (As built:
+`aotil/graph.py` `coherence_metrics` computes these, and `aotil/report_paper.py` gives the
+random subsets' purity. Until 2026-10-21 the code's purity counted selected neighbours in the
+symmetrised graph and divided by each point's degree; it now follows the definition above,
+which on the 2026-10-16 runs raised S = 500 purity by up to 0.015, e.g. spatial .75/.81/.81 →
+.76/.82/.81 over seeds 0–2.)
 
 ---
 
@@ -376,4 +391,5 @@ covariate group with null bands; (6) E5 two curves if run.
 Tables: pilot vs full-run controls; per-region summary (E4); E3 enrichment.
 Code: `aotil/oodselect.py` (+μ), `aotil/graph.py` (adjacency, metrics),
 `aotil/pointcov.py` (E0), `aotil/transfer.py` (E2), `aotil/explain.py` (E3),
-`aotil/maps.py` (E4). Every result file carries `{state}_{protocol}_{traindom}_s{seed}_mu{mu}_{graph}` in its name.
+`aotil/maps.py` (E4). (As built, see the 2026-10-21 status note at the top: `graph.py` and
+`oodselect_paper.py` remain; the others were removed or never written.) Every result file carries `{state}_{protocol}_{traindom}_s{seed}_mu{mu}_{graph}` in its name.

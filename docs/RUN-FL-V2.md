@@ -6,7 +6,11 @@ values below are from that run unless marked as scratch. To rerun, start from th
 go in order. Each step says what to check before going
 on. **Stop** marks the points where a failure means do not continue.
 
-Times are for this laptop. Steps 2, 4–5 and 13–14 download data or call web services; sizes are given where they matter.
+The code review of 2026-10-21 fixed bugs in the sampler and in the Earth Engine and NHDPlus
+covariates, so the points and covariates on disk predate the current code. "Still to run" at the
+end says what to rerun and what changes (`docs/DATA-SUMMARY.md` §7 for the data).
+
+Times are for this laptop. The raw-input steps, steps 2, 4–5 and 13–14 download data or call web services; sizes are given where they matter.
 
 ## 0. Every new shell
 
@@ -29,6 +33,44 @@ export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 && mkdir -p lo
 
 Keep at least 10 GB free throughout. About 122 GB were free on 2026-10-14; the DEM in step 13
 is the largest download.
+
+## Raw inputs (done 2026-09-16 to 09-18; rerun only to start from a newer flood map)
+
+Everything below starts from FEMA's National Flood Hazard Layer (NFHL), the national flood map, cut
+down to Florida: `data/interim/nfhl_states/{pan,s_bfe,s_lomr}_FL.parquet` and
+`data/interim/prep/{idx_FL,haz_FL_5070}.parquet`, all on disk. These four steps rebuild them; each
+skips outputs that exist, so for a newer map move the old Florida files aside first. They replace
+the old ten-state download guide (moved to `Claude outputs/removed-2026-10-21/docs/DOWNLOAD-GUIDE.md`).
+
+1. The national geodatabase (19.6 GB zip; one connection, resumes after Ctrl-C, then checks the
+   archive). The copy on disk is FEMA's extract of 2026-03-03; a new download gets whatever FEMA
+   last published:
+   ```bash
+   ./fetch_nfhl.sh
+   ```
+2. Extract it with a ZIP64-capable tool (macOS `unzip` cannot read it; `subset_nfhl.py` puts the
+   extracted size at about 40 GB), then cut out Florida:
+   ```bash
+   ditto -x -k data/raw/nfhl/NFHL_Key_Layers.gdb.zip data/raw/nfhl/ && .venv/bin/python subset_nfhl.py FL
+   ```
+   Pass 1 writes the zone attributes of all ten original states to
+   `data/interim/nfhl_haz_attrs_10state.parquet` (`aotil/o5_polygons.py` reads it) and checks each
+   state's Zone A share against FEMA's (`max delta ... (OK)` means within 2 points). Pass 2 writes
+   `data/interim/nfhl_states/haz_FL.parquet` (the flood-zone polygons) and `pan_FL.parquet` (the
+   FIRM panels, the printed map sheets).
+3. Before deleting the extracted geodatabase, save the base-flood-elevation lines (`s_bfe_FL`) and
+   the map revisions (LOMRs, `s_lomr_FL`). It prints whether deleting the geodatabase is safe:
+   ```bash
+   .venv/bin/python pull_extras.py
+   ```
+4. Repack the polygons once into an attribute index and an EPSG:5070 geometry file
+   (`idx_FL.parquet`, `haz_FL_5070.parquet`, 5.4 GB). It skips when both exist (`--force` redoes it):
+   ```bash
+   .venv/bin/python sample_points.py --prep FL
+   ```
+
+NHDPlus (step 5, `fetch_nhdplus_fl.sh`), the TIGER county file (step 2, `pull_gis_lines.py`) and the
+Earth Engine layers (step 4) are fetched by their own steps.
 
 ## 1. Record v1 and archive it (A0, about 1 min)
 
@@ -80,23 +122,33 @@ why it is opt-in:
 .venv/bin/python -u sample_points.py FL --protocols band --exact --ring-oversample 6 --state-polygons data/interim/gis/counties_FL.parquet 2>&1 | tee logs/$D/A2_sample_points_FL.log
 ```
 
+(b) also fills `meta_point_county`, the TIGER county each point lies in; with (a) it stays null.
+`points_FL.parquet` exists, so a rebuild needs `--force` (without it the script skips).
+
 **Stop** if it prints `FAILED` (exit code 1, nothing written). The message names the setting to
 raise.
 
-Expected for (a), from the scratch builds:
-- `[A] positives 20,600 kept for 20,000 from 930 polygons`
-- `band candidates 370,063: … 35,506 after thinning`, and 49,998 for AE
-- `whole-state separation dropped A/0/band 136, A/1/- 0, AE/0/band 139, AE/1/- 0`
+Expected for (b) with the current sampler, from the code review's scratch build (22.5 min):
+- `[A] positives 20,600 kept for 20,000 from 9,335 polygons` (the polygons the area-proportional
+  draw placed points in)
+- band rings from 4,300 (A) and 4,328 (AE) polygons (cap 10,000), the polygons the kept positives
+  came from
+- band candidates in Zone D or AREA NOT INCLUDED dropped: 1,532 (A) and 2,137 (AE)
+- 28,375 (A) and 47,099 (AE) band candidates after thinning
+- `whole-state separation dropped A/0/band 178, A/1/- 0, AE/0/band 177, AE/1/- 2`
 - `[FL] wrote 80,000 points`
 
-Expected for (b), confirmed by the real build of 2026-10-14 (23 min):
+Before the 2026-10-21 fixes (the points on disk), (b) gave, in the real build of 2026-10-14 (23 min):
 - A band: `2,609 outside the state polygons`, 32,998 after thinning
 - AE band: `1,092 outside the state polygons`, 48,212 after thinning
 - `whole-state separation dropped A/0/band 159, A/1/- 2, AE/0/band 179, AE/1/- 0`
 - `[FL] wrote 80,000 points`
 
-The mask changes how many random draws the A band uses, so (b)'s AE positives are a different
-realization of the same distribution, not the same points as (a).
+and (a), in the scratch builds: `[A] positives 20,600 kept for 20,000 from 930 polygons`;
+`band candidates 370,063: … 35,506 after thinning`, and 49,998 for AE;
+`whole-state separation dropped A/0/band 136, A/1/- 0, AE/0/band 139, AE/1/- 0`. The mask changes
+how many random draws the A band uses, so (b)'s AE positives are a different realization of the
+same distribution, not the same points as (a).
 
 ```bash
 .venv/bin/python sample_points.py --audit FL 2>&1 | tee logs/$D/A2_audit_FL.log
@@ -106,9 +158,13 @@ Check:
 - `exact targets … YES` and `A/AE strata identical: YES`
 - `pairs closer than 100 m: 0`
 - band distance between 500 and 5,000 m, and `40,000/40,000` inside a FIRM panel
+- `band negatives in D or AREA NOT INCLUDED: 0 (must be 0)`. Zone D (flood hazard undetermined)
+  and AREA NOT INCLUDED are unassessed land, so a point there is no evidence of dry ground. The
+  points on disk have 2,129 there.
 
-Expected values: (a) minimum nearest-neighbour 100.009 m, largest polygon 2.23% (A) and 2.18%
-(AE); (b) 100.114 m, 2.23% and 2.09%.
+Expected values with the current sampler (scratch build): band 500–4,993 m, largest polygon
+2.12% (A) and 2.02% (AE). Before the fixes: (a) minimum nearest-neighbour 100.009 m, largest
+polygon 2.23% (A) and 2.18% (AE); (b) 100.114 m, 2.23% and 2.09%.
 
 **Stop** if a check fails.
 
@@ -127,6 +183,12 @@ export EE_PROJECT=your-cloud-project-id        # the Cloud project registered fo
 ```
 
 Check: the selftest returns values for all bands at the three Vermont points (slope not null).
+Since the 2026-10-21 fix, each layer is read on its own native grid, so a point gets the MERIT
+Hydro or 3DEP cell that contains it. The review could not run the selftest (Earth Engine asked for
+authorization), so this is the first live check that Earth Engine accepts that request.
+
+Finished chunks are skipped, so for a re-pull move `data/interim/gee/FL` aside first. The merge
+rewrites `dataset_FL.parquet` from the points and the chunks alone, so steps 5–7 must follow it.
 
 ```bash
 .venv/bin/python -u pull_gee.py FL --project $EE_PROJECT 2>&1 | tee logs/$D/A3_pull_gee_FL.log
@@ -159,16 +221,27 @@ Check: the new blocks are fetched, FL near 100%, and `FEATURES.txt already lists
 server answered HTTP 503 to manual checks from 23:12 to 00:14), leaving 191 points (0.24%)
 without values; status showed 97.9% of blocks. Once it answers, rerun `pull_atlas14.py FL`,
 `--merge FL`, then `pull_hydro.py --merge FL`; blocks over open water may still fail as outside
-Atlas 14's area. Then rerun everything from step 7 into a new `D`. Add `--overwrite` to
+Atlas 14's area. The fetch now ends with a `failure causes:` line (e.g. `HTTP 503`), so the next
+run says why blocks failed. Then rerun everything from step 7 into a new `D`. Add `--overwrite` to
 `audit_dataset.py`, `zoo.py` (the cell path is not dated), `pull_point_extras.py` and
 `check_gis_inputs.py`, or move their old outputs aside: each script skips an existing output.
 
-NHDPlus is already on disk: both commands below skip, and `--inspect` must find
-`NHDPlusV21_FL.gdb` with layers `Catchment` and `NHDFlowline_Network`.
+NHDPlus is already on disk, so `fetch_nhdplus_fl.sh` skips. The `NHDPlusV21_FL.gdb` on disk predates
+the 2026-10-21 fix that keeps every Coastline feature, including island and barrier-island shores,
+which are not part of the river network and were cut with it. Rebuild it once with `--overwrite`
+(the review's rebuild: 53,094 flowlines against 52,351, and 5,377 Coastline features against 4,634;
+later runs can drop the flag). `--inspect` must find `NHDPlusV21_FL.gdb` with layers `Catchment` and
+`NHDFlowline_Network`.
 
 ```bash
-./fetch_nhdplus_fl.sh && .venv/bin/python prep_nhdplus_units.py && .venv/bin/python pull_hydro.py --inspect
+./fetch_nhdplus_fl.sh && .venv/bin/python prep_nhdplus_units.py --overwrite && .venv/bin/python pull_hydro.py --inspect
 ```
+
+The next three stages skip an existing output. For new points, move
+`data/interim/hydro/comid_FL.parquet` and `river_FL.parquet` aside first; for the 2026-10-21 fixes
+alone (coastline, drainage density, channel slope), `river_FL.parquet` only. `streamcat_FL.parquet` is
+a per-county cache keyed by catchment id (COMID) and can stay: the count below says whether it covers
+the points.
 
 ```bash
 .venv/bin/python pull_hydro.py --catchments FL && .venv/bin/python pull_hydro.py --flowlines FL && .venv/bin/python pull_hydro.py --streamcat FL
@@ -240,7 +313,9 @@ Check: the split matches step 7 and `300 models`. (b), the real run: `train 28,1
 
 **Stop** unless it ends `verdict: PASS`. The audit covers shapes, 300 models in eight families,
 `point_id` joins for both halves, the same test tiles with both zones, and 10 refits matching to
-1e-9.
+1e-9. A cell built before 2026-10-21 fails `table == matrices`: `zoo.py` now counts a negative
+predicted at exactly p = 0.5 as correct (the argmax rule the selection uses), which raises the
+`acc_*` columns of the dt, et and rf models that output exactly 0.5. Rebuild it with `--overwrite`.
 
 ## 9. Selections (C3, about 40 min)
 
@@ -260,6 +335,13 @@ CELLS="FL:band:AE:0" JOBS=8 caffeinate -i ./run_oodselect_local.sh --date $D && 
 - the aggregate ID→OOD r;
 - the classic and spatial r, purity, components and tiles at S = 250, 500 and 1,000;
 - the smoothed-classic ablation rows.
+
+Purity is now the paper's definition: the share of each selected point's own 10 nearest
+neighbours that are also selected. Runs from before 2026-10-21 stored it on the symmetrised graph
+(two points count as neighbours if either is among the other's 10 nearest), so their audit fails
+the stored-coherence check until the selections are rerun (a new `--date`).
+The most-misclassified baseline now averages over random orders of the points tied at the cut;
+`report_paper.py` alone refreshes it.
 
 ## 10. Regions (C4, seconds)
 
@@ -314,6 +396,10 @@ they decide how big steps 13 and 14 are (v1 S = 500: 32,131 km²). Outputs per b
 (`contact_row_id`, `contact_zone`, `contact_subty`, `same_role_contact`), so the analysis can keep
 only the SFHA-exterior edge and drop shared edges.
 
+When the three outputs exist, `lobes.py` skips only if they hold the same components as this call
+(`--only-components`, or all of them); a different set stops with an error, so use another `--out`
+or `--overwrite`.
+
 ## 13. The 10 m DEM (D3). Decision: the download is over 2 GB
 
 The dry run makes one metadata call per tile and prints the totals for both budgets together.
@@ -331,15 +417,18 @@ Read the dry run's call total for `--remote`, then:
 B=results/$D/boundary && P=FL_band_AE_s0_spatial_mu3_knn10 && .venv/bin/python pull_dem.py fetch --bboxes $B/${P}_S250_bboxes.parquet $B/${P}_S500_bboxes.parquet --remote --yes --max-gb 3.5 2>&1 | tee logs/$D/D3_dem_fetch.log
 ```
 
-It still refuses if free disk would fall below 10 GB. Then elevation at every vertex and ±100 m
-along its inward normal:
+It still refuses if free disk would fall below 10 GB. `fetch` keeps an existing raster whose grid
+and source match, so add `--overwrite` to rebuild rasters made before the 2026-10-21 fix: where
+two 1×1° tiles of different releases meet, each pixel now comes from the tile that owns it, which
+removes a false 0.17–0.43 m step near the seam. Then elevation at every vertex and ±100 m along its
+inward normal:
 
 ```bash
 for S in 250 500; do P=FL_band_AE_s0_spatial_mu3_knn10_S${S}; .venv/bin/python pull_dem.py sample --vertices results/$D/boundary/${P}_vertices.parquet --out results/$D/boundary/${P}_vertices_z.parquet 2>&1 | tee logs/$D/D3_dem_sample_${P}.log; done
 ```
 
 If a coastal component misses DEM values over open water, it exits 1 and lists the misses. Rerun
-`sample` with `--allow-missing` only if you accept `dem_ok=False` rows (decision 7). The output
+`sample` with `--allow-missing` only if you accept `dem_ok=False` rows. The output
 also flags whether each ±100 m probe really lands inside or outside its lobe
 (`in_probe_inside`, `out_probe_outside`, `out_probe_in_any_lobe`). In v1 only 81–88% of region
 inward probes stayed inside, so the analysis should filter on these.
@@ -364,10 +453,16 @@ B=results/$D/boundary && P=FL_band_AE_s0_spatial_mu3_knn10 && .venv/bin/python p
 
 Outputs: `data/interim/gis/ssurgo/<prefix>_mupolygons.parquet` and `<prefix>_mulines.parquet`.
 Lines are tagged:
-- `kind`: `soil_line`, `survey_join`, `water_edge` or `clip_edge`;
+- `kind`: `soil_line`, `survey_join`, `water_edge` or `clip_edge`, or `no_data_edge` (one-sided,
+  inside the queried area, where SSURGO has no polygon);
 - `areaname_a` / `areaname_b`, so county survey joins can be told from National Park, Forest
   and Conservation Area joins;
 - `diff_<attr>`: which `muaggatt` attributes change across the line.
+
+Each component's perimeter-balance line now also prints how many polygons own over 1 m more line
+than their perimeter: a join written twice where two polygons overlap slightly. A nonzero count
+raises the component's topology WARNING; the doubled lines are flagged, not removed. To get these
+lines for an existing pull, rerun the `--yes` command with `--overwrite` (it rebuilds from the cache).
 
 If it stops with "re-run with --refetch" (SSURGO was refreshed mid-run), do exactly that.
 
@@ -380,7 +475,10 @@ for S in 250 500; do P=FL_band_AE_s0_spatial_mu3_knn10_S${S}; .venv/bin/python a
 If step 13 needed `--allow-missing`, add `--allow-dem-missing` here. Vertices just past the
 state line (within `--state-tol-m`, 1 km) and vertices of a lobe that runs past its own county's
 panels are measured and flagged (`outside_state`, `outside_own_panels`) rather than failing the
-run. The coverage table must show `ok` or an explained `warn` for:
+run. Since 2026-10-21 every vertex is checked against `counties_FL.parquet`, not only those of a
+box that reaches past the county layer's extent. The seed-0 tables of 2026-10-14 and 2026-10-16
+miss `outside_state` on some vertices that lie outside (add `--overwrite` to rebuild them). The
+coverage table must show `ok` or an explained `warn` for:
 - the DEM;
 - soil (`soil_line` only), `soil_water`, `soil_join_county`, `soil_join_other`;
 - county and state-or-coast lines;
@@ -405,10 +503,13 @@ Then tell Claude the date `D`, so the report's pending numbers can be filled in 
 - `results/$D/gis/check_gis_inputs_FL.md`
 - the coverage JSONs under `results/$D/boundary/`
 
-## Still to run: not part of this routine
+## Extra selection runs: seeds 1–2, the μ sweep and the controls
 
-Run these only after the routine above. Commands come from the build and fix reports; nothing
-here has been run.
+These ran on 2026-10-16 on the seven-feature cells (`docs/TASK-FULL-RUN-W7.md` C3–C4; results in
+`docs/RUN-W7-REPORT-2026-10-16.md`). C4 points to the μ-sweep command below under this section's
+old name, "Still to run". As written the commands use the 45-feature cell; for the seven-feature
+cells pass `--cells-dir`/`--cells data/interim/aotil/cells_w7` (and, to the script,
+`DATA_DIR=data/processed_w7 CELLS_DIR=data/interim/aotil/cells_w7`).
 
 - **Seeds 1–2**: one call per seed, so the Optuna search seed follows the tile-split seed, with
   the report log copied aside each time.
@@ -418,8 +519,8 @@ here has been run.
   ```bash
   for s in 1 2; do .venv/bin/python aotil/audit_selection.py --root results/$D/oodselect_paper --cells-dir data/interim/aotil/cells --tag FL_band_AE_s$s --recompute-budgets 250 500 1000 --smoothed-classic; done
   ```
-  Then `aotil/regions.py --cell FL_band_AE_s{1,2} --seed {1,2}` as in step 10, to check which
-  regions recur.
+  Then `aotil/regions.py --cell FL_band_AE_s{1,2} --seed {1,2}` as in step 10, and
+  `aotil/region_recurrence.py` (`docs/TASK-FULL-RUN-W7.md` C5) to see which regions recur.
 - **Paper-protocol μ sweep** (μ = 0 and 3 come from step 9; this adds μ = 1 and 10 at S = 250, 500
   and 1,000, paired by `--seed 0`):
   ```bash
@@ -428,13 +529,57 @@ here has been run.
   ```bash
   .venv/bin/python aotil/audit_selection.py --root results/$D/oodselect_paper --cells-dir data/interim/aotil/cells --tag FL_band_AE_s0 --variants classic spatial_mu1_knn10 spatial_mu3_knn10 spatial_mu10_knn10 --check-budgets 250 500 1000 --recompute-budgets 250 500 1000 --out results/$D/selection_audit/mu_sweep
   ```
-- **Smoothed-classic ablation**: already produced by step 9 (`--smoothed-classic`), post hoc.
-  The ranking was fixed to `expit(−θ)`, because `sigmoid(θ)` rounds to 1.0 and made the old
-  result depend on column order.
-- **Null-select: missing.** `aotil/oodselect_paper.py` has no flag for it. Needed: `--null-seed N`
-  (shuffle the selection and validation models' ID accuracies, run the same search, score the
-  kept θ on the test models against the true accuracies), plus a `VARIANTS` knob in
-  `run_oodselect_local.sh`.
-- **Family-disjoint split (trees→others, others→trees): missing.** `oodselect_paper.py` always uses
-  the random 60/20/20 split. Needed: `--split {random,trees->others,others->trees}`, plus
-  matching output-folder names. `audit_selection.py` already accepts suffixed variants.
+- **Smoothed-classic ablation**: produced by step 9 (`--smoothed-classic`), post hoc. The ranking
+  uses `expit(−θ)`, because `sigmoid(θ)` rounds to 1.0 and made the result depend on column order.
+- **Null-select and the family-disjoint splits**: `--null-seed N` and
+  `--split {trees->others,others->trees}` of `aotil/oodselect_paper.py`, run through the script's
+  `NULL_SEEDS="1 2 3"` or `SPLITS="trees->others others->trees"` knobs, usually with
+  `BUDGETS="250 500 1000"`. The runs go into suffixed folders (`classic_null1`,
+  `spatial_mu3_knn10_trees2others`, ...); audit them with `audit_selection.py --variants` naming those
+  folders, classic first, and its own `--out`. `aotil/README.md`, "Controls", says what each does.
+
+## Still to run: not part of this routine
+
+1. **Rebuild after the 2026-10-21 code review.** The review fixed the sampler (positives uniform by
+   area, band negatives kept out of Zone D and AREA NOT INCLUDED, thin polygons filled, finer ring
+   buffers, the new `meta_point_county`), the Earth Engine reads (the MERIT Hydro and 3DEP cell
+   that contains the point) and the NHDPlus covariates (island and panhandle coastlines, drainage
+   density 0 in sink catchments, `channel_slope`'s −9998 as missing). `docs/DATA-SUMMARY.md` §7 says
+   what each changes. Everything from the points on is stale, including `data/processed_w7/` and
+   `data/processed_w7_minus_*/`, which link to `data/processed/dataset_FL.parquet`. In a new `D`:
+   - Move the v2 files keyed by `point_id` aside, as step 1 did for v1 (`archive_sampling_v1.sh`
+     handles only v1 and skips what it already archived): `data/interim/gee/FL/`,
+     `data/interim/hydro/comid_FL.parquet` and `river_FL.parquet`.
+   - Step 3 (b) with `--force`, and its `--audit`; step 4 (re-authenticate first); step 5 with
+     `prep_nhdplus_units.py --overwrite`; step 6.
+   - Steps 7–15 with `--overwrite` where a script skips an existing output (`audit_dataset.py`,
+     `zoo.py`, `pull_point_extras.py`, `check_gis_inputs.py`, `pull_dem.py fetch`,
+     `aotil/edge_layers.py`).
+   - Then `docs/TASK-FULL-RUN-W7.md` Part C, `docs/TASK-O5-REGIONS.md` (S1, S2, Parts A–F),
+     `docs/TASK-REGION-TWINS.md` and the figures in `results/2026-10-19/paper_figures/`.
+
+   On the current points the review measured: 917 coast distances shrink and none grow (641 by more
+   than 0.3 in log10, all Zone AE, mostly in Monroe County); 1,582 drainage densities go from missing
+   to 0; 2,129 band negatives lie in Zone D or AREA NOT INCLUDED. The new sampler's kept positives
+   come from 4,300 (A) and 4,329 (AE) polygons instead of 592 and 950. How far the regions, r values
+   and twins numbers move is unknown until the rerun.
+
+2. **Results the review made stale without new points.** All of these are redone by item 1; each
+   can also be refreshed alone.
+
+   | fix | stale | rerun |
+   |---|---|---|
+   | most-misclassified ties broken at random (100 orders) | `hard_r`, `hard_sel_r`, `hard_purity`, `overlap_hard` in `results/2026-10-16/oodselect_paper/` (paper's Hardest row at S = 500: −.13/−.14/−.31 becomes −.21/−.19/−.36) | `report_paper.py` alone: `.venv/bin/python aotil/report_paper.py --root results/2026-10-16/oodselect_paper --cells data/interim/aotil/cells_w7 --tags FL_band_AE_s0 FL_band_AE_s1 FL_band_AE_s2` |
+   | purity as the paper defines it | every stored `coh_purity` (S = 500: .08/.10/.09 becomes .09/.11/.10 classic, .75/.81/.81 becomes .76/.82/.81 spatial) | new selections (W7 C3–C4, new `--date`), then their audits and the report |
+   | p = 0.5 ties in the `acc_*` columns | every `<tag>_models.csv` | the cells (step 8, W7 C1, O5 D2 and F populations) with `--overwrite`, then O5 Part A |
+   | O1: land excludes missing land cover, p not rounded, 2,000 bootstrap draws | `results/2026-10-16/o1_shift*.csv` | W7 C2 |
+   | O5 Part C label scopes; D2 seed means; F land-only evaluation, p not rounded, 1,000 draws | `C_conflict.csv`, `C_support.csv`; `D2_lofo.csv`; `F_pooling.csv` (primary −0.0018 becomes about −0.0030) | `docs/TASK-O5-REGIONS.md` Part C; D2 step 4; F evaluation |
+   | twins: split 2's strongest models ranked on the stored ID AUROC; figure axes from the data | split-2 twins outputs, `fig_twins.pdf` | `docs/TASK-REGION-TWINS.md` Part A |
+   | DEM seams; `outside_state` on every vertex | DEM rasters of every seed and the vertex tables built on them; seed-0 `outside_state`; the boundary statistic | step 13 `fetch --overwrite` and `sample`, step 15 `--overwrite`, W7 C7 |
+   | audit counts (B3 missingness, B16 ties, panel overlaps) | `results/2026-10-14/data_audit/`, `results/2026-10-14/gis/check_gis_inputs_FL.*` | steps 7 and 11 with `--overwrite` |
+   | doubled soil joins reported | the SSURGO pull logs only | step 14 with `--overwrite` |
+
+3. **Atlas 14 gap**: 191 points in 35 blocks have no rainfall values (step 5). A rebuild fetches
+   blocks for its own points anyway.
+4. **`docs/TASK-REGION-TWINS.md`** has not run: Part A (reproduce the paper's twins numbers),
+   Part B (port them into `aotil/`) and its report.

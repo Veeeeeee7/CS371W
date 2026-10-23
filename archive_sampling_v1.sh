@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# archive_sampling_v1.sh -- move Florida's sampling-v1 files aside before the v2 build.
+# Move Florida's sampling-v1 files aside before the v2 build (docs/RUN-FL-V2.md step 1).
 #
-# Sampling protocol v2 reissues point_ids FL0000000... for different locations, and
-# the pull scripts treat an existing output as done. Any v1 file keyed by point_id
-# left in place would be joined onto v2 points silently, at full coverage. So every
-# such file is MOVED (same volume: no disk cost) into
+# Protocol v2 reissues point_ids FL0000000... for different locations, and the pull scripts treat
+# an existing output as done, so a v1 file keyed by point_id left in place would be joined onto
+# the v2 points silently. Each such file is MOVED (same volume, no disk cost) to
 #     data/interim/archive/sampling-v1/<same relative path>
-# Two shared files are COPIED instead, because the v2 run updates them in place and
-# moving them would discard the other nine states' rows: the Atlas 14 block cache
-# and FEATURES.txt.
+# The Atlas 14 block cache and FEATURES.txt are COPIED instead: the v2 run updates both in place,
+# and moving them would lose the entries it does not rewrite.
 #
-# Also records, before anything moves:
-#     sha256_before.txt   all ten dataset_*.parquet, FEATURES.txt, blocks.parquet
-#     MANIFEST.txt        what was moved or copied, with sizes
-#
-# Safe to rerun: an entry already in the archive is skipped, and nothing in the
-# archive is ever overwritten.
+# Before anything moves, sha256_before.txt records every dataset_*.parquet, FEATURES.txt and
+# blocks.parquet; MANIFEST.txt lists what was moved or copied, with sizes. Safe to rerun: an entry
+# already in the archive is skipped, and nothing in the archive is ever overwritten.
 #
 #     ./archive_sampling_v1.sh
 
 set -euo pipefail
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  echo "usage: ./archive_sampling_v1.sh   (from the repo root; docs/RUN-FL-V2.md step 1)"
+  exit 0
+fi
 
 ARCH="data/interim/archive/sampling-v1"
 

@@ -1,0 +1,8 @@
+# Leave-one-feature-out population for docs/TASK-O5-REGIONS.md Part D2 (2026-10-17):
+# the seven Woznicki features of data/processed_w7/FEATURES.txt without log10_dist_coast.
+landcover
+slope
+tri_300
+wetindexcat
+log10_dist_river
+hand

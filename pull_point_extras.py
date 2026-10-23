@@ -1,91 +1,19 @@
 #!/usr/bin/env python3
-"""
-pull_point_extras.py -- per-point provenance sidecar for the boundary analysis.
+"""Per-point provenance sidecar for the boundary analysis: FIRM panel, nearest SFHA polygon, edge.
 
-The boundary analysis (docs/REGION-ANALYSIS-FLORIDA.md section 3.3, audit brief
-Part D1) needs three facts per point that the point table does not carry:
+Reads data/processed/dataset_<ST>.parquet, data/interim/prep/idx_<ST>.parquet and
+haz_<ST>_5070.parquet, and data/interim/nfhl_states/pan_<ST>.parquet. Writes
+data/interim/analysis/point_extras_<ST>.parquet, one row per dataset row in dataset order:
+    point_id; meta_firm_pan, meta_firm_pan_n, meta_firm_pan_eff_date: the FIRM panel;
+    meta_near_src_row_id, meta_near_fld_ar_id, meta_near_fld_zone, meta_near_dist_m: the nearest
+        SFHA polygon within --radius;
+    meta_edge_src_row_id, meta_edge_dist_m: for positives, the labelling polygon and the distance
+        to its edge.
+The columns live in a sidecar, not in dataset_<ST>.parquet, so the models never see them: they are
+the held-out maps the regions are tested against. Settings and inputs go in the schema metadata.
 
-    meta_firm_pan          the FIRM panel (map sheet) the point lies in, and its
-                           EFF_DATE
-    meta_near_*            the nearest SFHA polygon: which one, its zone, how far
-    meta_edge_dist_m       for a positive, how far it sits inside the polygon
-                           that labelled it
-
-They go in a sidecar keyed by point_id, not into dataset_<ST>.parquet, so that
-the dataset and its 45 features stay exactly as the models saw them. Every
-column is meta_: these are the "held-out maps" the paper tests the regions
-against, and a model that could see them would make that test meaningless.
-
-DECISIONS, EACH WITH ITS REASON
-===============================
-
-1. THE NEAREST SFHA POLYGON IS THE ONE sample_points.distances_to_sfha MEASURES.
-   Same candidates (idx rows with SFHA_TF == 'T', every SFHA zone, not just A
-   and AE), same geometry (haz_<ST>_5070.parquet), same exact shapely distance in
-   EPSG:5070. The difference is that the polygon's identity is kept, and that
-   the 5.4 GB hazard file is streamed one row group at a time, each read once,
-   instead of once per 50 km tile. A polygon within --radius of a point has its
-   bounding box within --radius of the point, so filtering candidates on the
-   idx bbox columns first loses nothing: every distance <= --radius is exact.
-   Beyond it the column is null. Under protocol v2 every point is <= 5,000 m
-   from an SFHA (positives 0, band negatives 500-5,000 m), so 5,000 m is the
-   default. On equal distances the lower row_id wins.
-
-2. FOR A POSITIVE THE NEAREST POLYGON IS THE LABELLING POLYGON. A positive is at
-   distance 0 from the polygon it was drawn in, but adjacent or overlapping SFHA
-   polygons can also be at 0. So when the labelling polygon covers the point it
-   is used outright, and the cases where the plain nearest search picked another
-   polygon are counted.
-
-3. THE LABELLING POLYGON. v2 points carry meta_src_row_id (the idx row_id of
-   the polygon behind each point, sample_points.py note 8); it is used whenever
-   it is set. v1 points do not, so a positive's polygon is recovered from
-   (dfirm_id, meta_fld_ar_id) through idx_<ST>: the pair, because FLD_AR_ID
-   alone repeats across DFIRMs, and where the pair itself names several rows (39
-   rows in Florida) the one candidate that covers the point is taken, exactly as
-   aotil/regions.py does. A v1 band negative's ring polygon was never recorded,
-   which is fine: meta_edge_dist_m is defined for positives only.
-
-4. meta_edge_dist_m is the distance to the BOUNDARY of the labelling polygon,
-   holes included. That boundary includes edges the polygon shares with
-   neighbouring SFHA polygons (an A/AE contact, a polygon split at a panel or
-   county line), not only the edge to unmapped or Zone X ground. It is null for
-   a positive that its polygon does not cover; there should be none.
-
-5. THE PANEL IS THE ONE OF THE POINT'S OWN DFIRM. FIRM panels are full printed
-   rectangles, and in Florida they overlap across county DFIRMs (about 65,000
-   km2 of pairwise overlap: a Monroe panel can lie wholly inside a Miami-Dade
-   one). A point inside several panels takes, among the panels whose DFIRM_ID
-   equals the point's dfirm_id, the lowest FIRM_PAN; a point in none of its own
-   DFIRM's panels takes the lowest FIRM_PAN of the others. meta_firm_pan_n
-   records how many panels contain the point. This is the rule
-   sample_points.attach_panel_meta applies to the dataset's meta_eff_date,
-   meta_panel_scale and meta_panel_typ, with the same "within" in EPSG:5070, so
-   both name one sheet; meta_firm_pan_eff_date is that sheet's EFF_DATE and
-   equals meta_eff_date for a dataset built by the current sampler (v1 took
-   the first of several panels). The one difference is that this script
-   repairs the one Florida panel that reprojection leaves self-intersecting
-   (12081C0333E, a 3.1 km spur under 1 m wide); the sampler tests the raw
-   ring, and the two can disagree only inside that spur. Checked: the same
-   panel row for all 98,578 v1 points and all 80,000 points of a v2 test build.
-
-OUTPUT
-======
-<out> (default data/interim/analysis/point_extras_<ST>.parquet), one row per
-dataset row, in dataset order:
-    point_id
-    meta_firm_pan, meta_firm_pan_n, meta_firm_pan_eff_date (naive UTC, as meta_eff_date)
-    meta_near_src_row_id, meta_near_fld_ar_id, meta_near_fld_zone, meta_near_dist_m
-    meta_edge_src_row_id   the labelling polygon whose edge meta_edge_dist_m measures
-                           (meta_src_row_id where the dataset has it)
-    meta_edge_dist_m
-The settings and input paths travel in the parquet schema metadata.
-
-USAGE
-=====
     python pull_point_extras.py --state FL
-    python pull_point_extras.py --state FL --dataset data/processed/dataset_FL.parquet \\
-        --out /tmp/x/point_extras_FL.parquet --limit 2000      # smoke test
+    python pull_point_extras.py --state FL --out /tmp/x/point_extras_FL.parquet --limit 2000
 """
 from __future__ import annotations
 
@@ -95,13 +23,14 @@ import sys
 import time
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shapely
-from shapely import STRtree
 from pyproj import Transformer
+from shapely import STRtree
 
 PROCESSED = Path("data/processed")
 PREP_DIR = Path("data/interim/prep")
@@ -110,13 +39,15 @@ OUT_DIR = Path("data/interim/analysis")
 
 CRS_WORK = 5070        # CONUS Albers, metres: the sampler's working CRS
 CRS_LL = 4269          # NAD83 lon/lat, as sample_points writes lon/lat
-RADIUS_M = 5000.0      # band_max_m: no v2 point is farther than this from an SFHA
-LIMIT_SEED = 0
+RADIUS_M = 5000.0      # band_max_m: no protocol v2 point is farther than this from an SFHA
+LIMIT_SEED = 0         # RNG seed of the --limit subset
+MIN_CELL_M = 1000.0    # smallest cell candidate_rows bins the points into
 
 POINT_COLS = ["point_id", "domain", "label", "dfirm_id", "meta_fld_ar_id", "lon", "lat"]
 OPTIONAL_COLS = ["meta_src_row_id", "meta_dist_to_sfha_m", "meta_eff_date", "geometry"]
 IDX_COLS = ["row_id", "DFIRM_ID", "FLD_AR_ID", "FLD_ZONE", "SFHA_TF",
             "minx", "miny", "maxx", "maxy"]
+BBOX_COLS = ["minx", "miny", "maxx", "maxy"]
 
 
 # =========================================================================
@@ -130,48 +61,61 @@ def default_paths(state: str) -> dict:
                 out=OUT_DIR / f"point_extras_{state}.parquet")
 
 
+def project_to_work(x: np.ndarray, y: np.ndarray, epsg: int) -> np.ndarray:
+    """(n, 2) coordinates reprojected from EPSG:`epsg` to EPSG:5070."""
+    transformer = Transformer.from_crs(epsg, CRS_WORK, always_xy=True)
+    return np.column_stack(transformer.transform(x, y))
+
+
 def geo_crs(schema: pa.Schema) -> int | None:
     """EPSG code of a GeoParquet's primary geometry, or None if unstated."""
-    geo = json.loads((schema.metadata or {}).get(b"geo", b"{}") or b"{}")
-    col = geo.get("columns", {}).get(geo.get("primary_column", "geometry"), {})
-    crs = col.get("crs") or {}
-    cid = crs.get("id", {}) if isinstance(crs, dict) else {}
-    return int(cid["code"]) if cid.get("authority") == "EPSG" else None
+    metadata = schema.metadata or {}
+    geo = json.loads(metadata.get(b"geo") or b"{}")
+    primary = geo.get("primary_column", "geometry")
+    column = geo.get("columns", {}).get(primary, {})
+    crs = column.get("crs")
+    if not isinstance(crs, dict):
+        return None
+    crs_id = crs.get("id", {})
+    if crs_id.get("authority") != "EPSG":
+        return None
+    return int(crs_id["code"])
 
 
 def load_points(path: Path, limit: int | None = None,
                 cols: list[str] = POINT_COLS) -> tuple[pd.DataFrame, np.ndarray, str]:
-    """Point rows plus their (x, y) in EPSG:5070 and a note on where xy came from.
+    """Point rows, their (x, y) in EPSG:5070, and a note on where the xy came from.
 
-    The dataset's own point geometry is used when it is there: it holds the exact
-    coordinates the sampler tested containment and distances with, which a
-    lon/lat round trip reproduces only to ~1e-9 m.
+    The dataset's own point geometry is preferred: it holds the exact coordinates the sampler
+    tested containment and distances with, which a lon/lat round trip reproduces only to ~1e-9 m.
+    `limit` keeps a random subset of rows, in dataset order.
     """
     pf = pq.ParquetFile(path)
     names = pf.schema_arrow.names
     missing = [c for c in cols if c not in names]
     if missing:
         sys.exit(f"{path}: missing columns {missing}")
-    df = pq.read_table(path, columns=cols + [c for c in OPTIONAL_COLS
-                                             if c in names and c not in cols]).to_pandas()
+    optional = [c for c in OPTIONAL_COLS if c in names and c not in cols]
+    df = pq.read_table(path, columns=cols + optional).to_pandas()
     if not df.point_id.is_unique:
         sys.exit(f"{path}: point_id is not unique")
     if limit is not None and limit < len(df):
-        keep = np.sort(np.random.default_rng(LIMIT_SEED).choice(len(df), limit, replace=False))
+        rng = np.random.default_rng(LIMIT_SEED)
+        keep = np.sort(rng.choice(len(df), limit, replace=False))
         df = df.iloc[keep].reset_index(drop=True)
 
     epsg = geo_crs(pf.schema_arrow) if "geometry" in df else None
     if epsg is not None:
-        xy = shapely.get_coordinates(shapely.from_wkb(df.pop("geometry").to_numpy()))
+        points = shapely.from_wkb(df.pop("geometry").to_numpy())
+        xy = shapely.get_coordinates(points)
         how = f"dataset geometry (EPSG:{epsg})"
         if epsg != CRS_WORK:
-            tf = Transformer.from_crs(epsg, CRS_WORK, always_xy=True)
-            xy = np.column_stack(tf.transform(xy[:, 0], xy[:, 1]))
+            xy = project_to_work(xy[:, 0], xy[:, 1], epsg)
             how += f" -> EPSG:{CRS_WORK}"
     else:
+        # no geometry, or one without a stated CRS: use lon/lat
         df = df.drop(columns="geometry", errors="ignore")
-        tf = Transformer.from_crs(CRS_LL, CRS_WORK, always_xy=True)
-        xy = np.column_stack(tf.transform(df.lon.to_numpy(float), df.lat.to_numpy(float)))
+        xy = project_to_work(df.lon.to_numpy(float), df.lat.to_numpy(float), CRS_LL)
         how = f"lon/lat projected EPSG:{CRS_LL} -> {CRS_WORK}"
     if len(xy) != len(df):
         sys.exit(f"{path}: {len(xy)} coordinates for {len(df)} rows (empty or multi geometry)")
@@ -179,79 +123,104 @@ def load_points(path: Path, limit: int | None = None,
 
 
 def load_index(path: Path) -> pd.DataFrame:
+    """idx_<ST> polygon attributes and bboxes, with the string columns as object dtype."""
     idx = pq.read_table(path, columns=IDX_COLS).to_pandas()
-    for c in ("DFIRM_ID", "FLD_AR_ID", "FLD_ZONE", "SFHA_TF"):
-        idx[c] = idx[c].astype(object)
+    for col in ("DFIRM_ID", "FLD_AR_ID", "FLD_ZONE", "SFHA_TF"):
+        idx[col] = idx[col].astype(object)
     return idx
+
+
+def match_row_ids(rid: np.ndarray, wanted: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The wanted ids present in the unordered id array `rid`, and their positions in it."""
+    order = np.argsort(rid)
+    sorted_ids = rid[order]
+    hit = np.searchsorted(sorted_ids, wanted)
+    clipped = np.minimum(hit, len(rid) - 1)
+    found = (hit < len(rid)) & (sorted_ids[clipped] == wanted)
+    return wanted[found], order[hit[found]]
 
 
 class HazReader:
     """Geometry from haz_<ST>_5070.parquet by row_id, one row group at a time.
 
-    The file is 5.4 GB for Florida in 10,000-row groups and must never be read
-    whole. prep_state writes row_id 0..n-1 in order, so row_id r sits at
-    position r - start[g] of group g; that is checked on every read and a group
-    whose ids are out of order falls back to matching them.
+    The Florida file is 5.4 GB in 10,000-row groups and must never be read whole. prep_state
+    writes row_id 0..n-1 in file order, so row_id r sits at position r - start[g] of group g.
+    Every read checks that, and matches the ids explicitly in a group where it does not hold.
     """
 
     def __init__(self, path: Path):
-        self.path = Path(path)
-        self.pf = pq.ParquetFile(self.path)
-        md = self.pf.metadata
-        sizes = [md.row_group(i).num_rows for i in range(md.num_row_groups)]
+        self.pf = pq.ParquetFile(path)
+        meta = self.pf.metadata
+        sizes = [meta.row_group(i).num_rows for i in range(meta.num_row_groups)]
         self.start = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
         self.n_rows = int(self.start[-1])
 
     def group_of(self, row_ids: np.ndarray) -> np.ndarray:
+        """The row group each row_id sits in when ids follow file order."""
         return np.searchsorted(self.start, row_ids, side="right") - 1
 
     def iter_groups(self, row_ids):
-        """Yield (group, sorted row_ids found, geometries) for the wanted rows."""
+        """Yield (group, sorted row_ids found, geometries) for each group holding wanted rows."""
         want = np.unique(np.asarray(row_ids, dtype=np.int64))
         want = want[(want >= 0) & (want < self.n_rows)]
-        grp = self.group_of(want)
-        for gi in np.unique(grp):
-            sel = want[grp == gi]
-            t = self.pf.read_row_group(int(gi), columns=["row_id", "geometry"])
-            rid = t.column("row_id").to_numpy()
+        groups = self.group_of(want)
+        for gi in np.unique(groups):
+            sel = want[groups == gi]
+            table = self.pf.read_row_group(int(gi), columns=["row_id", "geometry"])
+            rid = table.column("row_id").to_numpy()
             pos = sel - self.start[gi]
-            if pos.max() >= len(rid) or not np.array_equal(rid[pos], sel):
-                order = np.argsort(rid)
-                hit = np.searchsorted(rid[order], sel)
-                ok = (hit < len(rid)) & (rid[order][np.minimum(hit, len(rid) - 1)] == sel)
-                sel, pos = sel[ok], order[hit[ok]]
-            wkb = t.column("geometry").take(pa.array(pos)).to_numpy(zero_copy_only=False)
+            if not np.array_equal(rid[pos], sel):
+                sel, pos = match_row_ids(rid, sel)
+            wkb = table.column("geometry").take(pa.array(pos)).to_numpy(zero_copy_only=False)
             yield int(gi), sel, shapely.from_wkb(wkb)
 
     def read(self, row_ids) -> dict[int, object]:
+        """{row_id: geometry} for the wanted rows the file holds."""
         out: dict[int, object] = {}
-        for _, sel, geo in self.iter_groups(row_ids):
-            out.update(zip(sel.tolist(), geo))
+        for _, sel, geoms in self.iter_groups(row_ids):
+            out.update(zip(sel.tolist(), geoms))
         return out
 
 
 # =========================================================================
-# the labelling polygon (decision 3)
+# the labelling polygon of each positive
 # =========================================================================
+def key_candidates(df: pd.DataFrame, has_key: np.ndarray, idx: pd.DataFrame) -> pd.DataFrame:
+    """idx rows matching each keyed point's (dfirm_id, meta_fld_ar_id); i is the point's row."""
+    keys = pd.DataFrame(dict(i=np.flatnonzero(has_key),
+                             DFIRM_ID=df.dfirm_id.to_numpy()[has_key].astype(str),
+                             FLD_AR_ID=df.meta_fld_ar_id.to_numpy()[has_key].astype(str)))
+    idx_keys = idx[["row_id", "DFIRM_ID", "FLD_AR_ID"]].astype({"DFIRM_ID": str, "FLD_AR_ID": str})
+    return keys.merge(idx_keys, on=["DFIRM_ID", "FLD_AR_ID"], how="inner")
+
+
 def resolve_label_polygons(df: pd.DataFrame, xy: np.ndarray, idx: pd.DataFrame,
                            haz: HazReader) -> tuple[np.ndarray, dict]:
-    """idx row_id of the polygon that labelled each positive; -1 for the rest."""
-    n = len(df)
-    src = np.full(n, -1, dtype=np.int64)
+    """idx row_id of the polygon that labelled each positive (-1 for the rest), and counts of
+    how each was found.
+
+    meta_src_row_id names the polygon wherever it is set. Points without it (sampling v1) are
+    matched on (dfirm_id, meta_fld_ar_id): the pair, because FLD_AR_ID alone repeats across
+    DFIRMs. Where the pair names several idx rows, the single one that covers the point is taken,
+    as aotil/regions.py does.
+    """
+    src = np.full(len(df), -1, dtype=np.int64)
     pos = df.label.to_numpy() == 1
     info = dict(positives=int(pos.sum()), from_column=0, key_unique=0,
                 key_ambiguous=0, key_ambiguous_resolved=0, key_not_in_index=0,
                 no_key=0, column_key_mismatch=0)
 
     if "meta_src_row_id" in df:
-        s = pd.to_numeric(df.meta_src_row_id, errors="coerce").to_numpy(dtype=float)
-        have = pos & np.isfinite(s)
-        src[have] = s[have].astype(np.int64)
+        column = pd.to_numeric(df.meta_src_row_id, errors="coerce").to_numpy(dtype=float)
+        have = pos & np.isfinite(column)
+        src[have] = column[have].astype(np.int64)
         info["from_column"] = int(have.sum())
-        if have.any() and "meta_fld_ar_id" in df:
-            ar = idx.set_index("row_id").FLD_AR_ID.reindex(src[have]).to_numpy()
-            info["column_key_mismatch"] = int(
-                (ar.astype(str) != df.meta_fld_ar_id.to_numpy()[have].astype(str)).sum())
+        if have.any():
+            # the named polygon should carry the point's own FLD_AR_ID
+            polygon_ar = idx.set_index("row_id").FLD_AR_ID.reindex(src[have]).to_numpy()
+            point_ar = df.meta_fld_ar_id.to_numpy()[have]
+            mismatch = polygon_ar.astype(str) != point_ar.astype(str)
+            info["column_key_mismatch"] = int(mismatch.sum())
 
     todo = pos & (src < 0)
     has_key = todo & df.meta_fld_ar_id.notna().to_numpy()
@@ -259,26 +228,25 @@ def resolve_label_polygons(df: pd.DataFrame, xy: np.ndarray, idx: pd.DataFrame,
     if not has_key.any():
         return src, info
 
-    key = pd.DataFrame(dict(i=np.flatnonzero(has_key),
-                            DFIRM_ID=df.dfirm_id.to_numpy()[has_key].astype(str),
-                            FLD_AR_ID=df.meta_fld_ar_id.to_numpy()[has_key].astype(str)))
-    cand = key.merge(idx[["row_id", "DFIRM_ID", "FLD_AR_ID"]].astype(
-        {"DFIRM_ID": str, "FLD_AR_ID": str}), on=["DFIRM_ID", "FLD_AR_ID"], how="inner")
+    cand = key_candidates(df, has_key, idx)
     n_cand = cand.groupby("i").row_id.transform("size")
-    one = cand[n_cand == 1]
-    src[one.i.to_numpy()] = one.row_id.to_numpy()
-    info["key_unique"] = len(one)
+    unique = cand[n_cand == 1]
+    src[unique.i.to_numpy()] = unique.row_id.to_numpy()
+    info["key_unique"] = len(unique)
     info["key_not_in_index"] = int(has_key.sum()) - int(cand.i.nunique())
 
-    amb = cand[n_cand > 1]
-    info["key_ambiguous"] = int(amb.i.nunique())
-    if len(amb):
-        geoms = haz.read(amb.row_id.unique())
-        for i, grp in amb.groupby("i"):
-            pt = shapely.Point(xy[i])
-            hits = [r for r in grp.row_id if geoms.get(r) is not None and geoms[r].covers(pt)]
-            if len(hits) == 1:
-                src[i] = hits[0]
+    ambiguous = cand[n_cand > 1]
+    info["key_ambiguous"] = int(ambiguous.i.nunique())
+    if len(ambiguous):
+        geoms = haz.read(ambiguous.row_id.unique())
+        for i, group in ambiguous.groupby("i"):
+            point = shapely.Point(xy[i])
+            covering = []
+            for r in group.row_id:
+                if geoms.get(r) is not None and geoms[r].covers(point):
+                    covering.append(r)
+            if len(covering) == 1:
+                src[i] = covering[0]
                 info["key_ambiguous_resolved"] += 1
     return src, info
 
@@ -287,26 +255,77 @@ def resolve_label_polygons(df: pd.DataFrame, xy: np.ndarray, idx: pd.DataFrame,
 # nearest SFHA polygon and edge distance, one pass over the hazard file
 # =========================================================================
 def candidate_rows(sfha: pd.DataFrame, xy: np.ndarray, radius: float) -> np.ndarray:
-    """SFHA row_ids whose bbox lies within `radius` of some point (decision 1).
+    """SFHA row_ids whose bbox comes within `radius` of an occupied point cell.
 
-    Points are binned into radius-sized cells; a polygon is kept if its bbox meets
-    an occupied cell grown by radius. That is a superset of the polygons within
-    radius of any point, at the cost of a few hundred thousand box tests.
+    A polygon within radius of a point has its bbox within radius too, so this prefilter loses
+    no distance <= radius. Binning the points into cells keeps it to a few hundred thousand box
+    tests.
     """
-    c = max(radius, 1000.0)
-    cells = np.unique(np.floor(xy / c).astype(np.int64), axis=0)
-    boxes = shapely.box(cells[:, 0] * c - radius, cells[:, 1] * c - radius,
-                        (cells[:, 0] + 1) * c + radius, (cells[:, 1] + 1) * c + radius)
-    pb = shapely.box(sfha.minx.to_numpy(), sfha.miny.to_numpy(),
-                     sfha.maxx.to_numpy(), sfha.maxy.to_numpy())
-    hit = STRtree(boxes).query(pb, predicate="intersects")
-    return sfha.row_id.to_numpy()[np.unique(hit[0])]
+    cell = max(radius, MIN_CELL_M)
+    cells = np.unique(np.floor(xy / cell).astype(np.int64), axis=0)
+    cell_boxes = shapely.box(cells[:, 0] * cell - radius, cells[:, 1] * cell - radius,
+                             (cells[:, 0] + 1) * cell + radius, (cells[:, 1] + 1) * cell + radius)
+    polygon_boxes = shapely.box(sfha.minx.to_numpy(), sfha.miny.to_numpy(),
+                                sfha.maxx.to_numpy(), sfha.maxy.to_numpy())
+    hits = STRtree(cell_boxes).query(polygon_boxes, predicate="intersects")
+    return sfha.row_id.to_numpy()[np.unique(hits[0])]
+
+
+def nearest_in_group(pts: np.ndarray, xy: np.ndarray, rows: np.ndarray, geoms: np.ndarray,
+                     bboxes: np.ndarray, radius: float):
+    """(point index, distance, row_id) of each point's nearest polygon among one row group's,
+    within radius; the lower row_id wins on equal distances."""
+    x0 = bboxes[:, 0].min() - radius
+    y0 = bboxes[:, 1].min() - radius
+    x1 = bboxes[:, 2].max() + radius
+    y1 = bboxes[:, 3].max() + radius
+    in_x = (xy[:, 0] >= x0) & (xy[:, 0] <= x1)
+    in_y = (xy[:, 1] >= y0) & (xy[:, 1] <= y1)
+    near = np.flatnonzero(in_x & in_y)
+    if near.size == 0:
+        return near, np.zeros(0), np.zeros(0, dtype=np.int64)
+
+    (pi, gj), d = STRtree(geoms).query_nearest(
+        pts[near], max_distance=radius, return_distance=True, all_matches=True)
+    pi = near[pi]
+    r = rows[gj]
+    if pi.size == 0:
+        # points inside the grown bbox can still all be farther than radius from every polygon
+        return pi, d, r
+    # order by point, distance, row_id and keep each point's first match
+    order = np.lexsort((r, d, pi))
+    pi, d, r = pi[order], d[order], r[order]
+    first = np.r_[True, pi[1:] != pi[:-1]]
+    return pi[first], d[first], r[first]
+
+
+def label_polygon_edges(pts: np.ndarray, src: np.ndarray, rows: np.ndarray, geoms: np.ndarray,
+                        usable: np.ndarray):
+    """For the points whose labelling polygon is in this row group: their indices, whether the
+    polygon covers each, and the distance to its boundary."""
+    labelled = np.flatnonzero(np.isin(src, rows))
+    if labelled.size == 0:
+        return labelled, np.zeros(0, dtype=bool), np.zeros(0)
+    at = np.searchsorted(rows, src[labelled])
+    ok = usable[at]
+    labelled, at = labelled[ok], at[ok]
+    inside = shapely.covers(geoms[at], pts[labelled])
+    uniq, inv = np.unique(at, return_inverse=True)
+    boundaries = shapely.boundary(geoms[uniq])
+    dist = shapely.distance(pts[labelled], boundaries[inv])
+    return labelled, inside, dist
 
 
 def nearest_and_edges(haz: HazReader, sfha: pd.DataFrame, xy: np.ndarray,
                       src: np.ndarray, radius: float) -> dict:
-    """Stream the hazard file once: nearest SFHA polygon for every point, and the
-    covering test and boundary distance for every positive's labelling polygon."""
+    """One pass over the hazard file: every point's nearest SFHA polygon within radius, and for
+    every positive whether its labelling polygon covers it and how far its edge is.
+
+    Same candidates (every SFHA_TF == 'T' zone), geometry and exact EPSG:5070 distance as
+    sample_points.distances_to_sfha. The edge is the whole polygon boundary, holes and edges
+    shared with neighbouring SFHA polygons included; it is NaN where the polygon does not cover
+    the point.
+    """
     n = len(xy)
     pts = shapely.points(xy)
     best_d = np.full(n, np.inf)
@@ -318,43 +337,25 @@ def nearest_and_edges(haz: HazReader, sfha: pd.DataFrame, xy: np.ndarray,
     want = np.union1d(cand, src[src >= 0])
     is_cand = np.zeros(haz.n_rows, dtype=bool)
     is_cand[cand] = True
-    bb = sfha.set_index("row_id")[["minx", "miny", "maxx", "maxy"]]
+    bboxes = sfha.set_index("row_id")[BBOX_COLS]
     n_groups = len(np.unique(haz.group_of(want)))
     print(f"  {len(cand):,} of {len(sfha):,} SFHA polygons within {radius:.0f} m of a "
           f"point's cell; reading {n_groups} of {len(haz.start) - 1} row groups", flush=True)
 
     t0 = time.time()
-    for k, (gi, sel, geo) in enumerate(haz.iter_groups(want), 1):
-        ok = np.array([g is not None and not g.is_empty for g in geo])
-        m = is_cand[sel] & ok
-        if m.any():
-            g_rows, g_geo = sel[m], geo[m]
-            b = bb.loc[g_rows].to_numpy()
-            x0, y0 = b[:, 0].min() - radius, b[:, 1].min() - radius
-            x1, y1 = b[:, 2].max() + radius, b[:, 3].max() + radius
-            near = np.flatnonzero((xy[:, 0] >= x0) & (xy[:, 0] <= x1) &
-                                  (xy[:, 1] >= y0) & (xy[:, 1] <= y1))
-            if near.size:
-                (pi, gj), d = STRtree(g_geo).query_nearest(
-                    pts[near], max_distance=radius, return_distance=True, all_matches=True)
-                pi, r = near[pi], g_rows[gj]
-                o = np.lexsort((r, d, pi))
-                pi, d, r = pi[o], d[o], r[o]
-                first = np.r_[True, pi[1:] != pi[:-1]]
-                pi, d, r = pi[first], d[first], r[first]
-                better = (d < best_d[pi]) | ((d == best_d[pi]) & (r < best_r[pi]))
-                best_d[pi[better]] = d[better]
-                best_r[pi[better]] = r[better]
+    for k, (gi, rows, geoms) in enumerate(haz.iter_groups(want), 1):
+        usable = ~shapely.is_missing(geoms) & ~shapely.is_empty(geoms)
+        keep = is_cand[rows] & usable
+        if keep.any():
+            group_bboxes = bboxes.loc[rows[keep]].to_numpy()
+            pi, d, r = nearest_in_group(pts, xy, rows[keep], geoms[keep], group_bboxes, radius)
+            better = (d < best_d[pi]) | ((d == best_d[pi]) & (r < best_r[pi]))
+            best_d[pi[better]] = d[better]
+            best_r[pi[better]] = r[better]
 
-        mine = np.flatnonzero(np.isin(src, sel))
-        if mine.size:
-            gpos = np.searchsorted(sel, src[mine])
-            have = ok[gpos]
-            mine, gpos = mine[have], gpos[have]
-            covered[mine] = shapely.covers(geo[gpos], pts[mine])
-            uniq, inv = np.unique(gpos, return_inverse=True)
-            bnd = shapely.boundary(geo[uniq])
-            edge[mine] = shapely.distance(pts[mine], bnd[inv])
+        labelled, inside, dist = label_polygon_edges(pts, src, rows, geoms, usable)
+        covered[labelled] = inside
+        edge[labelled] = dist
         if k % 10 == 0 or k == n_groups:
             print(f"    row groups {k}/{n_groups}  ({time.time() - t0:.0f}s)", flush=True)
 
@@ -363,189 +364,231 @@ def nearest_and_edges(haz: HazReader, sfha: pd.DataFrame, xy: np.ndarray,
 
 
 # =========================================================================
-# FIRM panel (decision 5)
+# FIRM panel
 # =========================================================================
 def load_panels(path: Path):
-    """Panels in EPSG:5070, plus the mask of those reprojection left invalid
-    (repaired here with make_valid)."""
-    import geopandas as gpd
+    """FIRM panels in EPSG:5070, and the mask of those reprojection left invalid.
+
+    Those are repaired with make_valid; in Florida it is one panel, 12081C0333E, whose 3.1 km
+    spur under 1 m wide self-intersects after reprojection.
+    """
     pan = gpd.read_parquet(path)
     if pan.crs is None:
         sys.exit(f"{path}: no CRS")
     pan = pan.to_crs(CRS_WORK).reset_index(drop=True)
-    g = np.asarray(pan.geometry.values)
-    bad = ~shapely.is_valid(g)
+    geoms = np.asarray(pan.geometry.values)
+    bad = ~shapely.is_valid(geoms)
     if bad.any():
-        g[bad] = shapely.make_valid(g[bad])
-        pan = pan.set_geometry(g)
+        geoms[bad] = shapely.make_valid(geoms[bad])
+        pan = pan.set_geometry(geoms)
     return pan, bad
 
 
 def panel_of(pan, xy: np.ndarray, dfirm: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
-    """(row of the chosen panel in pan or -1, number of containing panels, points
-    in several panels that took their own DFIRM's). The choice is decision 5's."""
+    """Each point's panel: its row in pan (-1 for none), the number of panels containing the
+    point, and how many points in several panels took one of their own DFIRM's.
+
+    Panels are whole printed rectangles and overlap across county DFIRMs. A point takes the
+    lowest FIRM_PAN among its own DFIRM's panels, else the lowest of the others: the rule
+    sample_points.attach_panel_meta applies, so meta_firm_pan and meta_eff_date name one sheet.
+    """
     n = len(xy)
-    hits = STRtree(np.asarray(pan.geometry.values)).query(shapely.points(xy), predicate="within")
-    count = np.bincount(hits[0], minlength=n)
-    h = pd.DataFrame(dict(i=hits[0], row=hits[1], pan=pan.FIRM_PAN.to_numpy()[hits[1]],
-                          own=pan.DFIRM_ID.to_numpy()[hits[1]] == dfirm[hits[0]]))
-    h = h.sort_values(["i", "own", "pan"], ascending=[True, False, True], kind="stable")
-    first = h.drop_duplicates("i")
+    point_i, panel_row = STRtree(np.asarray(pan.geometry.values)).query(
+        shapely.points(xy), predicate="within")
+    count = np.bincount(point_i, minlength=n)
+    hits = pd.DataFrame(dict(i=point_i, row=panel_row,
+                             pan=pan.FIRM_PAN.to_numpy()[panel_row],
+                             own=pan.DFIRM_ID.to_numpy()[panel_row] == dfirm[point_i]))
+    hits = hits.sort_values(["i", "own", "pan"], ascending=[True, False, True], kind="stable")
+    chosen = hits.drop_duplicates("i")
     out = np.full(n, -1, dtype=np.int64)
-    out[first.i.to_numpy()] = first.row.to_numpy()
-    multi = count > 1
-    by_dfirm = int(first.own.to_numpy()[multi[first.i.to_numpy()]].sum())
+    out[chosen.i.to_numpy()] = chosen.row.to_numpy()
+    in_several = count > 1
+    by_dfirm = int(chosen.own.to_numpy()[in_several[chosen.i.to_numpy()]].sum())
     return out, count, by_dfirm
 
 
 def eff_dates(pan) -> np.ndarray:
-    """Panel EFF_DATE as naive UTC datetime64, the form sample_points writes to
-    meta_eff_date (its tz-aware EFF_DATE goes through .values)."""
+    """Panel EFF_DATE as naive UTC datetime64, the form sample_points writes to meta_eff_date."""
     if "EFF_DATE" not in pan:
         return np.full(len(pan), np.datetime64("NaT", "ms"))
     return pd.to_datetime(pan.EFF_DATE, utc=True).dt.tz_localize(None).to_numpy()
 
 
 # =========================================================================
-def summarise(df: pd.DataFrame, res: pd.DataFrame, src_info: dict, near: dict,
-              radius: float) -> None:
+# output table and summary
+# =========================================================================
+def nullable_ids(row_ids: np.ndarray):
+    """int64 row ids with -1 for none, as a pandas Int64 array with <NA>."""
+    out = pd.array(np.where(row_ids >= 0, row_ids, 0), dtype="Int64")
+    out[row_ids < 0] = pd.NA
+    return out
+
+
+def lookup_strings(column: pd.Series, row_ids: np.ndarray):
+    """column[row_id] as a pandas string array, <NA> where row_id is -1."""
+    found = row_ids >= 0
+    values = column.reindex(np.where(found, row_ids, -1)).to_numpy()
+    return pd.array(np.where(found, values, None), dtype="string")
+
+
+def sidecar_frame(df: pd.DataFrame, idx: pd.DataFrame, near_r: np.ndarray, near_d: np.ndarray,
+                  src: np.ndarray, edge: np.ndarray, pan, pan_row: np.ndarray,
+                  pan_n: np.ndarray) -> pd.DataFrame:
+    """The sidecar table: one row per point, in dataset order."""
     pos = df.label.to_numpy() == 1
-    n = len(df)
-    cnt = res.meta_firm_pan_n.to_numpy()
-    print(f"\n  panels: {int((cnt == 1).sum()):,} points in exactly one, "
-          f"{int((cnt == 0).sum()):,} in none, {int((cnt > 1).sum()):,} in more than one "
-          f"(max {int(cnt.max()) if n else 0})")
-    if "meta_eff_date" in df:
-        mine = pd.to_datetime(res.meta_firm_pan_eff_date)
-        theirs = pd.to_datetime(df.meta_eff_date)
-        both = mine.notna() & theirs.notna()
-        same = int((mine[both] == theirs[both]).sum())
-        print(f"  meta_firm_pan_eff_date equals the dataset's meta_eff_date for "
-              f"{same:,}/{int(both.sum()):,} points; sample_points.attach_panel_meta picks "
-              f"the panel by the same rule (decision 5), so any difference means the dataset "
-              f"was built by an older sampler (v1 took the first of several panels) or "
-              f"from another pan file")
-
-    s = src_info
-    print(f"  labelling polygon of {s['positives']:,} positives: {s['from_column']:,} from "
-          f"meta_src_row_id, {s['key_unique']:,} by unique (dfirm_id, meta_fld_ar_id), "
-          f"{s['key_ambiguous_resolved']}/{s['key_ambiguous']} ambiguous keys by "
-          f"point-in-polygon, {s['key_not_in_index']} keys not in the index, "
-          f"{s['no_key']} without a key")
-    if s["column_key_mismatch"]:
-        print(f"  WARNING: {s['column_key_mismatch']} positives whose meta_src_row_id "
-              f"polygon has a different FLD_AR_ID from meta_fld_ar_id")
-    has_src = res.meta_edge_src_row_id.notna().to_numpy()
-    cov = near["covered"]
-    print(f"  positives covered by their labelling polygon: {int(cov[pos].sum()):,}"
-          f"/{int((pos & has_src).sum()):,} with a polygon"
-          f"{'' if cov[pos & has_src].all() else '   <-- NOT ALL'}")
-    if near.get("swapped") is not None:
-        print(f"  positives whose plain nearest search found another polygon at the same "
-              f"distance 0 (adjacent or overlapping SFHA): {near['swapped']:,}")
-
-    d = res.meta_near_dist_m.to_numpy(float)
-    found = np.isfinite(d)
-    print(f"  nearest SFHA polygon found within {radius:.0f} m for {int(found.sum()):,}"
-          f"/{n:,} points; zones: " +
-          ", ".join(f"{z} {c:,}" for z, c in res.meta_near_fld_zone.value_counts().items()))
-    for lab, name in ((1, "positives"), (0, "negatives")):
-        m = (df.label.to_numpy() == lab) & found
-        if m.any():
-            q = np.percentile(d[m], [0, 50, 100])
-            print(f"    {name:<9} distance min/median/max {q[0]:.1f} / {q[1]:.1f} / {q[2]:.1f} m")
-    if "meta_dist_to_sfha_m" in df:
-        ref = df.meta_dist_to_sfha_m.to_numpy(float)
-        both = found & np.isfinite(ref)
-        diff = np.abs(d[both] - ref[both])
-        print(f"  check against the dataset's meta_dist_to_sfha_m "
-              f"(sample_points.distances_to_sfha): {int(both.sum()):,} points, max |diff| "
-              f"{diff.max() if both.any() else float('nan'):.2e} m, "
-              f"{int((diff > 1e-6).sum())} differ by more than 1e-6 m")
-
-    e = res.meta_edge_dist_m.to_numpy(float)
-    for dom, g in df[pos].groupby("domain"):
-        v = e[g.index.to_numpy()]
-        v = v[np.isfinite(v)]
-        if len(v):
-            q = np.percentile(v, [10, 50, 90])
-            print(f"  meta_edge_dist_m [{dom}] n={len(v):,}: p10 {q[0]:.1f}, median "
-                  f"{q[1]:.1f}, p90 {q[2]:.1f}, max {v.max():.1f} m")
-
-
-def build(a) -> int:
-    t0 = time.time()
-    if a.out.exists() and not a.overwrite:
-        print(f"{a.out} exists -- skipping (use --overwrite)")
-        return 0
-    for p in (a.dataset, a.idx, a.haz, a.panels):
-        if not Path(p).exists():
-            sys.exit(f"missing input {p}")
-
-    df, xy, how = load_points(a.dataset, a.limit)
-    print(f"[{a.state}] {len(df):,} points from {a.dataset}"
-          f"{f' (random {a.limit:,}, seed {LIMIT_SEED})' if a.limit else ''}; xy: {how}",
-          flush=True)
-    idx = load_index(a.idx)
-    haz = HazReader(a.haz)
-    if haz.n_rows != len(idx):
-        sys.exit(f"{a.haz} has {haz.n_rows:,} rows, {a.idx} {len(idx):,}: not the same prep")
-    sfha = idx[idx.SFHA_TF == "T"]
-
-    src, src_info = resolve_label_polygons(df, xy, idx, haz)
-    print(f"  resolved labelling polygons ({time.time() - t0:.0f}s)", flush=True)
-
-    near = nearest_and_edges(haz, sfha, xy, src, a.radius)
-    pos = df.label.to_numpy() == 1
-    use_src = pos & near["covered"]
-    near["swapped"] = int((use_src & (near["near_r"] != src)).sum())
-    near_r = np.where(use_src, src, near["near_r"])
-    near_d = np.where(use_src, 0.0, near["near_d"])
-    found = near_r >= 0
-
-    attrs = idx.set_index("row_id")
-    nr = pd.array(np.where(found, near_r, 0), dtype="Int64")
-    nr[~found] = pd.NA
-    er = pd.array(np.where(src >= 0, src, 0), dtype="Int64")
-    er[src < 0] = pd.NA
-
-    pan, fixed = load_panels(a.panels)
-    pan_row, pan_n, by_dfirm = panel_of(pan, xy, df.dfirm_id.to_numpy().astype(object))
     in_pan = pan_row >= 0
-    print(f"  {len(pan):,} panels ({int(fixed.sum())} repaired after reprojection); "
-          f"{by_dfirm:,} of {int((pan_n > 1).sum()):,} multi-panel points took their own "
-          f"DFIRM's panel", flush=True)
-
-    res = pd.DataFrame({
+    attrs = idx.set_index("row_id")
+    return pd.DataFrame({
         "point_id": df.point_id.to_numpy(),
         "meta_firm_pan": pd.array(np.where(in_pan, pan.FIRM_PAN.to_numpy()[pan_row], None),
                                   dtype="string"),
         "meta_firm_pan_n": pan_n.astype(np.int16),
         "meta_firm_pan_eff_date": np.where(in_pan, eff_dates(pan)[pan_row],
                                            np.datetime64("NaT", "ms")),
-        "meta_near_src_row_id": nr,
-        "meta_near_fld_ar_id": pd.array(np.where(
-            found, attrs.FLD_AR_ID.reindex(np.where(found, near_r, -1)).to_numpy(), None),
-            dtype="string"),
-        "meta_near_fld_zone": pd.array(np.where(
-            found, attrs.FLD_ZONE.reindex(np.where(found, near_r, -1)).to_numpy(), None),
-            dtype="string"),
-        "meta_near_dist_m": np.where(found, near_d, np.nan),
-        "meta_edge_src_row_id": er,
-        "meta_edge_dist_m": np.where(pos, near["edge"], np.nan),
+        "meta_near_src_row_id": nullable_ids(near_r),
+        "meta_near_fld_ar_id": lookup_strings(attrs.FLD_AR_ID, near_r),
+        "meta_near_fld_zone": lookup_strings(attrs.FLD_ZONE, near_r),
+        "meta_near_dist_m": np.where(near_r >= 0, near_d, np.nan),
+        "meta_edge_src_row_id": nullable_ids(src),
+        "meta_edge_dist_m": np.where(pos, edge, np.nan),
     })
-    summarise(df, res, src_info, near, a.radius)
 
-    a.out.parent.mkdir(parents=True, exist_ok=True)
-    t = pa.Table.from_pandas(res, preserve_index=False)
-    md = dict(t.schema.metadata or {})
-    md[b"point_extras"] = json.dumps(dict(
-        state=a.state, dataset=str(a.dataset), idx=str(a.idx), haz=str(a.haz),
-        panels=str(a.panels), radius_m=a.radius, limit=a.limit, xy=how,
-        labelling_polygon=src_info, written=time.strftime("%Y-%m-%d %H:%M:%S")),
-        sort_keys=True).encode()
-    pq.write_table(t.replace_schema_metadata(md), a.out)
-    print(f"\n[{a.state}] wrote {len(res):,} rows x {res.shape[1]} columns -> {a.out}  "
+
+def print_panel_summary(df: pd.DataFrame, res: pd.DataFrame) -> None:
+    count = res.meta_firm_pan_n.to_numpy()
+    most = int(count.max()) if len(df) else 0
+    print(f"\n  panels: {int((count == 1).sum()):,} points in exactly one, "
+          f"{int((count == 0).sum()):,} in none, {int((count > 1).sum()):,} in more than one "
+          f"(max {most})")
+    if "meta_eff_date" not in df:
+        return
+    mine = pd.to_datetime(res.meta_firm_pan_eff_date)
+    theirs = pd.to_datetime(df.meta_eff_date)
+    both = mine.notna() & theirs.notna()
+    same = int((mine[both] == theirs[both]).sum())
+    print(f"  meta_firm_pan_eff_date equals the dataset's meta_eff_date for "
+          f"{same:,}/{int(both.sum()):,} points (sample_points picks the panel by the same rule; "
+          f"a difference means another pan file or the v1 sampler, which took the first panel)")
+
+
+def print_label_summary(df: pd.DataFrame, res: pd.DataFrame, info: dict, near: dict) -> None:
+    print(f"  labelling polygon of {info['positives']:,} positives: {info['from_column']:,} from "
+          f"meta_src_row_id, {info['key_unique']:,} by unique (dfirm_id, meta_fld_ar_id), "
+          f"{info['key_ambiguous_resolved']}/{info['key_ambiguous']} ambiguous keys by "
+          f"point-in-polygon, {info['key_not_in_index']} keys not in the index, "
+          f"{info['no_key']} without a key")
+    if info["column_key_mismatch"]:
+        print(f"  WARNING: {info['column_key_mismatch']} positives whose meta_src_row_id "
+              f"polygon has a different FLD_AR_ID from meta_fld_ar_id")
+    pos = df.label.to_numpy() == 1
+    with_polygon = pos & res.meta_edge_src_row_id.notna().to_numpy()
+    covered = near["covered"]
+    flag = "" if covered[with_polygon].all() else "   <-- NOT ALL"
+    print(f"  positives covered by their labelling polygon: {int(covered[pos].sum()):,}"
+          f"/{int(with_polygon.sum()):,} with a polygon{flag}")
+    if near.get("swapped") is not None:
+        print(f"  positives whose plain nearest search found another polygon at the same "
+              f"distance 0 (adjacent or overlapping SFHA): {near['swapped']:,}")
+
+
+def print_nearest_summary(df: pd.DataFrame, res: pd.DataFrame, radius: float) -> None:
+    d = res.meta_near_dist_m.to_numpy(float)
+    found = np.isfinite(d)
+    zone_counts = res.meta_near_fld_zone.value_counts()
+    zones = ", ".join(f"{z} {c:,}" for z, c in zone_counts.items())
+    print(f"  nearest SFHA polygon found within {radius:.0f} m for {int(found.sum()):,}"
+          f"/{len(df):,} points; zones: {zones}")
+    labels = df.label.to_numpy()
+    for lab, name in ((1, "positives"), (0, "negatives")):
+        mask = (labels == lab) & found
+        if mask.any():
+            q = np.percentile(d[mask], [0, 50, 100])
+            print(f"    {name:<9} distance min/median/max {q[0]:.1f} / {q[1]:.1f} / {q[2]:.1f} m")
+    if "meta_dist_to_sfha_m" in df:
+        ref = df.meta_dist_to_sfha_m.to_numpy(float)
+        both = found & np.isfinite(ref)
+        diff = np.abs(d[both] - ref[both])
+        max_diff = diff.max() if both.any() else float("nan")
+        print(f"  check against the dataset's meta_dist_to_sfha_m "
+              f"(sample_points.distances_to_sfha): {int(both.sum()):,} points, max |diff| "
+              f"{max_diff:.2e} m, {int((diff > 1e-6).sum())} differ by more than 1e-6 m")
+
+
+def print_edge_summary(df: pd.DataFrame, res: pd.DataFrame) -> None:
+    pos = df.label.to_numpy() == 1
+    edge = res.meta_edge_dist_m.to_numpy(float)
+    for domain, group in df[pos].groupby("domain"):
+        dist = edge[group.index.to_numpy()]
+        dist = dist[np.isfinite(dist)]
+        if len(dist):
+            q = np.percentile(dist, [10, 50, 90])
+            print(f"  meta_edge_dist_m [{domain}] n={len(dist):,}: p10 {q[0]:.1f}, median "
+                  f"{q[1]:.1f}, p90 {q[2]:.1f}, max {dist.max():.1f} m")
+
+
+def summarise(df: pd.DataFrame, res: pd.DataFrame, src_info: dict, near: dict,
+              radius: float) -> None:
+    """Print the checks docs/RUN-FL-V2.md asks a reader of the build log to make."""
+    print_panel_summary(df, res)
+    print_label_summary(df, res, src_info, near)
+    print_nearest_summary(df, res, radius)
+    print_edge_summary(df, res)
+
+
+def write_sidecar(res: pd.DataFrame, args: argparse.Namespace, how: str, src_info: dict) -> None:
+    """Write the table to args.out, with the settings and input paths in the schema metadata."""
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    table = pa.Table.from_pandas(res, preserve_index=False)
+    settings = dict(state=args.state, dataset=str(args.dataset), idx=str(args.idx),
+                    haz=str(args.haz), panels=str(args.panels), radius_m=args.radius,
+                    limit=args.limit, xy=how, labelling_polygon=src_info,
+                    written=time.strftime("%Y-%m-%d %H:%M:%S"))
+    metadata = dict(table.schema.metadata or {})
+    metadata[b"point_extras"] = json.dumps(settings, sort_keys=True).encode()
+    pq.write_table(table.replace_schema_metadata(metadata), args.out)
+
+
+def build(args: argparse.Namespace) -> int:
+    t0 = time.time()
+    if args.out.exists() and not args.overwrite:
+        print(f"{args.out} exists -- skipping (use --overwrite)")
+        return 0
+    for path in (args.dataset, args.idx, args.haz, args.panels):
+        if not path.exists():
+            sys.exit(f"missing input {path}")
+
+    df, xy, how = load_points(args.dataset, args.limit)
+    subset = f" (random {args.limit:,}, seed {LIMIT_SEED})" if args.limit else ""
+    print(f"[{args.state}] {len(df):,} points from {args.dataset}{subset}; xy: {how}", flush=True)
+    idx = load_index(args.idx)
+    haz = HazReader(args.haz)
+    if haz.n_rows != len(idx):
+        sys.exit(f"{args.haz} has {haz.n_rows:,} rows, {args.idx} {len(idx):,}: not the same prep")
+    sfha = idx[idx.SFHA_TF == "T"]
+
+    src, src_info = resolve_label_polygons(df, xy, idx, haz)
+    print(f"  resolved labelling polygons ({time.time() - t0:.0f}s)", flush=True)
+    near = nearest_and_edges(haz, sfha, xy, src, args.radius)
+
+    # Adjacent or overlapping SFHA polygons can also be at distance 0 from a positive, so the
+    # labelling polygon is its nearest whenever it covers the point.
+    pos = df.label.to_numpy() == 1
+    use_src = pos & near["covered"]
+    near["swapped"] = int((use_src & (near["near_r"] != src)).sum())
+    near_r = np.where(use_src, src, near["near_r"])
+    near_d = np.where(use_src, 0.0, near["near_d"])
+
+    pan, fixed = load_panels(args.panels)
+    pan_row, pan_n, by_dfirm = panel_of(pan, xy, df.dfirm_id.to_numpy().astype(object))
+    print(f"  {len(pan):,} panels ({int(fixed.sum())} repaired after reprojection); "
+          f"{by_dfirm:,} of {int((pan_n > 1).sum()):,} multi-panel points took their own "
+          f"DFIRM's panel", flush=True)
+
+    res = sidecar_frame(df, idx, near_r, near_d, src, near["edge"], pan, pan_row, pan_n)
+    summarise(df, res, src_info, near, args.radius)
+    write_sidecar(res, args, how, src_info)
+    print(f"\n[{args.state}] wrote {len(res):,} rows x {res.shape[1]} columns -> {args.out}  "
           f"({time.time() - t0:.0f}s)")
     return 0
 
@@ -554,24 +597,27 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--state", default="FL")
-    ap.add_argument("--dataset", type=Path)
-    ap.add_argument("--idx", type=Path, help="prep/idx_<ST>.parquet")
-    ap.add_argument("--haz", type=Path, help="prep/haz_<ST>_5070.parquet")
-    ap.add_argument("--panels", type=Path, help="nfhl_states/pan_<ST>.parquet")
-    ap.add_argument("--out", type=Path)
+    ap.add_argument("--dataset", type=Path, help="default data/processed/dataset_<ST>.parquet")
+    ap.add_argument("--idx", type=Path, help="default data/interim/prep/idx_<ST>.parquet")
+    ap.add_argument("--haz", type=Path, help="default data/interim/prep/haz_<ST>_5070.parquet")
+    ap.add_argument("--panels", type=Path, help="default data/interim/nfhl_states/pan_<ST>.parquet")
+    ap.add_argument("--out", type=Path,
+                    help="default data/interim/analysis/point_extras_<ST>.parquet")
     ap.add_argument("--radius", type=float, default=RADIUS_M,
-                    help="nearest-SFHA search radius in metres (decision 1)")
+                    help="nearest-SFHA search radius in metres")
     ap.add_argument("--limit", type=int, help="random subset of N points, for smoke tests")
     ap.add_argument("--overwrite", action="store_true")
-    a = ap.parse_args(argv)
+    args = ap.parse_args(argv)
 
-    d = default_paths(a.state)
-    if a.limit is not None and a.out is None:
+    if args.limit is not None and args.out is None:
         sys.exit("--limit writes a partial sidecar: give an explicit --out")
-    for k, v in d.items():
-        if getattr(a, k) is None:
-            setattr(a, k, v)
-    return build(a)
+    defaults = default_paths(args.state)
+    args.dataset = args.dataset or defaults["dataset"]
+    args.idx = args.idx or defaults["idx"]
+    args.haz = args.haz or defaults["haz"]
+    args.panels = args.panels or defaults["panels"]
+    args.out = args.out or defaults["out"]
+    return build(args)
 
 
 if __name__ == "__main__":

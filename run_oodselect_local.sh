@@ -1,20 +1,26 @@
 #!/bin/bash
-# =============================================================================
-# run_oodselect_local.sh -- the first experiment (classic + spatial OODSelect,
-# paper protocol) on this laptop instead of the cluster.
+# run_oodselect_local.sh -- the first experiment on this laptop: train the model zoo for each cell,
+# run classic and spatial OODSelect (paper protocol) at every budget, then report_paper.py.
 #
-# Same code, same cells, same budgets, same outputs as the two submit_* scripts:
-#   results/<date>/oodselect_paper/{classic,spatial_mu3_knn10}/...
-#   logs/<date>/oodselect_paper/...
-# Only the scheduler changes: Slurm arrays become `xargs -P`, one budget per
-# process, one thread each (the selection is dispatch-bound, so N single-thread
-# processes beat one N-thread process).
+# Writes results/<date>/oodselect_paper/{classic,spatial_mu3_knn10}/... and
+#        logs/<date>/oodselect_paper/...
+# Each (variant, cell, budget) is one single-threaded process, JOBS at a time (xargs -P): the
+# selection is dispatch-bound, so N single-thread processes beat one N-thread process.
 #
 # Usage, from the repo root:
 #   ./run_oodselect_local.sh --date 2026-09-24
 #   JOBS=8 ./run_oodselect_local.sh --date 2026-09-24
 #   VARIANTS=classic ./run_oodselect_local.sh --date 2026-09-24     # one version
 #   TRIALS=3 MAX_EPOCHS=500 ./run_oodselect_local.sh --date 2000-01-01   # smoke test
+#   CELLS="FL:band:AE:1" SEED=1 ./run_oodselect_local.sh --date ...   # one cell, seed 1
+# CELLS is a space-separated list of state:protocol:train_dom:zoo_seed, one entry per cell.
+#
+# The two O3 controls (aotil/oodselect_paper.py, "TWO CONTROLS"), off by default:
+#   NULL_SEEDS="1 2 3"   null-select, one run per null seed (folders <variant>_null<N>)
+#   SPLITS="trees->others others->trees"   family-disjoint splits
+#                        (folders <variant>_trees2others, <variant>_others2trees)
+#   BUDGETS="250 500 1000"   only these budgets (default: the paper grid)
+# e.g. NULL_SEEDS="1 2 3" BUDGETS="250 500 1000" ./run_oodselect_local.sh --date ...
 #
 # Resumable: a budget whose _result.csv exists is skipped, so re-running the
 # same command after an interruption only does what is missing.
@@ -23,7 +29,6 @@
 #   .venv/bin/pip install torch optuna xgboost      # + `brew install libomp` for xgboost
 # Keep the Mac plugged in; the script wraps itself in `caffeinate -i` so it
 # does not idle-sleep (closing the lid on battery still will).
-# =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -42,7 +47,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 if ! echo "$DATE" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
-    echo "usage: $0 --date YYYY-MM-DD" >&2; exit 1
+    echo "usage: $0 --date YYYY-MM-DD" >&2
+    exit 1
 fi
 
 PY="${PY:-.venv/bin/python}"
@@ -57,12 +63,19 @@ TRIALS="${TRIALS:-100}"
 MAX_EPOCHS="${MAX_EPOCHS:-50000}"
 PATIENCE="${PATIENCE:-500}"
 SEED="${SEED:-0}"
+NULL_SEEDS="${NULL_SEEDS:-}"
+SPLITS="${SPLITS:-random}"
+BUDGETS="${BUDGETS:-}"
 # Default: the performance cores (Apple silicon), leaving the efficiency cores
 # for the rest of the machine.
 if [ -z "${JOBS:-}" ]; then
     JOBS=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || true)
-    [ -n "$JOBS" ] || JOBS=$(( $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4) - 2 ))
-    [ "$JOBS" -ge 1 ] || JOBS=1
+    if [ -z "$JOBS" ]; then
+        JOBS=$(( $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4) - 2 ))
+    fi
+    if ! [ "$JOBS" -ge 1 ]; then
+        JOBS=1
+    fi
 fi
 
 ROOT="results/${DATE}/oodselect_paper"
@@ -77,33 +90,51 @@ if ! "$PY" -c "import optuna, torch, sklearn, scipy, pandas, pyarrow" 2>/dev/nul
 fi
 if ! "$PY" -c "import xgboost" 2>/dev/null; then
     echo "WARNING: xgboost not importable -- the population will lack the XGBoost"
-    echo "         family, so it will NOT match the cluster's 300 models."
+    echo "         family, so it will NOT match the full 300-model population."
     echo "         $PY -m pip install xgboost   (and: brew install libomp)"
     if [ "${ALLOW_NO_XGB:-0}" != "1" ]; then
-        echo "         ALLOW_NO_XGB=1 to run anyway." >&2; exit 1
+        echo "         ALLOW_NO_XGB=1 to run anyway." >&2
+        exit 1
     fi
 fi
 
-variant_dir() {   # variant_dir <mu>
-    if [ "$(printf '%g' "$1")" = "0" ]; then echo classic
-    else echo "spatial_mu$(printf '%g' "$1")_knn${KNN}"; fi
+# variant_dir <mu> [<split> [<null seed>|none]]: the folder name oodselect_paper.variant_name gives.
+variant_dir() {
+    local name suffix=""
+    if [ "$(printf '%g' "$1")" = "0" ]; then
+        name=classic
+    else
+        name="spatial_mu$(printf '%g' "$1")_knn${KNN}"
+    fi
+    case "${2:-random}" in
+        random) ;;
+        "trees->others") suffix="_trees2others" ;;
+        "others->trees") suffix="_others2trees" ;;
+        *) echo "unknown split '$2' (random|trees->others|others->trees)" >&2; exit 1 ;;
+    esac
+    if [ -n "${3:-}" ] && [ "${3:-}" != "none" ]; then
+        suffix="${suffix}_null$3"
+    fi
+    echo "${name}${suffix}"
 }
 
 echo "[local] date=$DATE cells=[$CELLS] variants=[$VARIANTS] jobs=$JOBS"
+echo "[local] splits=[$SPLITS] null_seeds=[${NULL_SEEDS:-off}] budgets=[${BUDGETS:-paper grid}]"
 echo "[local] models=$N_MODELS trials=$TRIALS max_epochs=$MAX_EPOCHS patience=$PATIENCE"
 T0=$(date +%s)
 
 # ---------------------------------------------------------------- 1. zoo
 TAGS=""
 for spec in $CELLS; do
-    IFS=':' read -r st pr td sd <<< "$spec"
-    tag="${st}_${pr}_${td}_s${sd}"
+    IFS=':' read -r state protocol train_dom cell_seed <<< "$spec"
+    tag="${state}_${protocol}_${train_dom}_s${cell_seed}"
     TAGS="$TAGS $tag"
     echo "[zoo] $tag"
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-    "$PY" -u aotil/zoo.py --state "$st" --protocol "$pr" --train-dom "$td" --seed "$sd" \
-        --n-models "$N_MODELS" --data "$DATA_DIR" --out "$CELLS_DIR" \
-        --n-jobs -1 --device cpu >>"${LOG_DIR}/zoo_${tag}_local.out" 2>>"${LOG_DIR}/zoo_${tag}_local.err"
+    "$PY" -u aotil/zoo.py --state "$state" --protocol "$protocol" --train-dom "$train_dom" \
+        --seed "$cell_seed" --n-models "$N_MODELS" --data "$DATA_DIR" --out "$CELLS_DIR" \
+        --n-jobs -1 --device cpu \
+        >>"${LOG_DIR}/zoo_${tag}_local.out" 2>>"${LOG_DIR}/zoo_${tag}_local.err"
     tail -1 "${LOG_DIR}/zoo_${tag}_local.out"
 done
 
@@ -112,17 +143,22 @@ done
 # longest, and starting them first keeps the tail of the run short.
 TASKS="${LOG_DIR}/local_tasks.txt"
 : > "$TASKS"
-for v in $VARIANTS; do
-    case "$v" in
+for variant in $VARIANTS; do
+    case "$variant" in
         classic) mu=0 ;;
         spatial) mu="$MU_SPATIAL" ;;
-        *) echo "unknown variant '$v' (classic|spatial)" >&2; exit 1 ;;
+        *) echo "unknown variant '$variant' (classic|spatial)" >&2; exit 1 ;;
     esac
-    vd=$(variant_dir "$mu")
-    mkdir -p "$ROOT/$vd"
-    for tag in $TAGS; do
-        for b in $("$PY" aotil/oodselect_paper.py --cells "$CELLS_DIR" --tag "$tag" --list-budgets); do
-            echo "$b $mu $vd $tag" >> "$TASKS"
+    for split in $SPLITS; do
+        for null_seed in ${NULL_SEEDS:-none}; do
+            folder=$(variant_dir "$mu" "$split" "$null_seed")
+            mkdir -p "$ROOT/$folder"
+            for tag in $TAGS; do
+                for budget in ${BUDGETS:-$("$PY" aotil/oodselect_paper.py --cells "$CELLS_DIR" \
+                                               --tag "$tag" --list-budgets)}; do
+                    echo "$budget $mu $folder $tag $split $null_seed" >> "$TASKS"
+                done
+            done
         done
     done
 done
@@ -131,17 +167,27 @@ N_TASKS=$(wc -l < "$TASKS" | tr -d ' ')
 echo "[select] $N_TASKS tasks, $JOBS at a time (progress: ls $ROOT/*/*_result.csv | wc -l)"
 
 export PY CELLS_DIR ROOT LOG_DIR KNN TRIALS MAX_EPOCHS PATIENCE SEED
+# Each task line arrives as the words $0..$5 of the inner script.
 # shellcheck disable=SC2016
 xargs -P "$JOBS" -L 1 bash -c '
-    b=$0; mu=$1; vd=$2; tag=$3
-    log="${LOG_DIR}/${vd}_${tag}_S${b}_local"
+    budget=$0
+    mu=$1
+    folder=$2
+    tag=$3
+    split=$4
+    null_seed=$5
+    log="${LOG_DIR}/${folder}_${tag}_S${budget}_local"
+    null_arg=""
+    if [ "$null_seed" != "none" ]; then
+        null_arg="--null-seed $null_seed"
+    fi
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
     "$PY" -u aotil/oodselect_paper.py --cells "$CELLS_DIR" --tag "$tag" \
-        --out "$ROOT/$vd" --budget "$b" --mu "$mu" --knn "$KNN" \
+        --out "$ROOT/$folder" --budget "$budget" --mu "$mu" --knn "$KNN" \
         --trials "$TRIALS" --max-epochs "$MAX_EPOCHS" --patience "$PATIENCE" \
-        --seed "$SEED" --threads 1 >>"$log.out" 2>>"$log.err" \
-      && echo "  done  $vd $tag S=$b  $(grep -o "TEST r = [^|]*" "$log.out" | tail -1)" \
-      || echo "  FAIL  $vd $tag S=$b  (see $log.err)"
+        --seed "$SEED" --split "$split" $null_arg --threads 1 >>"$log.out" 2>>"$log.err" \
+      && echo "  done  $folder $tag S=$budget  $(grep -o "TEST r = [^|]*" "$log.out" | tail -1)" \
+      || echo "  FAIL  $folder $tag S=$budget  (see $log.err)"
 ' < "$TASKS"
 
 # ---------------------------------------------------------------- 3. report

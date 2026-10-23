@@ -3,6 +3,11 @@
 Written 2026-10-13, revised the same evening for sampling protocol v2 (`docs/PROJECT-PLAN.md`
 §2a). Run from the repo root (`CS371W/`). Work through Parts A → E in order.
 
+(Updated 2026-10-21.) This brief ran on 2026-10-14 (`docs/DATA-AUDIT-2026-10-14.md`). The code
+changes it asks for are in place, and `docs/RUN-FL-V2.md` is the routine that rebuilds the data.
+The 2026-10-21 refactor removed the numbered docstring notes the brief points to, and four docs
+it names were moved to `Claude outputs/removed-2026-10-21/docs/`.
+
 **Goal.**
 1. Rebuild the Florida point sample with sampling protocol v2 (100 m spacing, exactly 1:1 band
    negatives, exactly 20,000 positives per zone) and re-pull its covariates.
@@ -25,11 +30,12 @@ Written 2026-10-13, revised the same evening for sampling protocol v2 (`docs/PRO
    on Zone A) describe the **old (v1) sample**. You will report the new numbers.
 3. `docs/REGION-ANALYSIS-FLORIDA.md` §3.3: the boundary analysis whose inputs you collect. The
    regions in its §2 come from the v1 sample and will change.
-4. The pipeline: `sample_points.py` (all of it, especially the docstring notes and `DEFAULTS`),
-   `subset_nfhl.py`, `pull_gee.py`, `pull_hydro.py`, `pull_atlas14.py`, `pull_climate.py`,
-   `pull_extras.py`, and `docs/COVARIATES.md`, `docs/COVARIATE-AUDIT.md`,
-   `docs/SAMPLING-RESULTS.md`, `docs/DATA-SOURCES.md`, `docs/DOWNLOAD-GUIDE.md`,
-   `docs/ASSEMBLY-SHORTCUTS.md`.
+4. The pipeline: `sample_points.py` (all of it, especially `DEFAULTS`), `subset_nfhl.py`,
+   `pull_gee.py`, `pull_hydro.py`, `pull_atlas14.py`, `pull_extras.py`, and
+   `docs/COVARIATES.md`, `docs/DATA-SOURCES.md`. (Updated 2026-10-21: the list also named the
+   docstring notes and `pull_climate.py`, which was removed, and `docs/COVARIATE-AUDIT.md`,
+   `docs/SAMPLING-RESULTS.md`, `docs/DOWNLOAD-GUIDE.md` and `docs/ASSEMBLY-SHORTCUTS.md` were
+   moved to `Claude outputs/removed-2026-10-21/docs/`.)
 5. The models: `aotil/README.md`, `aotil/zoo.py`, `aotil/cells.py`, `aotil/graph.py`,
    `aotil/oodselect_paper.py`, `aotil/report_paper.py`, `run_oodselect_local.sh`.
 
@@ -98,16 +104,25 @@ described in Rules.
 - Add a way to build Florida with band negatives only (for example `--protocols band`). The
   default for other states stays as it is.
 - Rewrite the docstring notes that state the old values (note 2's 200 m rationale, the ratio
-  note) with the v2 values and the reasons in PLAN §2a.
+  note) with the v2 values and the reasons in PLAN §2a. (Updated 2026-10-21: done on
+  2026-10-14; the refactor has since removed the numbered notes, and the values now sit in
+  `DEFAULTS` with PLAN §2a as the reference.)
 - Leave everything else unchanged: the area-proportional draw, the 2% per-polygon cap, the
   500–5,000 m band, the FIRM-panel mask, 10 km blocks, and the seed.
+- (Updated 2026-10-21: three later changes are in `sample_points.py` and need no action here.
+  Band negatives inside Florida's county polygons, `--state-polygons`, decided 2026-10-14.
+  Since 2026-10-21, positives are drawn in one area-proportional draw over each whole zone with
+  the 2% cap; band negatives that fall in a Zone D or AREA NOT INCLUDED polygon (inside a panel
+  but never studied) are dropped; and each point gets `meta_point_county`.)
 
 ### A2. Build and check
 
 Run it for FL, then `--audit FL`. Check and record:
 - 20,000 positives and 20,000 band negatives per zone, 80,000 points in total.
 - The smallest distance between any two points is ≥ 100 m, measured in EPSG:5070.
-- Every band negative is 500–5,000 m from the nearest SFHA and inside a FIRM panel.
+- Every band negative is 500–5,000 m from the nearest SFHA and inside a FIRM panel (and, since
+  2026-10-21, outside every Zone D / AREA NOT INCLUDED polygon: `--audit` prints the count,
+  which must be 0; updated 2026-10-21).
 - The largest share of a zone's positives that comes from a single polygon. The cap is applied
   before thinning, so report the real maximum and the share supplied by the top 10 polygons.
 - A and AE are balanced exactly.
@@ -116,7 +131,8 @@ Run it for FL, then `--audit FL`. Check and record:
 
 Run the pipeline for Florida in the order its docstrings and `docs/` describe (`pull_gee.py FL`
 → the `pull_hydro.py` stages → `pull_atlas14.py` → the merges). Check whether `pull_climate.py`
-or `pull_extras.py` produce any of the 45 features and run them only if they do.
+or `pull_extras.py` produce any of the 45 features and run them only if they do. (Updated
+2026-10-21: neither does, and `pull_climate.py` was removed.)
 
 - **NHDPlus V2 raw data is not on disk** (`data/raw/` holds only `nfhl/`), and
   `pull_hydro.py --catchments` / `--flowlines` read it. Work out exactly which layers are needed.
@@ -156,7 +172,9 @@ checked, how (the command or a short code excerpt), the result, and a verdict: �
   MERIT Hydro, NLCD, JRC Global Surface Water, NHDPlus V2, EPA StreamCat, NOAA Atlas 14). Save it
   as `docs/FEATURE-SOURCES.md`.
 - Missingness per feature; constant or near-constant features; no `meta_*`, `lon`, `lat`,
-  elevation or id column in `FEATURES.txt`; lon/lat in EPSG:4326 and inside Florida.
+  elevation or id column in `FEATURES.txt`; lon/lat in EPSG:4269 (NAD83, as `sample_points.py`
+  writes them, `CRS_SRC`; within about 1 m of EPSG:4326 in Florida) and inside Florida
+  (updated 2026-10-21: this line said EPSG:4326).
 - Columns the boundary analysis needs: `meta_fld_ar_id` populated for every positive and
   matching an `FLD_AR_ID` in `haz_FL_5070.parquet`; `meta_fld_zone` consistent with `domain`;
   `county_fips`; `meta_eff_date`.
@@ -266,12 +284,18 @@ component with ≥ 20 points:
 
 ### D3. 10 m DEM over the analysis bboxes
 
-The displaced-edge null needs elevation at displaced positions too, so get a local raster, not
-just point samples.
+Get a local raster per bbox, not just point samples. (Updated 2026-10-21: this line first gave
+the displaced-edge null's need for elevation at displaced positions as the reason. The null as
+built, `docs/TASK-FULL-RUN-W7.md` B3 step 6, keeps each window's observed level-set flag and
+never reads the DEM at displaced positions; the local raster serves the observed vertices and
+their ±100 m probes, and one raster per bbox serves every prefix.)
 - Preferred: USGS 3DEP 1/3 arc-second GeoTIFF tiles from The National Map API. Report the total
   size first; ask if it is over 2 GB.
 - Fallback: export `USGS/3DEP/10m` clipped to each bbox from Earth Engine. Call
-  `setDefaultProjection` before any terrain operation (`docs/COVARIATES.md` §2.1).
+  `setDefaultProjection` before any terrain operation (`docs/COVARIATES.md` §2.1). (Updated
+  2026-10-21: `pull_dem.py` implements the fallback as `fetch --source imageserver`, the 3DEP
+  ImageServer's best-available surface resampled bilinearly, which is not the 1/3″ product; no
+  reported run used it.)
 - Sample with rasterio: elevation at each vertex and at ±100 m along its normal, as `z`, `z_in`,
   `z_out` on a copy of the vertex table.
 
@@ -281,7 +305,10 @@ just point samples.
 service, with their `muaggatt` attributes (`flodfreqdcd`, `flodfreqmax`, `pondfreqprs`,
 `hydclprs`, `drclassdcd`, `drclasswettest`, `hydgrpdcd`).
 - Check the current SDA documentation for the spatial-query functions (the plan names
-  `SDA_Get_Mukey_from_intersection_with_WktWgs84` and the `mupolygon` geometry).
+  `SDA_Get_Mukey_from_intersection_with_WktWgs84` and the `mupolygon` geometry). (Updated
+  2026-10-21: `pull_ssurgo.py` uses `SDA_Get_Mupolygonkey_from_intersection_with_WktWgs84`,
+  then an inner join to `mupolygon` on `mupolygonkey`; the `_Mukey_` function returns map units
+  without their polygons.)
 - Tile large bboxes to stay under SDA's response limits.
 - Fallback: the gSSURGO Florida geodatabase; ask first if it is over 2 GB.
 - Write GeoParquet in EPSG:5070, plus the map-unit boundaries as lines, each segment tagged with

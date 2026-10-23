@@ -1,201 +1,22 @@
 #!/usr/bin/env python3
 """
-Lobes and the edge-vertex table: the polygon boundaries the G1 boundary analysis
-classifies (docs/REGION-ANALYSIS-FLORIDA.md section 3.3 steps 1-2,
-docs/TASK-DATA-AUDIT.md D2).
+Lobes and their 30 m edge vertices: the flood-zone boundaries the boundary analysis classifies
+(docs/REGION-ANALYSIS-FLORIDA.md section 3.3 steps 1-2, docs/TASK-DATA-AUDIT.md D2).
 
-WHAT A LOBE IS
---------------
-One single-part polygon of the NFHL flood-hazard layer. G1's verdict ("this
-stretch of Zone A edge was traced from the soil survey") is about a part drawn in
-one pass, and its statistic is a share of edge length, so the unit is the
-exploded part, not the multipart polygon a FLD_AR_ID names. For every region
-component of >= --min-size points (aotil/regions.py) three sets of lobes are
-built, each tagged with a `role`:
+A lobe is one single-part NFHL flood-hazard polygon, taken whole: clipping would add a straight
+edge no map drew. Each region component of >= --min-size points (aotil/regions.py) gets three roles:
+  region     Zone A parts of the positives' source polygons and of polygons within --near-m of
+             a region point, kept where they meet the points' hull buffered by --hull-buffer-m
+  AE         Zone AE parts in the component's 50 km tiles, the detailed-study contrast
+  matched_A  Zone A parts in those tiles that hold no selected point, matched on perimeter
+Only AE->A cells (OOD = Zone A). Outputs in --out, prefix <cell>_<variant>_S<S> from --regions:
+  <prefix>_lobes.parquet     GeoParquet in EPSG:5070, one row per (component, role, lobe)
+  <prefix>_vertices.parquet  one row per boundary vertex, with its inward normal and contacts
+  <prefix>_bboxes.parquet    one row per component: the analysis bbox later layers are pulled for
 
-    region     Zone A parts that hold the region: parts of the polygons the
-               region's positives were drawn in, plus parts of every Zone A
-               polygon within --near-m of any region point, kept when they
-               intersect the convex hull of the region's points buffered by
-               --hull-buffer-m.
-    AE         every part of a Zone AE polygon that intersects one of the
-               region's 50 km tiles. The rule contrast: a detailed-study edge
-               should be an elevation level set.
-    matched_A  Zone A parts in the same tiles that hold no selected point,
-               matched to the region lobes on perimeter. Region specificity: if
-               they look like the region lobes, Zone A is drawn the same way
-               everywhere.
-
-DECISIONS, EACH WITH ITS REASON
--------------------------------
-1. NOTHING IS CLIPPED. A lobe cut at the hull or at a tile edge gains a straight
-   edge that no map ever drew, and a straight edge is exactly what an
-   administrative line looks like to G1. So a lobe is either taken whole or not
-   at all; the hull and the tiles only decide WHICH parts are taken.
-2. THE HULL TEST IS ON PARTS, the polygon test is on whole polygons. An NFHL
-   polygon can scatter parts tens of km apart; "within 2 km of a region point"
-   selects the polygon, "intersects the buffered hull" drops its far parts.
-   Every polygon that covers a region point is within 0 m of it, so the near
-   rule already contains the positives' own polygons; they are still looked up
-   explicitly, to report and check them (decision 7). The near rule can bring in
-   many small polygons that hold no point: on v1, 3,126 Zone A polygons of median
-   0.4 ha around component 0 carry 54% of its region edge. `from_positive` and
-   `n_points` keep them separable downstream.
-3. TILES ARE THE SELECTION'S. tile_50km is (bx // 5, by // 5) of the 10 km
-   EPSG:5070 blocks (pull_gee.derive), so tile (tx, ty) covers x in
-   [tx * 50 km, (tx + 1) * 50 km) and y likewise. A component's tiles are the
-   tiles of its own points: the contrast lobes come from the ground the models
-   were evaluated on. `tiles` records every tile a lobe intersects.
-4. MATCHED LOBES, PRECISELY. Eligible: a Zone A part intersecting one of the
-   component's tiles that covers (contains or has on its boundary) no selected
-   point of ANY component of this selection, and is not a region lobe of any
-   component. Matched on perimeter, because the null's power depends on edge
-   length; on log perimeter, because perimeters span five orders of magnitude
-   and a 10 km lobe is as far from a 1 km lobe as a 100 km one is from a 10 km
-   one. Round-robin without replacement: in each of --n-matched rounds every
-   region lobe, in a seeded random order, takes the eligible part nearest in log
-   perimeter (ties broken by a seeded random key), so no lobe exhausts the good
-   matches before the others get one. A large region lobe in a tile without a
-   comparable part still gets the nearest one; `match_dlogp` records
-   |log P_matched - log P_region| so a poor match is visible, not hidden. On v1
-   the point-holding region lobes have 345-3,552 km of edge, and in three of the
-   four components their own tiles hold nothing comparable (median |dlog P| of
-   their matches 2.6-4.2, a factor of 13-65 in perimeter).
-5. EVEN 30 m SPACING. Each ring (exterior and every hole) gets
-   n = ceil(L / --densify-m) vertices at s = k L / n, k = 0..n-1, where s is the
-   distance along the ring from its first coordinate; the original vertices are
-   not kept. Equal spacing makes "share of edge length" a vertex count and makes
-   10 vertices the 300 m window of section 3.3 step 5. Interpolation is done in
-   numpy over all rings at once: GEOS's interpolate walks the ring from its start
-   for every call, which on a 241,000-vertex swamp polygon is quadratic.
-6. INWARD NORMALS ARE THOSE OF THE 30 m BOUNDARY. Every part is oriented
-   (exterior counter-clockwise, holes clockwise), so the lobe's interior is on
-   the LEFT of every ring, holes included, and the inward normal is the left
-   perpendicular of the tangent. The tangent is the chord between the vertex's two neighbours
-   on the densified ring (s - ds to s + ds, ds = L / n; L / 4 on rings of fewer
-   than four vertices), i.e. the normal of the 30 m polyline G1 analyses, which
-   at a corner is the bisector rather than one segment's normal. A chord of
-   +-0.5 m was tried first and rejected: the lidar-era Indian River (12061C)
-   Zone AE edges are traced in 0.2-0.5 m steps that zig-zag about a metre either
-   side of their course, and there 11% of +-0.5 m normals were more than 45 deg
-   off the 30 m direction (v1, component 1); a +-100 m elevation probe (D3) along
-   such a normal samples the wrong ground. The lobes are written oriented, so the
-   vertex table can be rebuilt from the GeoParquet.
-       Checked in code on a seeded sample of vertices per component: x + 1 m * n
-   must be inside the lobe and x - 1 m * n outside. The test is asserted where
-   it is a statement about orientation: on vertices whose two probes are both
-   >= 0.9 m from the lobe's boundary, i.e. where the edge runs straight past the
-   vertex at the 1 m scale and the normal is within ~25 deg of it. There the run
-   aborts unless >= 99.5% pass and <= 0.5% are flipped. On v1 (ten components of
-   three selections) the worst component had 99.90% pass and 0.10% flipped,
-   from vertices where the 30 m direction and a sub-metre zig-zag disagree; an
-   orientation error flips whole rings, and holes alone carry 7-48% of a
-   component's vertices, so any such error is far above both thresholds.
-   Elsewhere (a lobe narrower than 2 m, a hole or a zig-zag within 1 m of the
-   vertex) a probe pair can land on one side ("ambiguous") or straddle a
-   different piece of edge; those vertices are counted and printed, not
-   asserted.
-7. SOURCE POLYGONS. A positive's polygon is meta_src_row_id when the regions
-   table carries it (v2 sampler, note 8 of sample_points.py). Otherwise it is
-   looked up by (dfirm_id, meta_fld_ar_id) in idx_<ST>; FLD_AR_ID alone repeats,
-   and where even the pair names several rows (39 in Florida) the candidate that
-   covers the point is taken. A band negative's meta_src_row_id names the ring it
-   came from, not a polygon it lies in, so negatives contribute through the near
-   rule only. Every resolved source polygon must be Zone A and should cover its
-   positive; the count is printed, and a source polygon of another zone aborts:
-   that would be an A->AE region, whose roles this script does not define.
-8. ANALYSIS BBOX. The union of the extents of all of a component's lobes, every
-   role, buffered by --bbox-buffer-m (3 km) so a 1 km displaced-edge null and the
-   +-100 m normal probes stay inside every layer pulled for it (D3-D6). Its
-   EPSG:4326 bounds are taken over the densified box edges, so the lon/lat box
-   covers the EPSG:5070 box rather than only its corners.
-9. GEOMETRY ACCESS. haz_<ST>_5070.parquet is 5.4 GB for Florida and is never
-   read whole: candidate polygons are chosen on idx_<ST>'s bbox columns, then
-   all components' candidates are read in one pass of sample_points.read_geoms
-   (one row group at a time, each row group at most once). Decision 10 needs
-   SFHA polygons that only the finished lobes and bboxes determine, so the ones
-   not already read come in one second pass. Parts that fail OGC validity are
-   repaired with make_valid, and only the polygonal pieces of the result are
-   kept (make_valid can return a GeometryCollection).
-10. CONTACTS ARE FLAGGED, NOT DROPPED. Not all of a lobe's boundary is an SFHA
-   limit. Some of it is a contact with another SFHA polygon, a line no map drew
-   as the edge of the floodplain: the floodway/fringe line inside Zone AE, a
-   Zone A polygon split by source or at a sheet edge, an A/AE/AH/VE contact.
-   An edge shared by two lobes of one role is also written twice, once per
-   lobe, with opposite normals. G1 must measure only the SFHA-exterior edge,
-   and must count a shared edge once. So every vertex carries
-       contact_row_id, contact_zone, contact_subty
-           the nearest other SFHA polygon (SFHA_TF 'T', any zone) within
-           --contact-m, or null when there is none. "Other" means not the
-           vertex's own polygon (src_row_id). Excluding the whole polygon
-           rather than only the lobe's own part loses no shared edge: the
-           parts of a valid MultiPolygon touch only at points. "Nearest" is by
-           exact distance, and ties go to the lower row_id;
-       same_role_contact
-           another lobe of the same role and component lies within
-           --contact-m (a sibling part of the vertex's own polygon counts:
-           4 vertices on v1 S=500, where two parts come within 0.5 m);
-   and G1 can take the exterior edge, the duplicates, or both, without a
-   rerun. On v1 S=500, 24% of component 0's vertices and 87% of component 3's
-   have a contact. 0.5 m is not a tuning knob: shared NFHL edges coincide to
-   floating point, so in component 0 the share is 23.7% at 1 mm, 24.5% at 0.5 m
-   and 25.2% at 2 m (the other components are just as flat); going from 1 mm
-   to 0.5 m adds 5,861 vertices of 1,052,316 where neighbours misfit slightly,
-   68% of them against another DFIRM's polygon. At exactly 0 m, round-off in
-   the interpolated vertices loses half the contacts (13.2%). The candidates are the SFHA
-   polygons whose idx bbox meets the component's analysis bbox (decision 8)
-   and comes within --contact-m of one of its lobes' bboxes. They feed one
-   STRtree over the component's vertices, queried with the polygons. Shapely
-   prepares the query geometry, so testing a vertex against a 241,000-vertex
-   polygon costs log n, not n. The other way round (vertices queried against
-   a tree of polygons) took 41 times longer on v1 component 2's 157,024
-   vertices (21.2 s against 0.5 s), and the gap grows with the vertex count.
-11. FLOODWAYS ARE AE LOBES, MARKED. NFHL codes a floodway as FLD_ZONE 'AE' with
-   a ZONE_SUBTY containing 'FLOODWAY' ('FLOODWAY', 'ADMINISTRATIVE FLOODWAY',
-   'RIVERINE FLOODWAY ...'), so it enters the AE role with the fringe polygons
-   around it. Its encroachment line is set by an allowed surcharge, not by an
-   elevation, and it runs against the fringe, so it is already a contact
-   (decision 10). Where a floodway itself reaches the SFHA limit, that edge is
-   the 1% limit like any other. So floodway lobes are kept, and `is_floodway` /
-   `zone_subty` let G1 drop them or report them on their own.
-
-Scope: the AE->A direction (cell FL_band_AE: OOD = Zone A), as the paper uses.
-Nothing written here is a model feature: these are per-lobe and per-vertex
-tables for the boundary analysis, keyed by NFHL identifiers.
-
-OUTPUTS (prefix = <cell>_<variant>_S<S>, taken from the regions file name)
--------
-<out>/<prefix>_lobes.parquet     GeoParquet, EPSG:5070, one row per (component,
-                                 role, lobe): lobe_id, zone, role, component,
-                                 src_row_id, fld_ar_id, dfirm_id, area_m2,
-                                 perimeter_m, matched_to (region lobe_id, for
-                                 matched_A), geometry; plus part (index of the
-                                 part in its polygon), tiles (';'-joined),
-                                 n_points (this component's selected points the
-                                 lobe covers), from_positive (region lobes: the
-                                 polygon is a positive's source polygon),
-                                 match_dlogp (matched_A), zone_subty (NFHL
-                                 ZONE_SUBTY, blank -> null), is_floodway
-                                 (decision 11)
-<out>/<prefix>_vertices.parquet  one row per vertex: lobe_id, zone, role,
-                                 component, ring (0 = exterior, k = k-th hole), s,
-                                 x, y (EPSG:5070), lon, lat (EPSG:4326), nx, ny
-                                 (unit inward normal); plus contact_row_id (idx
-                                 row_id), contact_zone, contact_subty,
-                                 same_role_contact (decision 10)
-<out>/<prefix>_bboxes.parquet    one row per component: component, minx, miny,
-                                 maxx, maxy (EPSG:5070, buffered), lon_min,
-                                 lat_min, lon_max, lat_max (EPSG:4326), width_km,
-                                 height_km, area_km2, n_lobes
-
-USAGE
------
     python aotil/lobes.py \\
         --regions results/<date>/regions/FL_band_AE_s0_spatial_mu3_knn10_S500_points.parquet \\
-        --dataset data/processed/dataset_FL.parquet
-    ... --components <..._components.csv>   (default: next to --regions)
-    ... --out results/<date>/boundary       (default: results/<today>/boundary)
-    ... --overwrite                         (redo when all three outputs exist)
+        --dataset data/processed/dataset_FL.parquet --out results/<date>/boundary
 """
 from __future__ import annotations
 
@@ -206,17 +27,16 @@ import time
 from datetime import date
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-
-import geopandas as gpd
 import shapely
-from shapely import STRtree
 from pyproj import Transformer
+from shapely import STRtree
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE.parent))     # sample_points
 import sample_points as sp  # noqa: E402
 
 PREP_DIR = Path("data/interim/prep")
@@ -228,10 +48,14 @@ LONLAT_TOL = 1e-9          # degrees; regions lon/lat are copies of the dataset'
 
 REGION_ZONE, CONTRAST_ZONE = "A", "AE"     # AE->A: OOD = Zone A
 ROLES = ("region", "matched_A", "AE")
-FLOODWAY = "FLOODWAY"      # substring of every floodway ZONE_SUBTY (decision 11)
+# NFHL codes a floodway as Zone AE with a ZONE_SUBTY containing this ('FLOODWAY', 'ADMINISTRATIVE
+# FLOODWAY', ...). Floodway lobes stay in the AE role, flagged by is_floodway.
+FLOODWAY = "FLOODWAY"
 
-# Normal check (decision 6): probes at PROBE_M either side; asserted on vertices
-# whose probes are both at least CLEAR_FRAC * PROBE_M from the lobe's boundary.
+# Inward-normal check: probes PROBE_M either side of a vertex. It is asserted only on "clear"
+# vertices, whose probes both lie >= CLEAR_FRAC * PROBE_M from the lobe's boundary (the edge runs
+# straight past the vertex at the 1 m scale). An orientation error flips whole rings, far beyond
+# both limits; sub-metre zig-zags in lidar-traced edges explain the few clear failures.
 PROBE_M = 1.0
 CLEAR_FRAC = 0.9
 CHECK_MIN_PASS = 0.995
@@ -239,11 +63,18 @@ CHECK_MAX_FLIPPED = 0.005
 
 REGION_COLS = ["point_id", "lon", "lat", "label", "component", "tile_50km",
                "meta_fld_ar_id", "dfirm_id"]
+# part: index of the part in its polygon; matched_to: the region lobe_id a matched_A lobe was
+# matched to; tiles: ';'-joined tiles the lobe meets; n_points: this component's selected points
+# it covers; from_positive: a region lobe of a positive's source polygon; match_dlogp:
+# |log P_matched - log P_region|; zone_subty: NFHL ZONE_SUBTY, blank -> null.
 LOBE_COLS = ["lobe_id", "zone", "role", "component", "src_row_id", "fld_ar_id",
              "dfirm_id", "area_m2", "perimeter_m", "matched_to", "part", "tiles",
              "n_points", "from_positive", "match_dlogp", "zone_subty", "is_floodway"]
+# ring: 0 = exterior, k = k-th hole; s: metres along the ring from its first coordinate;
+# x, y in EPSG:5070, lon, lat in EPSG:4326; nx, ny: the unit inward normal.
 VERTEX_COLS = ["lobe_id", "zone", "role", "component", "ring", "s", "x", "y",
                "lon", "lat", "nx", "ny"]
+# See contacts(). contact_row_id is an idx row_id.
 CONTACT_COLS = ["contact_row_id", "contact_zone", "contact_subty", "same_role_contact"]
 IDX_COLS = ["row_id", "DFIRM_ID", "FLD_AR_ID", "FLD_ZONE", "ZONE_SUBTY", "SFHA_TF",
             "minx", "miny", "maxx", "maxy"]
@@ -251,7 +82,8 @@ IDX_COLS = ["row_id", "DFIRM_ID", "FLD_AR_ID", "FLD_ZONE", "ZONE_SUBTY", "SFHA_T
 
 # ----------------------------------------------------------------- inputs
 def read_regions(points_p: Path, comps_p: Path, min_size: int):
-    """The regions table, checked against its components table."""
+    """The regions table, checked against its components table, and the ids of the components
+    of >= min_size points."""
     pts = pd.read_parquet(points_p)
     missing = [c for c in REGION_COLS if c not in pts]
     if missing:
@@ -263,73 +95,105 @@ def read_regions(points_p: Path, comps_p: Path, min_size: int):
     if not comps_p.exists():
         raise SystemExit(f"{comps_p} missing (aotil/regions.py writes it next to the points)")
     want = pd.read_csv(comps_p).set_index("component").n_points
-    if not want.reindex(sizes.index).eq(sizes).all() or len(want) != len(sizes):
+    same_sizes = want.reindex(sizes.index).eq(sizes).all()
+    if not same_sizes or len(want) != len(sizes):
         raise SystemExit(f"{points_p.name} and {comps_p.name} disagree on component sizes")
-    return pts, [int(c) for c in sizes.index[sizes >= min_size]]
+    big = [int(c) for c in sizes.index[sizes >= min_size]]
+    return pts, big
+
+
+def geometry_crs_id(pf: pq.ParquetFile) -> dict:
+    """The CRS id GeoParquet metadata states for the geometry column, e.g.
+    {"authority": "EPSG", "code": 5070}; {} when it states none."""
+    metadata = pf.schema_arrow.metadata or {}
+    geo = json.loads(metadata.get(b"geo") or b"{}")
+    crs = geo.get("columns", {}).get("geometry", {}).get("crs") or {}
+    return crs.get("id", {})
 
 
 def point_xy(pts: pd.DataFrame, dataset: Path | None) -> tuple[np.ndarray, str]:
-    """(x, y) in EPSG:5070 for every selected point: the dataset's own geometry
-    when --dataset is given (the coordinates the sampler drew), else the regions
-    lon/lat projected."""
+    """(x, y) in EPSG:5070 of every selected point: the dataset's own geometry (the coordinates
+    the sampler drew) when --dataset is given, else the regions lon/lat projected."""
     if dataset is None:
         tf = Transformer.from_crs(CRS_LONLAT_IN, CRS_WORK, always_xy=True)
         x, y = tf.transform(pts.lon.to_numpy(float), pts.lat.to_numpy(float))
-        return (np.column_stack([x, y]),
-                f"regions lon/lat projected EPSG:{CRS_LONLAT_IN} -> {CRS_WORK}")
-    pf = pq.ParquetFile(dataset)
-    geo = json.loads((pf.schema_arrow.metadata or {}).get(b"geo", b"{}") or b"{}")
-    crs = (geo.get("columns", {}).get("geometry", {}).get("crs") or {}).get("id", {})
+        note = f"regions lon/lat projected EPSG:{CRS_LONLAT_IN} -> {CRS_WORK}"
+        return np.column_stack([x, y]), note
+    crs = geometry_crs_id(pq.ParquetFile(dataset))
     if not (crs.get("authority") == "EPSG" and int(crs.get("code", -1)) == CRS_WORK):
         raise SystemExit(f"{dataset}: geometry CRS is {crs or 'unstated'}, not EPSG:{CRS_WORK}")
-    d = pq.read_table(dataset, columns=["point_id", "lon", "lat", "geometry"]).to_pandas()
-    d = d.set_index("point_id")
-    absent = ~pts.point_id.isin(d.index)
+    data = pq.read_table(dataset, columns=["point_id", "lon", "lat", "geometry"]).to_pandas()
+    by_id = data.set_index("point_id")
+    absent = ~pts.point_id.isin(by_id.index)
     if absent.any():
         raise SystemExit(f"{int(absent.sum())} selected point_ids are not in {dataset.name}; "
                          f"wrong --dataset?")
-    d = d.loc[pts.point_id]
-    dl = max(float(np.abs(d.lon.to_numpy(float) - pts.lon.to_numpy(float)).max()),
-             float(np.abs(d.lat.to_numpy(float) - pts.lat.to_numpy(float)).max()))
-    if dl > LONLAT_TOL:
-        raise SystemExit(f"lon/lat of the regions and {dataset.name} differ by up to {dl:.1e} deg")
-    xy = shapely.get_coordinates(shapely.from_wkb(d.geometry.to_numpy()))
-    return xy, f"{dataset.name} geometry (EPSG:{CRS_WORK}); lon/lat agree to {dl:.0e} deg"
+    rows = by_id.loc[pts.point_id]
+    dlon = float(np.abs(rows.lon.to_numpy(float) - pts.lon.to_numpy(float)).max())
+    dlat = float(np.abs(rows.lat.to_numpy(float) - pts.lat.to_numpy(float)).max())
+    max_diff = max(dlon, dlat)
+    if max_diff > LONLAT_TOL:
+        raise SystemExit(f"lon/lat of the regions and {dataset.name} differ by up to "
+                         f"{max_diff:.1e} deg")
+    xy = shapely.get_coordinates(shapely.from_wkb(rows.geometry.to_numpy()))
+    return xy, f"{dataset.name} geometry (EPSG:{CRS_WORK}); lon/lat agree to {max_diff:.0e} deg"
 
 
 def source_candidates(pts: pd.DataFrame, idx: pd.DataFrame, among: np.ndarray) -> tuple[dict, str]:
-    """Candidate source row_ids per positive in `among`, keyed by row position in
-    pts (decision 7): one when known, several when the (dfirm_id, meta_fld_ar_id)
-    key repeats."""
-    pos = np.flatnonzero((pts.label.to_numpy() == 1) & among)
+    """Candidate source polygons (idx row_ids) of each positive in `among`, keyed by its row in
+    pts: its meta_src_row_id when the table has one, else every idx row with its
+    (dfirm_id, meta_fld_ar_id) key. FLD_AR_ID alone repeats, and even the pair can name several
+    rows (39 in Florida). Band negatives are left out: their meta_src_row_id names the ring they
+    came from, not a polygon they lie in, so they contribute through the near rule only."""
+    positives = np.flatnonzero((pts.label.to_numpy() == 1) & among)
     src = pts.meta_src_row_id.astype("Int64")
-    cand = {int(i): [int(src.iloc[i])] for i in pos if pd.notna(src.iloc[i])}
+    cand, rest = {}, []
+    for i in positives:
+        if pd.notna(src.iloc[i]):
+            cand[int(i)] = [int(src.iloc[i])]
+        elif pd.notna(pts.meta_fld_ar_id.iloc[i]):
+            rest.append(i)
     n_direct = len(cand)
-    rest = [i for i in pos if i not in cand and pd.notna(pts.meta_fld_ar_id.iloc[i])]
-    n_key = n_rep = 0
+
+    n_by_key = 0
+    n_repeated = 0
     if rest:
-        key = pd.DataFrame(dict(i=rest, DFIRM_ID=pts.dfirm_id.iloc[rest].astype(str).to_numpy(),
-                                FLD_AR_ID=pts.meta_fld_ar_id.iloc[rest].astype(str).to_numpy()))
-        keys = idx[["row_id", "DFIRM_ID", "FLD_AR_ID"]].astype({"DFIRM_ID": str, "FLD_AR_ID": str})
-        hit = key.merge(keys, on=["DFIRM_ID", "FLD_AR_ID"], how="inner")
-        for i, g in hit.groupby("i"):
-            cand[int(i)] = g.row_id.astype(int).tolist()
-            n_key += 1
-            n_rep += len(g) > 1
-    n_none = len(pos) - len(cand)
-    return cand, (f"{n_direct} from meta_src_row_id, {n_key} by (dfirm_id, meta_fld_ar_id) "
-                  f"({n_rep} with a repeated key), {n_none} with neither")
+        keys = pd.DataFrame(dict(i=rest,
+                                 DFIRM_ID=pts.dfirm_id.iloc[rest].astype(str).to_numpy(),
+                                 FLD_AR_ID=pts.meta_fld_ar_id.iloc[rest].astype(str).to_numpy()))
+        idx_keys = idx[["row_id", "DFIRM_ID", "FLD_AR_ID"]]
+        idx_keys = idx_keys.astype({"DFIRM_ID": str, "FLD_AR_ID": str})
+        hits = keys.merge(idx_keys, on=["DFIRM_ID", "FLD_AR_ID"], how="inner")
+        for i, group in hits.groupby("i"):
+            cand[int(i)] = group.row_id.astype(int).tolist()
+            n_by_key += 1
+            if len(group) > 1:
+                n_repeated += 1
+    n_none = len(positives) - len(cand)
+    return cand, (f"{n_direct} from meta_src_row_id, {n_by_key} by (dfirm_id, meta_fld_ar_id) "
+                  f"({n_repeated} with a repeated key), {n_none} with neither")
+
+
+def covering_polygons(row_ids, geoms: dict, point) -> list:
+    """The row_ids among row_ids whose polygon covers point."""
+    hits = []
+    for r in row_ids:
+        g = geoms.get(r)
+        if g is not None and g.covers(point):
+            hits.append(r)
+    return hits
 
 
 def resolve_sources(cand: dict, xy: np.ndarray, geoms: dict) -> tuple[dict, int, int]:
-    """One source row_id per positive; returns (point -> row_id, n covering, n unresolved)."""
+    """One source row_id per positive: its only candidate, else the one candidate that covers
+    it. Returns (row -> row_id, n covered by their source polygon, n unresolved)."""
     out, n_cover, n_unres = {}, 0, 0
     for i, rids in cand.items():
-        pt = shapely.Point(xy[i])
-        covers = [r for r in rids if geoms.get(r) is not None and geoms[r].covers(pt)]
+        covers = covering_polygons(rids, geoms, shapely.Point(xy[i]))
         if len(rids) == 1:
             out[i] = rids[0]
-            n_cover += len(covers) == 1
+            if len(covers) == 1:
+                n_cover += 1
         elif len(covers) == 1:
             out[i] = covers[0]
             n_cover += 1
@@ -339,11 +203,15 @@ def resolve_sources(cand: dict, xy: np.ndarray, geoms: dict) -> tuple[dict, int,
 
 
 def tile_box(tile: str) -> tuple[float, float, float, float]:
-    tx, ty = (int(v) for v in str(tile).split("_"))
+    """The EPSG:5070 box of tile_50km "tx_ty": x in [tx, tx + 1) * 50 km, y likewise.
+    tile_50km is (bx // 5, by // 5) of the 10 km blocks (pull_gee.derive)."""
+    tx_str, ty_str = str(tile).split("_")
+    tx, ty = int(tx_str), int(ty_str)
     return tx * TILE_M, ty * TILE_M, (tx + 1) * TILE_M, (ty + 1) * TILE_M
 
 
 def bbox_hits(idx: pd.DataFrame, x0, y0, x1, y1) -> np.ndarray:
+    """Which rows of idx have a bbox that meets the box (x0, y0, x1, y1), edges included."""
     return ((idx.maxx.to_numpy() >= x0) & (idx.minx.to_numpy() <= x1) &
             (idx.maxy.to_numpy() >= y0) & (idx.miny.to_numpy() <= y1))
 
@@ -375,7 +243,9 @@ def polygon_parts(g) -> list:
 
 
 def explode(geoms: dict, zone: dict) -> tuple[pd.DataFrame, int]:
-    """Every polygon's single parts, oriented (decision 6); invalid parts repaired."""
+    """Every polygon's single parts, numbered within the polygon and oriented so the interior
+    lies left of every ring (exterior counter-clockwise, holes clockwise). An invalid part is
+    repaired with make_valid, keeping its polygonal pieces. Returns (parts, n repaired)."""
     rows, n_fixed = [], 0
     for rid, g in geoms.items():
         k = 0
@@ -394,92 +264,115 @@ def explode(geoms: dict, zone: dict) -> tuple[pd.DataFrame, int]:
 
 def lobe_tiles(geoms: np.ndarray) -> list[str]:
     """';'-joined tile_50km ids each lobe intersects."""
-    b = shapely.bounds(geoms)
-    t0 = np.floor(b[:, :2] / TILE_M).astype(np.int64)
-    t1 = np.floor(b[:, 2:] / TILE_M).astype(np.int64)
-    li, tx, ty = [], [], []
+    bounds = shapely.bounds(geoms)
+    lowest = np.floor(bounds[:, :2] / TILE_M).astype(np.int64)
+    highest = np.floor(bounds[:, 2:] / TILE_M).astype(np.int64)
+    # Every (lobe, tile) pair inside the lobe's bbox, tested exactly below.
+    lobe_ix, tx, ty = [], [], []
     for i in range(len(geoms)):
-        for a in range(t0[i, 0], t1[i, 0] + 1):
-            for c in range(t0[i, 1], t1[i, 1] + 1):
-                li.append(i); tx.append(a); ty.append(c)
-    li, tx, ty = np.array(li, int), np.array(tx), np.array(ty)
-    hit = shapely.intersects(geoms[li], shapely.box(tx * TILE_M, ty * TILE_M,
-                                                    (tx + 1) * TILE_M, (ty + 1) * TILE_M))
-    out = [[] for _ in geoms]
-    for i, a, c in zip(li[hit], tx[hit], ty[hit]):
-        out[i].append(f"{a}_{c}")
-    return [";".join(t) for t in out]
+        for tile_x in range(lowest[i, 0], highest[i, 0] + 1):
+            for tile_y in range(lowest[i, 1], highest[i, 1] + 1):
+                lobe_ix.append(i)
+                tx.append(tile_x)
+                ty.append(tile_y)
+    lobe_ix, tx, ty = np.array(lobe_ix, int), np.array(tx), np.array(ty)
+    boxes = shapely.box(tx * TILE_M, ty * TILE_M, (tx + 1) * TILE_M, (ty + 1) * TILE_M)
+    hit = shapely.intersects(geoms[lobe_ix], boxes)
+    tiles = [[] for _ in geoms]
+    for i, tile_x, tile_y in zip(lobe_ix[hit], tx[hit], ty[hit]):
+        tiles[i].append(f"{tile_x}_{tile_y}")
+    return [";".join(t) for t in tiles]
 
 
 def densify(geoms: np.ndarray, step: float) -> dict:
-    """Evenly spaced vertices and unit inward normals on every ring (decisions 5-6).
+    """Evenly spaced vertices and unit inward normals on every ring of the oriented polygons.
 
-    geoms are oriented Polygons. All rings are laid end to end on one cumulative
-    length axis, so every interpolation is one searchsorted over all segments.
-    Segments are not copied out: ring r's coordinates are contiguous and closed,
-    so global segment j of ring r starts at coordinate j + r. That keeps the peak
-    at about six floats per coordinate (Indian River's lidar-traced AE edges put
-    6.4 M coordinates into one v1 component's lobes).
+    A ring of length L gets n = ceil(L / step) vertices at s = k L / n, k = 0..n-1; the original
+    vertices are not kept. Even spacing makes a share of edge length a vertex count. The tangent
+    is the chord between the two neighbouring vertices, at s - L / n and s + L / n (L / 4 instead
+    of L / n on rings of fewer than four vertices), so the normal is that of the step-spaced
+    polyline (at a corner, the bisector); a sub-metre chord would follow the zig-zags of
+    lidar-traced edges.
+    The interior is on the left, so the inward normal is the tangent's left perpendicular.
+
+    All rings lie end to end on one cumulative length axis, so each lookup is one searchsorted
+    over all segments (GEOS's interpolate is quadratic on long rings). Segments are not copied
+    out: ring r's coordinates are contiguous and closed, so global segment j of ring r starts at
+    coordinate j + r. That keeps memory near six floats per coordinate.
     """
-    rings, gi = shapely.get_rings(geoms, return_index=True)
-    first_ring = np.searchsorted(gi, np.arange(len(geoms)))
-    ring_no = np.arange(len(rings)) - first_ring[gi]
-    xy = shapely.get_coordinates(rings)
-    nc = shapely.get_num_coordinates(rings)
-    ns = np.maximum(nc - 1, 0)                           # segments per ring
-    s0 = np.cumsum(ns) - ns                              # its first global segment
-    seg = np.hypot(*np.diff(xy, axis=0).T)
-    seg = np.delete(seg, (np.cumsum(nc) - 1)[:-1])       # drop the steps between rings
-    cum = np.concatenate([[0.0], np.cumsum(seg)])        # cum[j] = start of segment j
-    base, L = cum[s0], cum[s0 + ns] - cum[s0]
-    r_all = np.arange(len(rings))
+    rings, ring_lobe = shapely.get_rings(geoms, return_index=True)
+    first_ring = np.searchsorted(ring_lobe, np.arange(len(geoms)))
+    ring_no = np.arange(len(rings)) - first_ring[ring_lobe]
+    coords = shapely.get_coordinates(rings)
+    n_coords = shapely.get_num_coordinates(rings)
+    n_segs = np.maximum(n_coords - 1, 0)                     # segments per ring
+    first_seg = np.cumsum(n_segs) - n_segs                   # its first global segment
+    seg_len = np.hypot(*np.diff(coords, axis=0).T)
+    seg_len = np.delete(seg_len, (np.cumsum(n_coords) - 1)[:-1])   # drop steps between rings
+    seg_start = np.concatenate([[0.0], np.cumsum(seg_len)])  # length axis at segment j's start
+    ring_start = seg_start[first_seg]
+    ring_len = seg_start[first_seg + n_segs] - seg_start[first_seg]
 
-    n = np.where(L > 0, np.maximum(np.ceil(L / step), 1), 0).astype(np.int64)
-    vr = np.repeat(r_all, n)
-    k = np.arange(len(vr)) - np.repeat(np.cumsum(n) - n, n)
-    s = k * (L[vr] / n[vr])
+    n_vert = np.where(ring_len > 0, np.maximum(np.ceil(ring_len / step), 1), 0).astype(np.int64)
+    v_ring = np.repeat(np.arange(len(rings)), n_vert)        # ring of each vertex
+    v_k = np.arange(len(v_ring)) - np.repeat(np.cumsum(n_vert) - n_vert, n_vert)
+    v_len = ring_len[v_ring]
+    v_step = v_len / n_vert[v_ring]
+    s = v_k * v_step
 
-    def at(t):
-        """Point at ring position t (wrapped) and the start coordinate of its segment."""
-        g = base[vr] + np.mod(t, L[vr])
-        j = np.clip(np.searchsorted(cum, g, side="right") - 1, s0[vr], s0[vr] + ns[vr] - 1)
-        f = np.clip((g - cum[j]) / np.where(seg[j] > 0, seg[j], 1.0), 0.0, 1.0)
-        c = j + vr
-        return xy[c] + f[:, None] * (xy[c + 1] - xy[c]), c
+    def point_at(t):
+        """Point at ring position t (wrapped) and the index of its segment's first coordinate."""
+        pos = ring_start[v_ring] + np.mod(t, v_len)
+        seg = np.searchsorted(seg_start, pos, side="right") - 1
+        seg = np.clip(seg, first_seg[v_ring], first_seg[v_ring] + n_segs[v_ring] - 1)
+        safe_len = np.where(seg_len[seg] > 0, seg_len[seg], 1.0)
+        frac = np.clip((pos - seg_start[seg]) / safe_len, 0.0, 1.0)
+        coord = seg + v_ring
+        return coords[coord] + frac[:, None] * (coords[coord + 1] - coords[coord]), coord
 
-    p, c = at(s)
-    h = np.minimum(L[vr] / n[vr], L[vr] / 4)             # the neighbouring vertices
-    tan = at(s + h)[0] - at(s - h)[0]
-    norm = np.hypot(*tan.T)
-    flat = norm < 1e-9                                   # a spike the chord cannot see
-    tan[flat] = (xy[c + 1] - xy[c])[flat]
-    norm = np.hypot(*tan.T)
-    tan /= np.where(norm > 0, norm, 1)[:, None]
-    return dict(lobe=gi[vr], ring=ring_no[vr].astype(np.int32), s=s,
-                x=p[:, 0], y=p[:, 1], nx=-tan[:, 1], ny=tan[:, 0])
+    vertex, coord = point_at(s)
+    half_chord = np.minimum(v_step, v_len / 4)
+    tangent = point_at(s + half_chord)[0] - point_at(s - half_chord)[0]
+    norm = np.hypot(*tangent.T)
+    # At a spike the two neighbours coincide; fall back to the vertex's own segment.
+    flat = norm < 1e-9
+    tangent[flat] = (coords[coord + 1] - coords[coord])[flat]
+    norm = np.hypot(*tangent.T)
+    tangent /= np.where(norm > 0, norm, 1)[:, None]
+    return dict(lobe=ring_lobe[v_ring], ring=ring_no[v_ring].astype(np.int32), s=s,
+                x=vertex[:, 0], y=vertex[:, 1], nx=-tangent[:, 1], ny=tangent[:, 0])
 
 
-def check_normals(geoms: np.ndarray, bounds: np.ndarray, v: dict, sel: np.ndarray) -> dict:
-    """Decision 6's probe test on the vertices `sel` (indices into v). `bounds`
-    are the lobes' prepared boundaries; `clear` vertices have both probes at
-    least CLEAR_FRAC * PROBE_M from them."""
-    li = v["lobe"][sel]
-    x, y, nx, ny = v["x"][sel], v["y"][sel], v["nx"][sel], v["ny"][sel]
-    pin = shapely.points(x + PROBE_M * nx, y + PROBE_M * ny)
-    pout = shapely.points(x - PROBE_M * nx, y - PROBE_M * ny)
-    inn = shapely.contains(geoms[li], pin)
-    out = shapely.contains(geoms[li], pout)
-    clear = ~(shapely.dwithin(bounds[li], pin, CLEAR_FRAC * PROBE_M)
-              | shapely.dwithin(bounds[li], pout, CLEAR_FRAC * PROBE_M))
-    ok, flipped = inn & ~out, ~inn & out
+def check_normals(geoms: np.ndarray, bounds: np.ndarray, verts: dict, sel: np.ndarray) -> dict:
+    """Probe test of the normals at vertices `sel` (indices into verts, densify's output):
+    x + PROBE_M n must be inside the lobe and x - PROBE_M n outside. bounds are the lobes'
+    prepared boundaries."""
+    lobe = verts["lobe"][sel]
+    x, y = verts["x"][sel], verts["y"][sel]
+    nx, ny = verts["nx"][sel], verts["ny"][sel]
+    probe_in = shapely.points(x + PROBE_M * nx, y + PROBE_M * ny)
+    probe_out = shapely.points(x - PROBE_M * nx, y - PROBE_M * ny)
+    in_inside = shapely.contains(geoms[lobe], probe_in)
+    out_inside = shapely.contains(geoms[lobe], probe_out)
+    near_in = shapely.dwithin(bounds[lobe], probe_in, CLEAR_FRAC * PROBE_M)
+    near_out = shapely.dwithin(bounds[lobe], probe_out, CLEAR_FRAC * PROBE_M)
+    clear = ~(near_in | near_out)
+    ok = in_inside & ~out_inside
+    flipped = ~in_inside & out_inside
     return dict(n=len(sel), ok=int(ok.sum()), flipped=int(flipped.sum()),
-                ambiguous=int((inn == out).sum()), n_clear=int(clear.sum()),
+                ambiguous=int((in_inside == out_inside).sum()), n_clear=int(clear.sum()),
                 ok_clear=int((ok & clear).sum()), flipped_clear=int((flipped & clear).sum()))
 
 
 def match_perimeter(reg_logp: np.ndarray, cand_logp: np.ndarray, n_rounds: int,
                     rng: np.random.Generator) -> list[tuple[int, int, float]]:
-    """Decision 4. Returns (region index, candidate index, |dlog P|) per match."""
+    """Match candidates to region lobes on log perimeter, round-robin without replacement.
+
+    In each of n_rounds rounds every region lobe, in a seeded random order, takes the free
+    candidate nearest in log perimeter (ties by a seeded random key), so no lobe exhausts the
+    good matches before the others get one. Log, because perimeters span five orders of
+    magnitude. Returns (region index, candidate index, |dlog P|) per match.
+    """
     free = np.ones(len(cand_logp), bool)
     tie = rng.random(len(cand_logp))
     order = rng.permutation(len(reg_logp))
@@ -496,58 +389,147 @@ def match_perimeter(reg_logp: np.ndarray, cand_logp: np.ndarray, n_rounds: int,
 
 
 def lonlat_bounds(x0, y0, x1, y1) -> tuple[float, float, float, float]:
+    """EPSG:4326 bounds of an EPSG:5070 box, over its densified edges, so the lon/lat box covers
+    the whole projected box rather than only its corners."""
     tf = Transformer.from_crs(CRS_WORK, CRS_LONLAT_OUT, always_xy=True)
     return tf.transform_bounds(x0, y0, x1, y1, densify_pts=101)
 
 
 # ----------------------------------------------------------------- build
 def plan_component(c: int, pts: pd.DataFrame, xy: np.ndarray, idx: pd.DataFrame,
-                   a) -> dict:
-    """Which polygons each role may draw from, on idx bbox columns alone."""
-    m = pts.component.to_numpy() == c
-    p = xy[m]
-    tiles = sorted(pts.tile_50km[m].astype(str).unique())
+                   args) -> dict:
+    """The polygons each role of component c may draw from, chosen on idx's bbox columns.
+    The tiles are those of the component's own points: the ground the models were tested on."""
+    mask = pts.component.to_numpy() == c
+    comp_xy = xy[mask]
+    tiles = sorted(pts.tile_50km[mask].astype(str).unique())
     zone = idx.FLD_ZONE.to_numpy()
-    near_box = (p[:, 0].min() - a.near_m, p[:, 1].min() - a.near_m,
-                p[:, 0].max() + a.near_m, p[:, 1].max() + a.near_m)
+    near_box = (comp_xy[:, 0].min() - args.near_m, comp_xy[:, 1].min() - args.near_m,
+                comp_xy[:, 0].max() + args.near_m, comp_xy[:, 1].max() + args.near_m)
     near = (zone == REGION_ZONE) & bbox_hits(idx, *near_box)
     in_tiles = np.zeros(len(idx), bool)
     for t in tiles:
         in_tiles |= bbox_hits(idx, *tile_box(t))
-    rid = idx.row_id.to_numpy()
-    return dict(mask=m, xy=p, tiles=tiles,
-                hull=shapely.buffer(shapely.convex_hull(shapely.multipoints(p)), a.hull_buffer_m),
-                near_ids=rid[near], A_tile_ids=rid[in_tiles & (zone == REGION_ZONE)],
-                AE_tile_ids=rid[in_tiles & (zone == CONTRAST_ZONE)])
+    row_id = idx.row_id.to_numpy()
+    hull = shapely.convex_hull(shapely.multipoints(comp_xy))
+    return dict(mask=mask, xy=comp_xy, tiles=tiles,
+                hull=shapely.buffer(hull, args.hull_buffer_m),
+                near_ids=row_id[near],
+                A_tile_ids=row_id[in_tiles & (zone == REGION_ZONE)],
+                AE_tile_ids=row_id[in_tiles & (zone == CONTRAST_ZONE)])
 
 
-def build(pts: pd.DataFrame, xy: np.ndarray, big: list[int], idx: pd.DataFrame, a):
-    t0 = time.time()
-    cand, cand_note = source_candidates(pts, idx, pts.component.isin(big).to_numpy())
-    print(f"  positives' source polygons (components of >= {a.min_size} points): {cand_note}",
-          flush=True)
-    zone = dict(zip(idx.row_id.to_numpy().tolist(), idx.FLD_ZONE.to_numpy().tolist()))
-    other = sorted({r for rids in cand.values() if all(zone[r] != REGION_ZONE for r in rids)
-                    for r in rids})
+def require_zone_a_sources(cand: dict, zone: dict) -> None:
+    """Abort when a positive has no Zone A candidate source polygon: that would be an A->AE
+    region, whose roles this script does not define."""
+    other = set()
+    for rids in cand.values():
+        if all(zone[r] != REGION_ZONE for r in rids):
+            other.update(rids)
+    other = sorted(other)
     if other:
         raise SystemExit(f"{len(other)} source polygons of region positives are not Zone "
                          f"{REGION_ZONE} (e.g. row_id {other[0]}: {zone[other[0]]}); lobes.py "
                          f"handles AE->A regions only")
-    plans = {c: plan_component(c, pts, xy, idx, a) for c in big}
 
-    need = {r for rids in cand.values() for r in rids}
-    for pl in plans.values():
-        for k in ("near_ids", "A_tile_ids", "AE_tile_ids"):
-            need |= set(pl[k].tolist())
-    need = np.array(sorted(need), dtype=np.int64)
-    print(f"  reading {len(need):,} candidate polygons from "
-          f"{a.haz.name} ({len(np.unique(need // sp.RG_ROWS))} row groups)", flush=True)
-    g = sp.read_geoms(a.state, need)
-    missing = int(sum(x is None for x in g))
-    if missing:
-        raise SystemExit(f"{missing} candidate row_ids have no geometry in {a.haz}")
-    geoms = dict(zip(need.tolist(), g))
+
+def polygons_to_read(cand: dict, plans: dict, big: list[int]) -> np.ndarray:
+    """Sorted row_ids of the polygons build needs: the candidate source polygons, every
+    component's near-rule polygons, and the tile polygons of the components in big."""
+    need = set()
+    for rids in cand.values():
+        need.update(rids)
+    for c, plan in plans.items():
+        need.update(plan["near_ids"].tolist())
+        if c in big:
+            need.update(plan["A_tile_ids"].tolist())
+            need.update(plan["AE_tile_ids"].tolist())
+    return np.array(sorted(need), dtype=np.int64)
+
+
+def region_parts(plan: dict, parts: pd.DataFrame, tree: STRtree, geoms: dict, src: dict,
+                 near_m: float) -> tuple[np.ndarray, set, set, set]:
+    """One component's region lobes, as indices into parts.
+
+    A polygon qualifies when it is a positive's source polygon or lies within near_m of a region
+    point; its parts are kept when they meet the buffered hull of the region's points. The test
+    is on whole polygons first and parts second because an NFHL polygon can scatter parts tens of
+    km apart. Returns (indices, the positives' source polygons, the polygons within near_m,
+    all qualifying polygons).
+    """
+    from_pos = set()
+    for i in np.flatnonzero(plan["mask"]):
+        if i in src:
+            from_pos.add(src[i])
+    near_geoms = np.array([geoms[r] for r in plan["near_ids"]], dtype=object)
+    hit = np.empty(0, dtype=np.int64)
+    if len(near_geoms):
+        near_tree = STRtree(near_geoms)
+        hit = near_tree.query(shapely.points(plan["xy"]), predicate="dwithin",
+                              distance=near_m)[1]
+    near_set = set(plan["near_ids"][np.unique(hit)].tolist())
+    polys = from_pos | near_set
+    in_poly = parts.row_id.isin(polys).to_numpy()
+    on_hull = np.zeros(len(parts), bool)
+    on_hull[tree.query(plan["hull"], predicate="intersects")] = True
+    return np.flatnonzero(in_poly & on_hull), from_pos, near_set, polys
+
+
+def role_rows(parts: pd.DataFrame, part_geoms: np.ndarray, n_points: np.ndarray,
+              ix: np.ndarray, role: str, c: int) -> pd.DataFrame:
+    """Lobe rows for parts[ix] in one role of component c."""
+    out = pd.DataFrame(dict(
+        src_row_id=parts.row_id.to_numpy()[ix], part=parts.part.to_numpy()[ix],
+        zone=parts.zone.to_numpy()[ix], geometry=part_geoms[ix], n_points=n_points[ix]))
+    out["role"] = role
+    out["component"] = c
+    out["lobe_id"] = [f"c{c}_{role}_{r}_{k}" for r, k in zip(out.src_row_id, out.part)]
+    return out
+
+
+def add_attributes(lobes: pd.DataFrame, idx: pd.DataFrame) -> pd.DataFrame:
+    """The lobe table with its NFHL attributes, area, perimeter and tiles added."""
     meta = idx.set_index("row_id")[["FLD_AR_ID", "DFIRM_ID", "ZONE_SUBTY"]]
+    lobes["fld_ar_id"] = meta.FLD_AR_ID.reindex(lobes.src_row_id).to_numpy()
+    lobes["dfirm_id"] = meta.DFIRM_ID.reindex(lobes.src_row_id).to_numpy()
+    lobes["zone_subty"] = subty(meta.ZONE_SUBTY.reindex(lobes.src_row_id)).array
+    is_floodway = lobes.zone_subty.str.contains(FLOODWAY, regex=False)
+    lobes["is_floodway"] = is_floodway.fillna(False).astype(bool)
+    lobe_geoms = geom_array(lobes.geometry)
+    lobes["area_m2"] = shapely.area(lobe_geoms)
+    lobes["perimeter_m"] = shapely.length(lobe_geoms)
+    lobes["tiles"] = lobe_tiles(lobe_geoms)
+    lobes["from_positive"] = lobes.from_positive.astype("boolean")
+    return lobes.astype({"component": np.int32, "src_row_id": np.int64, "part": np.int32,
+                         "n_points": np.int32})
+
+
+def build(pts: pd.DataFrame, xy: np.ndarray, big: list[int], idx: pd.DataFrame, a):
+    """The lobes of the components in big, with `a` the parsed command line.
+    Returns (lobe table, plans of big, row_id -> polygon of every polygon read)."""
+    t0 = time.time()
+    # Region lobes are found for every component of >= min_size points, not only big, so that
+    # --only-components cannot let another component's region lobes into matched_A.
+    sizes = pts.groupby("component").size()
+    every = sorted(set(big) | {int(c) for c in sizes.index[sizes >= a.min_size]})
+    cand, cand_note = source_candidates(pts, idx, pts.component.isin(every).to_numpy())
+    print(f"  positives' source polygons (components of >= {a.min_size} points): {cand_note}",
+          flush=True)
+    zone = dict(zip(idx.row_id.to_numpy().tolist(), idx.FLD_ZONE.to_numpy().tolist()))
+    require_zone_a_sources(cand, zone)
+    plans = {c: plan_component(c, pts, xy, idx, a) for c in every}
+
+    # haz_<ST>_5070.parquet is 5.4 GB for Florida, so only these polygons are read, in one pass
+    # (read_geoms reads each row group at most once).
+    need = polygons_to_read(cand, plans, big)
+    n_groups = len(np.unique(need // sp.RG_ROWS))
+    print(f"  reading {len(need):,} candidate polygons from {a.haz.name} ({n_groups} row groups)",
+          flush=True)
+    polys = sp.read_geoms(a.state, need)
+    n_missing = sum(g is None for g in polys)
+    if n_missing:
+        raise SystemExit(f"{n_missing} candidate row_ids have no geometry in {a.haz}")
+    geoms = dict(zip(need.tolist(), polys))
     print(f"    read in {time.time() - t0:.1f}s", flush=True)
 
     src, n_cover, n_unres = resolve_sources(cand, xy, geoms)
@@ -559,295 +541,342 @@ def build(pts: pd.DataFrame, xy: np.ndarray, big: list[int], idx: pd.DataFrame, 
           f"{len(src) - n_cover} not; {n_unres} unresolved", flush=True)
 
     parts, n_fixed = explode(geoms, zone)
-    pg = geom_array(parts.geometry)
-    shapely.prepare(pg)
-    tree = STRtree(pg)
-    print(f"  {len(parts):,} single parts from {len(geoms):,} polygons"
-          + (f"; {n_fixed} invalid parts repaired" if n_fixed else ""), flush=True)
+    part_geoms = geom_array(parts.geometry)
+    shapely.prepare(part_geoms)
+    tree = STRtree(part_geoms)
+    repaired = f"; {n_fixed} invalid parts repaired" if n_fixed else ""
+    print(f"  {len(parts):,} single parts from {len(geoms):,} polygons{repaired}", flush=True)
 
-    # Which parts cover which selected points, for every component (decision 4).
-    pi, pj = tree.query(shapely.points(xy), predicate="covered_by")
+    # Which parts cover (contain or have on their boundary) which selected points, all components.
+    point_ix, part_ix = tree.query(shapely.points(xy), predicate="covered_by")
     covers_any = np.zeros(len(parts), bool)
-    covers_any[pj] = True
-    comp_of = pts.component.to_numpy()
-    key = pd.MultiIndex.from_arrays([parts.row_id, parts.part])
+    covers_any[part_ix] = True
+    comp_of_point = pts.component.to_numpy()
 
     region, tile_parts = {}, {}
-    for c, pl in plans.items():
-        mine = [i for i in np.flatnonzero(pl["mask"]) if i in src]
-        from_pos = {src[i] for i in mine}
-        near_geoms = np.array([geoms[r] for r in pl["near_ids"]], dtype=object)
-        hit = np.empty(0, dtype=np.int64)
-        if len(near_geoms):
-            hit = STRtree(near_geoms).query(shapely.points(pl["xy"]), predicate="dwithin",
-                                            distance=a.near_m)[1]
-        near_set = set(pl["near_ids"][np.unique(hit)].tolist())
-        polys = from_pos | near_set
-        in_poly = parts.row_id.isin(polys).to_numpy()
-        on_hull = np.zeros(len(parts), bool)
-        on_hull[tree.query(pl["hull"], predicate="intersects")] = True
-        region[c] = np.flatnonzero(in_poly & on_hull)
-        boxes = shapely.box(*np.array([tile_box(t) for t in pl["tiles"]]).T)
-        tp = np.unique(tree.query(boxes, predicate="intersects")[1])
-        tile_parts[c] = tp
-        pl.update(from_pos=from_pos, n_near=len(near_set), n_polys=len(polys))
-
-    region_keys = set(key[np.concatenate(list(region.values()))]) if region else set()
-    is_region_any = np.array([k in region_keys for k in key])
-    logp = np.log(shapely.length(pg))
+    for c, plan in plans.items():
+        region[c], from_pos, near_set, qualifying = region_parts(plan, parts, tree, geoms, src,
+                                                                 a.near_m)
+        boxes = shapely.box(*np.array([tile_box(t) for t in plan["tiles"]]).T)
+        tile_parts[c] = np.unique(tree.query(boxes, predicate="intersects")[1])
+        plan.update(from_pos=from_pos, n_near=len(near_set), n_polys=len(qualifying))
+    is_region_any = np.zeros(len(parts), bool)
+    for ix in region.values():
+        is_region_any[ix] = True
+    log_perimeter = np.log(shapely.length(part_geoms))
     part_zone = parts.zone.to_numpy()
 
-    lobes = []
-    for c, pl in plans.items():
+    tables = []
+    for c in big:
+        plan = plans[c]
         rng = np.random.default_rng([a.seed, c])
-        n_here = np.bincount(pj[comp_of[pi] == c], minlength=len(parts))
-        tp = tile_parts[c]
-        ae = tp[part_zone[tp] == CONTRAST_ZONE]
-        elig = tp[(part_zone[tp] == REGION_ZONE) & ~covers_any[tp] & ~is_region_any[tp]]
+        n_here = np.bincount(part_ix[comp_of_point[point_ix] == c], minlength=len(parts))
+        in_tiles = tile_parts[c]
+        ae = in_tiles[part_zone[in_tiles] == CONTRAST_ZONE]
+        # Eligible for matched_A: a Zone A part in the tiles that covers no selected point of
+        # any component and is no component's region lobe.
+        eligible = in_tiles[(part_zone[in_tiles] == REGION_ZONE) & ~covers_any[in_tiles]
+                            & ~is_region_any[in_tiles]]
         reg = region[c]
-        matches = match_perimeter(logp[reg], logp[elig], a.n_matched, rng)
+        matches = match_perimeter(log_perimeter[reg], log_perimeter[eligible], a.n_matched, rng)
 
-        def rows(ix, role, **extra):
-            out = pd.DataFrame(dict(
-                src_row_id=parts.row_id.to_numpy()[ix], part=parts.part.to_numpy()[ix],
-                zone=part_zone[ix], geometry=pg[ix], n_points=n_here[ix]))
-            out["role"] = role
-            out["component"] = c
-            out["lobe_id"] = [f"c{c}_{role}_{r}_{k}" for r, k in zip(out.src_row_id, out.part)]
-            for k, v in extra.items():
-                out[k] = v
-            return out
-
-        r_df = rows(reg, "region",
-                    from_positive=np.isin(parts.row_id.to_numpy()[reg], list(pl["from_pos"])))
-        m_ix = np.array([elig[j] for _, j, _ in matches], dtype=np.int64)
-        m_df = rows(m_ix, "matched_A",
-                    matched_to=[r_df.lobe_id.iloc[i] for i, _, _ in matches],
-                    match_dlogp=[d for _, _, d in matches])
-        e_df = rows(ae, "AE")
+        region_df = role_rows(parts, part_geoms, n_here, reg, "region", c)
+        region_df["from_positive"] = np.isin(parts.row_id.to_numpy()[reg], list(plan["from_pos"]))
+        matched_ix = np.array([eligible[j] for _, j, _ in matches], dtype=np.int64)
+        matched_df = role_rows(parts, part_geoms, n_here, matched_ix, "matched_A", c)
+        matched_df["matched_to"] = [region_df.lobe_id.iloc[i] for i, _, _ in matches]
+        matched_df["match_dlogp"] = [d for _, _, d in matches]
+        ae_df = role_rows(parts, part_geoms, n_here, ae, "AE", c)
         by = ["src_row_id", "part"]
-        lobes += [r_df.sort_values(by), m_df, e_df.sort_values(by)]
-        pl.update(n_region=len(r_df), n_matched=len(m_df), n_eligible=len(elig), n_ae=len(e_df),
-                  dlogp=np.array([d for _, _, d in matches]))
+        tables += [region_df.sort_values(by), matched_df, ae_df.sort_values(by)]
+        plan.update(n_region=len(region_df), n_matched=len(matched_df), n_eligible=len(eligible),
+                    n_ae=len(ae_df), dlogp=np.array([d for _, _, d in matches]))
 
-    lobes = pd.concat(lobes, ignore_index=True)
-    lobes["fld_ar_id"] = meta.FLD_AR_ID.reindex(lobes.src_row_id).to_numpy()
-    lobes["dfirm_id"] = meta.DFIRM_ID.reindex(lobes.src_row_id).to_numpy()
-    lobes["zone_subty"] = subty(meta.ZONE_SUBTY.reindex(lobes.src_row_id)).array
-    fw = lobes.zone_subty.str.contains(FLOODWAY, regex=False)
-    lobes["is_floodway"] = fw.fillna(False).astype(bool)
-    lg = geom_array(lobes.geometry)
-    lobes["area_m2"] = shapely.area(lg)
-    lobes["perimeter_m"] = shapely.length(lg)
-    lobes["tiles"] = lobe_tiles(lg)
-    for col, fill in (("matched_to", None), ("match_dlogp", np.nan), ("from_positive", pd.NA)):
-        if col not in lobes:
-            lobes[col] = fill
-    lobes["from_positive"] = lobes.from_positive.astype("boolean")
-    lobes = lobes.astype({"component": np.int32, "src_row_id": np.int64, "part": np.int32,
-                          "n_points": np.int32})
+    lobes = add_attributes(pd.concat(tables, ignore_index=True), idx)
     if not lobes.lobe_id.is_unique:
         raise SystemExit("lobe_id is not unique; a part was taken twice in one role")
-    return lobes[LOBE_COLS + ["geometry"]], plans, geoms
+    big_plans = {c: plans[c] for c in big}
+    return lobes[LOBE_COLS + ["geometry"]], big_plans, geoms
 
 
-def vertices_and_checks(lobes: pd.DataFrame, plans: dict, a) -> tuple[pd.DataFrame, dict]:
-    lg = geom_array(lobes.geometry)
-    shapely.prepare(lg)
-    v = densify(lg, a.densify_m)
-    bounds = shapely.boundary(lg)
+def vertices_and_checks(lobes: pd.DataFrame, plans: dict, args) -> tuple[pd.DataFrame, dict]:
+    """The vertex table, and the inward-normal check on a seeded sample of each component's
+    vertices; raises AssertionError when a component fails it."""
+    lobe_geoms = geom_array(lobes.geometry)
+    shapely.prepare(lobe_geoms)
+    verts = densify(lobe_geoms, args.densify_m)
+    bounds = shapely.boundary(lobe_geoms)
     shapely.prepare(bounds)
+    comp = lobes.component.to_numpy()[verts["lobe"]]
+    role = lobes.role.to_numpy()[verts["lobe"]]
     checks = {}
-    comp = lobes.component.to_numpy()[v["lobe"]]
-    role = lobes.role.to_numpy()[v["lobe"]]
     for c in plans:
-        rng = np.random.default_rng([a.seed, c, 1])
+        rng = np.random.default_rng([args.seed, c, 1])
         here = np.flatnonzero(comp == c)
-        sel = np.sort(rng.choice(here, min(a.check_n, len(here)), replace=False))
-        res = {r: check_normals(lg, bounds, v, sel[role[sel] == r]) for r in ROLES}
-        tot = {k: sum(x[k] for x in res.values()) for k in res["region"]}
-        res["all"] = tot
-        checks[c] = res
+        sel = np.sort(rng.choice(here, min(args.check_n, len(here)), replace=False))
+        result = {}
+        for r in ROLES:
+            result[r] = check_normals(lobe_geoms, bounds, verts, sel[role[sel] == r])
+        total = {}
+        for key in result["region"]:
+            total[key] = sum(result[r][key] for r in ROLES)
+        result["all"] = total
+        checks[c] = result
         # An explicit raise rather than `assert`, so python -O cannot skip it.
-        if not (tot["ok_clear"] >= CHECK_MIN_PASS * tot["n_clear"]
-                and tot["flipped_clear"] <= CHECK_MAX_FLIPPED * tot["n_clear"]):
+        enough_pass = total["ok_clear"] >= CHECK_MIN_PASS * total["n_clear"]
+        few_flipped = total["flipped_clear"] <= CHECK_MAX_FLIPPED * total["n_clear"]
+        if not (enough_pass and few_flipped):
             raise AssertionError(
                 f"component {c}: inward-normal check failed on clear edges: "
-                f"{tot['ok_clear']}/{tot['n_clear']} pass, {tot['flipped_clear']} flipped "
+                f"{total['ok_clear']}/{total['n_clear']} pass, {total['flipped_clear']} flipped "
                 f"(need >= {CHECK_MIN_PASS:.1%} and <= {CHECK_MAX_FLIPPED:.1%})")
 
     tf = Transformer.from_crs(CRS_WORK, CRS_LONLAT_OUT, always_xy=True)
-    lon, lat = tf.transform(v["x"], v["y"])
+    lon, lat = tf.transform(verts["x"], verts["y"])
+    lobe = verts["lobe"]
     vt = pd.DataFrame(dict(
-        lobe_id=lobes.lobe_id.to_numpy()[v["lobe"]], zone=lobes.zone.to_numpy()[v["lobe"]],
-        role=role, component=comp.astype(np.int32), ring=v["ring"], s=v["s"],
-        x=v["x"], y=v["y"], lon=lon, lat=lat, nx=v["nx"], ny=v["ny"]))
+        lobe_id=lobes.lobe_id.to_numpy()[lobe], zone=lobes.zone.to_numpy()[lobe],
+        role=role, component=comp.astype(np.int32), ring=verts["ring"], s=verts["s"],
+        x=verts["x"], y=verts["y"], lon=lon, lat=lat, nx=verts["nx"], ny=verts["ny"]))
     return vt[VERTEX_COLS], checks
 
 
 def bbox_table(lobes: pd.DataFrame, plans: dict, buf: float) -> tuple[pd.DataFrame, dict]:
-    b = shapely.bounds(geom_array(lobes.geometry))
-    rows, alt = [], {}
+    """Each component's analysis bbox: the union of all its lobes' extents, every role, buffered
+    by buf so a 1 km displaced-edge null and the normal probes stay inside every layer pulled
+    for it. Also returns, per component, the size the box would have from its region lobes
+    alone (NaN without region lobes)."""
+    bounds = shapely.bounds(geom_array(lobes.geometry))      # minx, miny, maxx, maxy per lobe
+    comp = lobes.component.to_numpy()
+    is_region = lobes.role.to_numpy() == "region"
+    rows, region_only = [], {}
     for c in plans:
-        m = lobes.component.to_numpy() == c
-        x0, y0 = b[m, 0].min() - buf, b[m, 1].min() - buf
-        x1, y1 = b[m, 2].max() + buf, b[m, 3].max() + buf
-        lo0, la0, lo1, la1 = lonlat_bounds(x0, y0, x1, y1)
-        rows.append(dict(component=c, minx=x0, miny=y0, maxx=x1, maxy=y1, lon_min=lo0,
-                         lat_min=la0, lon_max=lo1, lat_max=la1, width_km=(x1 - x0) / 1e3,
+        in_comp = comp == c
+        x0, y0 = bounds[in_comp, 0].min() - buf, bounds[in_comp, 1].min() - buf
+        x1, y1 = bounds[in_comp, 2].max() + buf, bounds[in_comp, 3].max() + buf
+        lon0, lat0, lon1, lat1 = lonlat_bounds(x0, y0, x1, y1)
+        rows.append(dict(component=c, minx=x0, miny=y0, maxx=x1, maxy=y1, lon_min=lon0,
+                         lat_min=lat0, lon_max=lon1, lat_max=lat1, width_km=(x1 - x0) / 1e3,
                          height_km=(y1 - y0) / 1e3, area_km2=(x1 - x0) * (y1 - y0) / 1e6,
-                         n_lobes=int(m.sum())))
-        rm = m & (lobes.role.to_numpy() == "region")
-        if rm.any():
-            rx = (b[rm, 2].max() - b[rm, 0].min() + 2 * buf,
-                  b[rm, 3].max() - b[rm, 1].min() + 2 * buf)
+                         n_lobes=int(in_comp.sum())))
+        in_region = in_comp & is_region
+        if in_region.any():
+            width = bounds[in_region, 2].max() - bounds[in_region, 0].min() + 2 * buf
+            height = bounds[in_region, 3].max() - bounds[in_region, 1].min() + 2 * buf
         else:
-            rx = (np.nan, np.nan)
-        alt[c] = dict(region_km=(rx[0] / 1e3, rx[1] / 1e3), region_km2=rx[0] * rx[1] / 1e6)
-    return pd.DataFrame(rows).astype({"component": np.int32}), alt
+            width = height = np.nan
+        region_only[c] = dict(region_km=(width / 1e3, height / 1e3),
+                              region_km2=width * height / 1e6)
+    return pd.DataFrame(rows).astype({"component": np.int32}), region_only
 
 
 def contact_candidates(idx: pd.DataFrame, lobes: pd.DataFrame, bb: pd.DataFrame,
                        tol: float) -> dict:
-    """SFHA row_ids per component whose idx bbox meets the component's analysis
-    bbox and comes within tol of one of its lobes' bboxes (decision 10)."""
-    sf = idx[idx.SFHA_TF.to_numpy() == "T"]
-    sbox = shapely.box(sf.minx.to_numpy(), sf.miny.to_numpy(), sf.maxx.to_numpy(),
-                       sf.maxy.to_numpy())
-    lb = shapely.bounds(geom_array(lobes.geometry)) + np.array([-tol, -tol, tol, tol])
+    """SFHA row_ids per component whose idx bbox meets the component's analysis bbox and comes
+    within tol of one of its lobes' bboxes."""
+    sfha = idx[idx.SFHA_TF.to_numpy() == "T"]
+    sfha_boxes = shapely.box(sfha.minx.to_numpy(), sfha.miny.to_numpy(), sfha.maxx.to_numpy(),
+                             sfha.maxy.to_numpy())
+    lobe_boxes = shapely.bounds(geom_array(lobes.geometry)) + np.array([-tol, -tol, tol, tol])
     comp = lobes.component.to_numpy()
     out = {}
-    for r in bb.itertuples():
-        inb = np.flatnonzero(bbox_hits(sf, r.minx, r.miny, r.maxx, r.maxy))
-        near = STRtree(shapely.box(*lb[comp == r.component].T)).query(
-            sbox[inb], predicate="intersects")[0]
-        out[int(r.component)] = sf.row_id.to_numpy()[inb[np.unique(near)]]
+    for box in bb.itertuples():
+        in_bbox = np.flatnonzero(bbox_hits(sfha, box.minx, box.miny, box.maxx, box.maxy))
+        comp_tree = STRtree(shapely.box(*lobe_boxes[comp == box.component].T))
+        near = comp_tree.query(sfha_boxes[in_bbox], predicate="intersects")[0]
+        out[int(box.component)] = sfha.row_id.to_numpy()[in_bbox[np.unique(near)]]
     return out
 
 
+def nearest_contacts(tree: STRtree, vertex_pts: np.ndarray, polys: np.ndarray,
+                     row_ids: np.ndarray, own_row_id: np.ndarray,
+                     tol: float) -> tuple[np.ndarray, np.ndarray, int]:
+    """For the vertices in tree, the nearest of polys within tol that is not the vertex's own
+    polygon; ties go to the lower row_id. Returns (vertex indices, their contact row_ids, the
+    number of vertices with several candidates)."""
+    poly_ix, v_ix = tree.query(polys, predicate="dwithin", distance=tol)
+    not_own = row_ids[poly_ix] != own_row_id[v_ix]
+    poly_ix, v_ix = poly_ix[not_own], v_ix[not_own]
+    # Exact distances are needed only where a vertex has several candidates.
+    several = np.bincount(v_ix, minlength=len(vertex_pts))[v_ix] > 1
+    n_several = len(np.unique(v_ix[several]))
+    dist = np.zeros(len(v_ix))
+    dist[several] = shapely.distance(vertex_pts[v_ix[several]], polys[poly_ix[several]])
+    order = np.lexsort((row_ids[poly_ix], dist, v_ix))
+    v_ix, poly_ix = v_ix[order], poly_ix[order]
+    if len(v_ix):
+        first = np.r_[True, v_ix[1:] != v_ix[:-1]]
+    else:
+        first = np.zeros(0, bool)
+    return v_ix[first], row_ids[poly_ix[first]], n_several
+
+
 def contacts(lobes: pd.DataFrame, vt: pd.DataFrame, bb: pd.DataFrame, idx: pd.DataFrame,
-             geoms: dict, a) -> tuple[pd.DataFrame, str]:
-    """Decision 10's columns for every vertex; reads the candidate SFHA polygons
-    that build() did not, in one more read_geoms pass."""
+             geoms: dict, args) -> tuple[pd.DataFrame, str]:
+    """The vertex table with CONTACT_COLS added, and a report line.
+
+    Not all of a lobe's boundary is an SFHA limit: some of it is a contact with another SFHA
+    polygon (a floodway/fringe line, a polygon split by source or at a sheet edge, an A/AE
+    contact), and an edge shared by two lobes of one role is written once per lobe. So each vertex
+    records the nearest other SFHA polygon (SFHA_TF 'T', any zone) within --contact-m, null when
+    there is none, and same_role_contact: whether another lobe of its role and component lies that
+    close. The analysis can then keep the SFHA-exterior edge, the duplicates, or both. "Other"
+    excludes the vertex's whole own polygon, which loses no shared edge: the parts of a valid
+    MultiPolygon touch only at points. Shared NFHL edges coincide to floating point, so
+    --contact-m only absorbs round-off in the densified vertices. Candidate polygons that build
+    did not read come in one more read_geoms pass.
+    """
     t0 = time.time()
-    tol = a.contact_m
+    tol = args.contact_m
     cand = contact_candidates(idx, lobes, bb, tol)
     every = np.unique(np.concatenate(list(cand.values())))
-    new = np.setdiff1d(every, np.fromiter(geoms, dtype=np.int64, count=len(geoms)))
-    g = sp.read_geoms(a.state, new)
-    if any(x is None for x in g):
-        raise SystemExit(f"{sum(x is None for x in g)} SFHA row_ids have no geometry in {a.haz}")
-    geoms.update(zip(new.tolist(), g))
+    already_read = np.fromiter(geoms, dtype=np.int64, count=len(geoms))
+    new = np.setdiff1d(every, already_read)
+    new_geoms = sp.read_geoms(args.state, new)
+    n_missing = sum(g is None for g in new_geoms)
+    if n_missing:
+        raise SystemExit(f"{n_missing} SFHA row_ids have no geometry in {args.haz}")
+    polygons = dict(geoms)
+    polygons.update(zip(new.tolist(), new_geoms))
 
-    li = pd.Index(lobes.lobe_id).get_indexer(vt.lobe_id)
-    own = lobes.src_row_id.to_numpy()[li]
+    lobe_of_vertex = pd.Index(lobes.lobe_id).get_indexer(vt.lobe_id)
+    own_row_id = lobes.src_row_id.to_numpy()[lobe_of_vertex]
     role = lobes.role.to_numpy()
-    lg = geom_array(lobes.geometry)
-    lcomp, vcomp = lobes.component.to_numpy(), vt.component.to_numpy()
+    lobe_geoms = geom_array(lobes.geometry)
+    lobe_comp, vertex_comp = lobes.component.to_numpy(), vt.component.to_numpy()
     x, y = vt.x.to_numpy(), vt.y.to_numpy()
-    crow = np.full(len(vt), -1, dtype=np.int64)
+    contact_row = np.full(len(vt), -1, dtype=np.int64)
     same = np.zeros(len(vt), dtype=bool)
-    n_multi = 0
-    for c, rows in cand.items():
-        vi = np.flatnonzero(vcomp == c)
-        pts = shapely.points(x[vi], y[vi])
-        tree = STRtree(pts)
-        pg = np.array([geoms[r] for r in rows], dtype=object)
-        pj, k = tree.query(pg, predicate="dwithin", distance=tol)
-        keep = rows[pj] != own[vi[k]]
-        pj, k = pj[keep], k[keep]
-        multi = np.bincount(k, minlength=len(vi))[k] > 1
-        n_multi += len(np.unique(k[multi]))
-        d = np.zeros(len(k))
-        d[multi] = shapely.distance(pts[k[multi]], pg[pj[multi]])
-        o = np.lexsort((rows[pj], d, k))
-        k, pj = k[o], pj[o]
-        first = np.r_[True, k[1:] != k[:-1]] if len(k) else np.zeros(0, bool)
-        crow[vi[k[first]]] = rows[pj[first]]
+    n_several = 0
+    for c, row_ids in cand.items():
+        # Vertices go in the tree and the polygons query it: shapely prepares the query
+        # geometry, so a vertex test against a huge polygon costs log n, not n.
+        comp_vertex = np.flatnonzero(vertex_comp == c)
+        vertex_pts = shapely.points(x[comp_vertex], y[comp_vertex])
+        tree = STRtree(vertex_pts)
+        polys = np.array([polygons[r] for r in row_ids], dtype=object)
+        v_ix, contact, n = nearest_contacts(tree, vertex_pts, polys, row_ids,
+                                            own_row_id[comp_vertex], tol)
+        contact_row[comp_vertex[v_ix]] = contact
+        n_several += n
 
-        lm = np.flatnonzero(lcomp == c)
-        lj, k = tree.query(lg[lm], predicate="dwithin", distance=tol)
-        mine = li[vi[k]]
-        same[vi[k[(lm[lj] != mine) & (role[lm[lj]] == role[mine])]]] = True
+        lobe_rows = np.flatnonzero(lobe_comp == c)
+        lobe_ix, v_ix = tree.query(lobe_geoms[lobe_rows], predicate="dwithin", distance=tol)
+        other_lobe = lobe_rows[lobe_ix]
+        vertex_lobe = lobe_of_vertex[comp_vertex[v_ix]]
+        same_role = (other_lobe != vertex_lobe) & (role[other_lobe] == role[vertex_lobe])
+        same[comp_vertex[v_ix[same_role]]] = True
 
-    has = crow >= 0
+    has = contact_row >= 0
+    lookup = np.where(has, contact_row, 0)       # row 0 stands in for none; masked below
     attrs = idx.set_index("row_id")
-    at = np.where(has, crow, 0)
+    zone = pd.Series(attrs.FLD_ZONE.reindex(lookup).to_numpy(), dtype="string")
+    zone_subty = subty(pd.Series(attrs.ZONE_SUBTY.reindex(lookup).to_numpy()))
     out = vt.assign(
-        contact_row_id=pd.Series(crow, dtype="Int64").mask(~has).array,
-        contact_zone=pd.Series(attrs.FLD_ZONE.reindex(at).to_numpy(), dtype="string")
-        .mask(~has).array,
-        contact_subty=subty(pd.Series(attrs.ZONE_SUBTY.reindex(at).to_numpy())).mask(~has).array,
+        contact_row_id=pd.Series(contact_row, dtype="Int64").mask(~has).array,
+        contact_zone=zone.mask(~has).array,
+        contact_subty=zone_subty.mask(~has).array,
         same_role_contact=same)
     note = (f"{len(every):,} SFHA polygons within {tol:g} m of a lobe bbox ({len(new):,} more "
-            f"read); {int(has.sum()):,} of {len(vt):,} vertices have a contact, {n_multi:,} "
+            f"read); {int(has.sum()):,} of {len(vt):,} vertices have a contact, {n_several:,} "
             f"of them several (nearest taken); {int(same.sum()):,} lie on another lobe of "
             f"their role ({time.time() - t0:.1f}s)")
     return out[VERTEX_COLS + CONTACT_COLS], note
 
 
 # ----------------------------------------------------------------- report
-def summarise(lobes, vt, bb, alt, plans, checks, a, pts) -> None:
-    nv = vt.groupby(["component", "role"]).size()
-    for c, pl in plans.items():
-        L = lobes[lobes.component == c]
-        n_pos = int((pts.label[pl["mask"]] == 1).sum())
-        per = L.groupby("role").perimeter_m.sum() / 1e3
-        print(f"\n--- component {c}: {int(pl['mask'].sum())} points ({n_pos} positive), "
-              f"tiles {';'.join(pl['tiles'])}", flush=True)
-        reg = L[L.role == "region"]
-        near_only = reg[~reg.from_positive.fillna(False).astype(bool)]
-        print(f"  region    {pl['n_region']:>6,} lobes from {reg.src_row_id.nunique():,} of "
-              f"{pl['n_polys']:,} polygons ({len(pl['from_pos'])} positives' source polygons, "
-              f"{pl['n_near']:,} within {a.near_m:g} m); perimeter {per.get('region', 0):,.0f} km, "
-              f"{near_only.perimeter_m.sum() / 1e3:,.0f} km of it on {len(near_only):,} lobes of "
-              f"near-only polygons; {int(reg.n_points.sum())} of {int(pl['mask'].sum())} "
-              f"points inside")
-        d = pl["dlogp"]
-        want = a.n_matched * pl["n_region"]
-        q = (f"; |dlog P| median {np.median(d):.3f}, max {d.max():.3f}" if len(d) else "")
-        print(f"  matched_A {pl['n_matched']:>6,} lobes of {want:,} wanted ({a.n_matched} per "
-              f"region lobe) from {pl['n_eligible']:,} eligible; perimeter "
-              f"{per.get('matched_A', 0):,.0f} km{q}")
-        fw = L[(L.role == "AE") & L.is_floodway]
-        print(f"  AE        {pl['n_ae']:>6,} lobes; perimeter {per.get('AE', 0):,.0f} km, "
-              f"{fw.perimeter_m.sum() / 1e3:,.0f} km of it on {len(fw):,} floodway lobes")
-        counts = [int(nv.get((c, r), 0)) for r in ROLES]
-        print(f"  vertices  " + " | ".join(f"{r} {k:,}" for r, k in zip(ROLES, counts))
-              + f" | total {sum(counts):,}")
-        V = vt[vt.component == c]
-        for r in ROLES:
-            w = V[V.role == r]
-            if not len(w):
-                continue
-            hc = w.contact_row_id.notna().to_numpy()
-            zs = w.contact_zone[hc].value_counts(normalize=True)
-            fwc = w.contact_subty[hc].str.contains(FLOODWAY, regex=False).fillna(False).mean()
-            print(f"  contacts  {r:<9} {1 - hc.mean():6.1%} SFHA-exterior; {hc.mean():.1%} on "
-                  f"another SFHA polygon within {a.contact_m:g} m ("
-                  + ", ".join(f"{z} {s:.0%}" for z, s in zs.head(4).items())
-                  + f"; floodway {fwc if hc.any() else 0:.0%}); {w.same_role_contact.mean():.1%}"
-                  f" on another {r} lobe")
-        ch, t = checks[c], checks[c]["all"]
-        print(f"  normals   {t['n']:,} sampled vertices, +-{PROBE_M:g} m probes: clear edges "
-              f"{t['ok_clear']:,}/{t['n_clear']:,} pass "
-              f"({t['ok_clear'] / max(t['n_clear'], 1):.3%}), "
-              f"{t['flipped_clear']} flipped -> assertion passed; all sampled "
-              f"{t['ok']:,}/{t['n']:,} pass ({t['ok'] / max(t['n'], 1):.2%}), "
-              f"{t['ambiguous']:,} ambiguous, {t['flipped']:,} flipped")
-        print("            by role (pass/n, clear pass/clear n): " + " | ".join(
-            f"{r} {ch[r]['ok']:,}/{ch[r]['n']:,}, {ch[r]['ok_clear']:,}/{ch[r]['n_clear']:,}"
-            for r in ROLES))
-        r = bb[bb.component == c].iloc[0]
-        rk = alt[c]
-        print(f"  bbox      {r.width_km:.1f} x {r.height_km:.1f} km = {r.area_km2:,.0f} km2 "
-              f"(lon {r.lon_min:.4f}..{r.lon_max:.4f}, lat {r.lat_min:.4f}..{r.lat_max:.4f}); "
-              f"region lobes alone + {a.bbox_buffer_m / 1e3:g} km: {rk['region_km'][0]:.1f} x "
-              f"{rk['region_km'][1]:.1f} km = {rk['region_km2']:,.0f} km2")
+def print_lobes(c: int, plan: dict, comp_lobes: pd.DataFrame, pts: pd.DataFrame, args) -> None:
+    """The header and the region, matched_A and AE lines of one component."""
+    n_points = int(plan["mask"].sum())
+    n_pos = int((pts.label[plan["mask"]] == 1).sum())
+    perimeter_km = comp_lobes.groupby("role").perimeter_m.sum() / 1e3
+    print(f"\n--- component {c}: {n_points} points ({n_pos} positive), "
+          f"tiles {';'.join(plan['tiles'])}", flush=True)
+
+    reg = comp_lobes[comp_lobes.role == "region"]
+    near_only = reg[~reg.from_positive.fillna(False).astype(bool)]
+    print(f"  region    {plan['n_region']:>6,} lobes from {reg.src_row_id.nunique():,} of "
+          f"{plan['n_polys']:,} polygons ({len(plan['from_pos'])} positives' source polygons, "
+          f"{plan['n_near']:,} within {args.near_m:g} m); perimeter "
+          f"{perimeter_km.get('region', 0):,.0f} km, {near_only.perimeter_m.sum() / 1e3:,.0f} km "
+          f"of it on {len(near_only):,} lobes of near-only polygons; "
+          f"{int(reg.n_points.sum())} of {n_points} points inside")
+
+    dlogp = plan["dlogp"]
+    want = args.n_matched * plan["n_region"]
+    spread = ""
+    if len(dlogp):
+        spread = f"; |dlog P| median {np.median(dlogp):.3f}, max {dlogp.max():.3f}"
+    print(f"  matched_A {plan['n_matched']:>6,} lobes of {want:,} wanted ({args.n_matched} per "
+          f"region lobe) from {plan['n_eligible']:,} eligible; perimeter "
+          f"{perimeter_km.get('matched_A', 0):,.0f} km{spread}")
+
+    floodway = comp_lobes[(comp_lobes.role == "AE") & comp_lobes.is_floodway]
+    print(f"  AE        {plan['n_ae']:>6,} lobes; perimeter {perimeter_km.get('AE', 0):,.0f} km, "
+          f"{floodway.perimeter_m.sum() / 1e3:,.0f} km of it on {len(floodway):,} floodway lobes")
+
+
+def print_vertices(c: int, comp_vt: pd.DataFrame, n_vertices: pd.Series, contact_m: float) -> None:
+    """Vertex counts by role, and each role's contact shares."""
+    counts = [int(n_vertices.get((c, r), 0)) for r in ROLES]
+    by_role = " | ".join(f"{r} {n:,}" for r, n in zip(ROLES, counts))
+    print(f"  vertices  {by_role} | total {sum(counts):,}")
+    for r in ROLES:
+        role_vt = comp_vt[comp_vt.role == r]
+        if not len(role_vt):
+            continue
+        has_contact = role_vt.contact_row_id.notna().to_numpy()
+        zone_shares = role_vt.contact_zone[has_contact].value_counts(normalize=True)
+        zones = ", ".join(f"{z} {share:.0%}" for z, share in zone_shares.head(4).items())
+        floodway_share = 0
+        if has_contact.any():
+            is_floodway = role_vt.contact_subty[has_contact].str.contains(FLOODWAY, regex=False)
+            floodway_share = is_floodway.fillna(False).mean()
+        print(f"  contacts  {r:<9} {1 - has_contact.mean():6.1%} SFHA-exterior; "
+              f"{has_contact.mean():.1%} on another SFHA polygon within {contact_m:g} m "
+              f"({zones}; floodway {floodway_share:.0%}); "
+              f"{role_vt.same_role_contact.mean():.1%} on another {r} lobe")
+
+
+def print_normals(check: dict) -> None:
+    """The inward-normal check of one component, overall and by role."""
+    total = check["all"]
+    print(f"  normals   {total['n']:,} sampled vertices, +-{PROBE_M:g} m probes: clear edges "
+          f"{total['ok_clear']:,}/{total['n_clear']:,} pass "
+          f"({total['ok_clear'] / max(total['n_clear'], 1):.3%}), "
+          f"{total['flipped_clear']} flipped -> assertion passed; all sampled "
+          f"{total['ok']:,}/{total['n']:,} pass ({total['ok'] / max(total['n'], 1):.2%}), "
+          f"{total['ambiguous']:,} ambiguous, {total['flipped']:,} flipped")
+    by_role = []
+    for r in ROLES:
+        by_role.append(f"{r} {check[r]['ok']:,}/{check[r]['n']:,}, "
+                       f"{check[r]['ok_clear']:,}/{check[r]['n_clear']:,}")
+    print("            by role (pass/n, clear pass/clear n): " + " | ".join(by_role))
+
+
+def print_bbox(box, region_only: dict, bbox_buffer_m: float) -> None:
+    """One component's analysis bbox, and the size of its region-lobes-only box."""
+    width_km, height_km = region_only["region_km"]
+    print(f"  bbox      {box.width_km:.1f} x {box.height_km:.1f} km = {box.area_km2:,.0f} km2 "
+          f"(lon {box.lon_min:.4f}..{box.lon_max:.4f}, lat {box.lat_min:.4f}..{box.lat_max:.4f}); "
+          f"region lobes alone + {bbox_buffer_m / 1e3:g} km: {width_km:.1f} x "
+          f"{height_km:.1f} km = {region_only['region_km2']:,.0f} km2")
+
+
+def summarise(lobes, vt, bb, region_only, plans, checks, args, pts) -> None:
+    """Print the report of every component, then the bbox totals."""
+    n_vertices = vt.groupby(["component", "role"]).size()
+    for c, plan in plans.items():
+        print_lobes(c, plan, lobes[lobes.component == c], pts, args)
+        print_vertices(c, vt[vt.component == c], n_vertices, args.contact_m)
+        print_normals(checks[c])
+        print_bbox(bb[bb.component == c].iloc[0], region_only[c], args.bbox_buffer_m)
     boxes = shapely.box(bb.minx, bb.miny, bb.maxx, bb.maxy)
+    union_km2 = shapely.union_all(boxes).area / 1e6
+    region_only_km2 = sum(v["region_km2"] for v in region_only.values())
     print(f"\n  analysis bboxes: {len(bb)}, sum of areas {bb.area_km2.sum():,.0f} km2, area of "
-          f"their union {shapely.union_all(boxes).area / 1e6:,.0f} km2; region-lobe-only boxes "
-          f"would sum to {sum(v['region_km2'] for v in alt.values()):,.0f} km2", flush=True)
+          f"their union {union_km2:,.0f} km2; region-lobe-only boxes would sum to "
+          f"{region_only_km2:,.0f} km2", flush=True)
 
 
 # ----------------------------------------------------------------- main
@@ -873,63 +902,86 @@ def main() -> int:
     ap.add_argument("--bbox-buffer-m", type=float, default=3000.0)
     ap.add_argument("--contact-m", type=float, default=0.5,
                     help="another SFHA polygon or same-role lobe this close to a vertex is a "
-                         "contact (decision 10)")
+                         "contact")
     ap.add_argument("--check-n", type=int, default=20_000,
                     help="vertices per component sampled for the inward-normal check")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--only-components", type=int, nargs="+",
+                    help="build lobes for these components only (each must have >= --min-size "
+                         "points); every selected point still counts as selected and every "
+                         "component's region lobes are still found, so the other components' "
+                         "polygons can never be matched_A. Default: all of them")
     ap.add_argument("--out", type=Path, help="default: results/<today>/boundary")
-    ap.add_argument("--overwrite", action="store_true")
-    a = ap.parse_args()
+    ap.add_argument("--overwrite", action="store_true",
+                    help="redo when all three outputs exist")
+    args = ap.parse_args()
     if not hasattr(shapely, "orient_polygons"):
         raise SystemExit(f"aotil/lobes.py needs shapely >= 2.1 (orient_polygons); this is "
                          f"{shapely.__version__}")
 
-    name = a.regions.name
+    name = args.regions.name
     if not name.endswith("_points.parquet"):
         raise SystemExit(f"{name}: expected <cell>_<variant>_S<S>_points.parquet")
     prefix = name[: -len("_points.parquet")]
-    comps_p = a.components or a.regions.with_name(f"{prefix}_components.csv")
-    a.idx = a.idx or PREP_DIR / f"idx_{a.state}.parquet"
-    a.haz = a.idx.parent / f"haz_{a.state}_5070.parquet"
-    out = a.out or Path("results") / date.today().isoformat() / "boundary"
+    comps_p = args.components or args.regions.with_name(f"{prefix}_components.csv")
+    args.idx = args.idx or PREP_DIR / f"idx_{args.state}.parquet"
+    args.haz = args.idx.parent / f"haz_{args.state}_5070.parquet"
+    out = args.out or Path("results") / date.today().isoformat() / "boundary"
     paths = {k: out / f"{prefix}_{k}.parquet" for k in ("lobes", "vertices", "bboxes")}
-    if all(p.exists() for p in paths.values()) and not a.overwrite:
-        print(f"{prefix}: outputs exist in {out}; skipping (--overwrite to redo)")
-        return 0
-    for p in (a.regions, a.idx, a.haz):
-        if not p.exists():
-            raise SystemExit(f"{p} missing")
-    sp.PREP_DIR = a.idx.parent       # read_geoms opens <PREP_DIR>/haz_<ST>_5070.parquet
+    if not args.regions.exists():
+        raise SystemExit(f"{args.regions} missing")
 
     t0 = time.time()
     print(f"=== lobes {prefix} ===", flush=True)
-    pts, big = read_regions(a.regions, comps_p, a.min_size)
+    pts, big = read_regions(args.regions, comps_p, args.min_size)
     print(f"  {len(pts)} selected points in {pts.component.nunique()} components; "
-          f"{len(big)} of >= {a.min_size} points: {big}", flush=True)
+          f"{len(big)} of >= {args.min_size} points: {big}", flush=True)
+    if args.only_components:
+        bad = sorted(set(args.only_components) - set(big))
+        if bad:
+            raise SystemExit(f"--only-components {bad}: not components of >= {args.min_size} "
+                             f"points (those are {big})")
+        big = [c for c in big if c in set(args.only_components)]
+        print(f"  --only-components: building {big} only", flush=True)
     if not big:
         raise SystemExit("no component is large enough; nothing to do")
-    xy, xy_note = point_xy(pts, a.dataset)
+    if all(p.exists() for p in paths.values()) and not args.overwrite:
+        # The file names do not say which components were built, so skip only when the
+        # existing bboxes table (one row per component) holds exactly these.
+        have = set(pq.read_table(paths["bboxes"], columns=["component"])
+                   .column("component").to_pylist())
+        if have != set(big):
+            raise SystemExit(f"{prefix}: outputs in {out} hold components {sorted(have)}, not "
+                             f"{big}; use another --out, or --overwrite to replace them")
+        print(f"{prefix}: outputs exist in {out}; skipping (--overwrite to redo)")
+        return 0
+    for p in (args.idx, args.haz):
+        if not p.exists():
+            raise SystemExit(f"{p} missing")
+    sp.PREP_DIR = args.idx.parent       # read_geoms opens <PREP_DIR>/haz_<ST>_5070.parquet
+    xy, xy_note = point_xy(pts, args.dataset)
     print(f"  point coordinates: {xy_note}", flush=True)
-    idx = pd.read_parquet(a.idx, columns=IDX_COLS)
+    idx = pd.read_parquet(args.idx, columns=IDX_COLS)
     if not np.array_equal(idx.row_id.to_numpy(), np.arange(len(idx))):
-        raise SystemExit(f"{a.idx.name}: row_id is not 0..n-1, which read_geoms' "
+        raise SystemExit(f"{args.idx.name}: row_id is not 0..n-1, which read_geoms' "
                          f"row-group lookup needs")
 
-    lobes, plans, geoms = build(pts, xy, big, idx, a)
+    lobes, plans, geoms = build(pts, xy, big, idx, args)
     print(f"  {len(lobes):,} lobes built ({time.time() - t0:.0f}s); densifying to "
-          f"{a.densify_m:g} m", flush=True)
-    vt, checks = vertices_and_checks(lobes, plans, a)
-    bb, alt = bbox_table(lobes, plans, a.bbox_buffer_m)
-    vt, note = contacts(lobes, vt, bb, idx, geoms, a)
+          f"{args.densify_m:g} m", flush=True)
+    vt, checks = vertices_and_checks(lobes, plans, args)
+    bb, region_only = bbox_table(lobes, plans, args.bbox_buffer_m)
+    vt, note = contacts(lobes, vt, bb, idx, geoms, args)
     print(f"  contacts: {note}", flush=True)
-    summarise(lobes, vt, bb, alt, plans, checks, a, pts)
+    summarise(lobes, vt, bb, region_only, plans, checks, args, pts)
 
     out.mkdir(parents=True, exist_ok=True)
     tables = dict(lobes=gpd.GeoDataFrame(lobes, geometry="geometry", crs=CRS_WORK),
                   vertices=vt, bboxes=bb)
-    for k, t in tables.items():
-        t.to_parquet(paths[k], index=False)
-        print(f"  wrote {paths[k]} ({len(t):,} rows, {paths[k].stat().st_size / 1e6:.1f} MB)")
+    for k, table in tables.items():
+        table.to_parquet(paths[k], index=False)
+        size_mb = paths[k].stat().st_size / 1e6
+        print(f"  wrote {paths[k]} ({len(table):,} rows, {size_mb:.1f} MB)")
     print(f"done in {time.time() - t0:.0f}s", flush=True)
     return 0
 

@@ -61,21 +61,26 @@ predicted. Recorded for diagnostics, never a feature.
 
 | feature | notes |
 |---|---|
-| `elev` | metres |
+| `elev` | metres. As built, never a feature: `pull_gee.py` `derive` renames it `meta_elev`, because absolute elevation identifies where a point is rather than whether it floods |
 | `slope` | degrees, `ee.Terrain.slope` |
-| `aspect` | degrees; use sin/cos, not the raw value |
+| `aspect` | degrees; use sin/cos, not the raw value. As built: `aspect_sin`, `aspect_cos`, NaN where slope < 0.5° (`derive`), raw value kept as `meta_aspect_raw` |
 | `curvature` | Laplacian of the DEM; no tuning constants |
 
 `.mosaic()` strips the projection and `ee.Terrain` silently returns null on an
 image without one, so the DEM must be given its native projection back with
-`setDefaultProjection()` before any terrain call. Sampling is at `scale=10`.
+`setDefaultProjection()` before any terrain call. Each point reads the cell of the
+source's own grid that contains it: `pull_gee.py` `sample_group` passes the source's
+projection as `crs` and no `scale` (since 2026-10-21; the earlier `scale=10` resampled
+onto a rescaled grid, which moved 3DEP reads by up to about 6.6 m and inflated slope by
+about 3%, and its `scale=90` moved about 42% of points to a neighbouring MERIT cell; the
+stored dataset keeps the old values until the Earth Engine pull is rerun).
 
 ### 2.2 Point-level hydrology — MERIT Hydro, ~90 m
 
 | feature | notes |
 |---|---|
 | `HAND` | height above nearest drainage, metres. The strongest single predictor in the flood-susceptibility literature, and it involves no division by a floored slope. |
-| `log1p_upa` | log upstream area. Labelled a **channel-proximity proxy**, not a contributing area — see §4. |
+| `log1p_upa` | log upstream area. Labelled a **channel-proximity proxy**, not a contributing area — see §4. As built: `log10_upa`, the upstream area floored at one MERIT cell (0.0081 km²) and then log10 (`pull_gee.py` `derive`); the pulled value is kept as `meta_log1p_upa` |
 
 ### 2.3 Catchment context — EPA StreamCat, per NHDPlusV2 catchment
 
@@ -83,7 +88,7 @@ Joined by COMID after a spatial join of points to NHDPlusV2 catchments.
 
 | feature | metric name | notes |
 |---|---|---|
-| wetness index | `WetIndexCat`, `WetIndexWs` | Mean Composite Topographic Index over the catchment (`Cat`) and the full upstream watershed (`Ws`). **Constant across a ~1–3 km² catchment**, so it is catchment context, not a point TWI. It must be described that way in the write-up. |
+| wetness index | `WetIndexCat`, `WetIndexWs` | Mean Composite Topographic Index over the catchment (`Cat`) and the full upstream watershed (`Ws`). **Constant across the whole catchment**, so it is catchment context, not a point TWI. It must be described that way in the write-up. (This note first said "a ~1–3 km² catchment"; in Florida the median catchment per point is 24.1 km², `FEATURE-SOURCES.md` §5.) |
 | base flow index | `BFICat`, `BFIWs` | % of streamflow from groundwater |
 | runoff | `RunoffCat`, `RunoffWs` | mm |
 | precipitation | `Precip8110Cat`, `Precip8110Ws` | PRISM 30-year normal, mm |
@@ -101,7 +106,7 @@ Cite: Hill, R.A. et al. (2016), *The Stream-Catchment (StreamCat) Dataset*, JAWR
 
 | feature | notes |
 |---|---|
-| `landcover` | categorical, one-hot or target-encode |
+| `landcover` | NLCD class code (15 codes, 11–95, in Florida). As built, all eight model families read it as a number: `aotil/zoo.py` does no one-hot or target encoding (`FEATURE-SOURCES.md` §7 item 7) |
 | `impervious` | % — also the urbanicity stratifier |
 
 ### 2.5 Still to assemble
@@ -111,6 +116,10 @@ Cite: Hill, R.A. et al. (2016), *The Stream-Catchment (StreamCat) Dataset*, JAWR
 | distance to nearest flowline | NHDPlus V2 flowlines | **needed** — this is the honest version of what `upa` is standing in for |
 | drainage density | NHDPlus V2 flowlines / catchment area | needed |
 | hydrologic soil group | gNATSGO via SDA REST, or `projects/sat-io/...` in GEE | optional; StreamCat soils may suffice |
+
+As built: distance to the nearest flowline and drainage density come from NHDPlus V2.1
+(`pull_hydro.py`), and no hydrologic soil group was added. `FEATURE-SOURCES.md` lists the
+45 features as built.
 
 ---
 
@@ -172,18 +181,24 @@ for an arbitrary DEM, so recomputing from 3DEP is not an option inside this stac
 So the wetness signal is split into pieces that are each defensible on their own:
 point-level `HAND`, catchment-level `WetIndexCat`/`WetIndexWs`, and point-level
 `slope`/`curvature` with no constants of ours in them. `upa` survives only as
-`log1p_upa`, described as channel proximity.
+`log1p_upa` (as built, `log10_upa`, §2.2), described as channel proximity.
 
-`check_ee.py` reproduces the arithmetic above on every run, so the decision stays
-checkable rather than becoming folklore.
+`check_ee.py`, the 2026-09-18 smoke test, reproduced the arithmetic above so the
+decision stayed checkable rather than becoming folklore. It was removed on 2026-10-21
+(kept in `Claude outputs/removed-2026-10-21/`). Today's smoke test is
+`pull_gee.py --selftest`, which samples the same three Vermont points but does not
+recompute TWI.
 
 ---
 
 ## 5. Splitting
 
-Every split — train/test, CV fold, OODSelect subset — is made on **`block_id`**
-(10 km grid cell), never on individual points. Points within a block share
-terrain, and several StreamCat variables are constant across a whole catchment, so
+The models' train/test split is made on **`tile_50km`**, a 50 km tile built from
+5 × 5 of the 10 km `block_id` grid cells (`aotil/zoo.py` `split_tiles`), never on
+individual points and never on `block_id`. (This note first said `block_id`; with
+10 km blocks, adjacent blocks land in different folds and a model can memorise a
+neighbourhood, so `pull_gee.py` `derive` adds the coarser tiles.) Points within a tile
+share terrain, and several StreamCat variables are constant across a whole catchment, so
 a random point split would put near-duplicates on both sides and reproduce the
 >0.95 AUCs the flood-susceptibility literature is criticised for.
 
@@ -193,6 +208,10 @@ temporal, spatial, hierarchical, or phylogenetic structure*, Ecography 40:913–
 ---
 
 ## 6. Order of work
+
+All six steps are done. Florida took only its three NHDPlus units (547 MB,
+`fetch_nhdplus_fl.sh`, `FEATURE-SOURCES.md` §8) instead of the 7.8 GB national download, and
+`docs/RUN-FL-V2.md` is the routine that runs them today.
 
 1. ~~Sample points~~ — `sample_points.py`, verified on Vermont.
 2. Spatial join points → NHDPlusV2 catchments (COMID). Needs the NHDPlus V2

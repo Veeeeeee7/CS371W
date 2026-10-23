@@ -1,38 +1,29 @@
 #!/usr/bin/env python3
-"""
-subset_nfhl.py -- national NFHL geodatabase -> per-state GeoParquet.
+"""Subset the national NFHL geodatabase into per-state GeoParquet files.
 
-Two passes, because they have very different cost:
-
-  PASS 1  attributes only (ignore_geometry=True), all states at once.
-          Seconds, no memory risk. Gives the go/no-go cross-check immediately.
-
-  PASS 2  geometry, ONE STATE AT A TIME, written per state.
-          Bounded memory. Resumable -- already-written states are skipped.
-
-Why the rewrite: reading all ten states' geometry in a single call segfaults.
-S_Fld_Haz_Ar across these states is on the order of a million features, some
-with >100 parts, and GDAL materialises the lot before handing it back. Chunking
-by state is the fix. Reading through /vsizip/ compounded it, so the archive now
-has to be extracted first.
-
-Extract with a ZIP64-capable tool -- NOT macOS unzip, which wraps at 2^32:
+Pass 1 reads the hazard-area attributes (no geometry) of all ten states in one query, writes
+data/interim/nfhl_haz_attrs_10state.parquet and checks each state's Zone A share against the
+share FEMA's REST service reported. Pass 2 reads geometry one state at a time into
+data/interim/nfhl_states/{haz,pan}_{ST}.parquet and skips states already written: reading every
+state's geometry in one call segfaults (about a million features, some with >100 parts), and so
+does reading through /vsizip/, so the archive must be extracted first, with a ZIP64-capable tool
+(macOS unzip wraps at 2^32 bytes):
 
     ditto -x -k data/raw/nfhl/NFHL_Key_Layers.gdb.zip data/raw/nfhl/
-    # or:  7z x data/raw/nfhl/NFHL_Key_Layers.gdb.zip -odata/raw/nfhl/
 
-Usage:
-    python subset_nfhl.py              # both passes
+    python subset_nfhl.py              # both passes, all ten states
     python subset_nfhl.py --attrs      # pass 1 only
-    python subset_nfhl.py FL TX        # geometry for specific states
+    python subset_nfhl.py FL           # pass 1, then geometry for FL only
 """
-from __future__ import annotations
-import os, sys, glob, time
+import glob
+import os
+import sys
+import time
 from pathlib import Path
 
-# Must be set before GDAL initialises. The >100-part polygons in this dataset
-# make the default ring-organisation path pathologically slow; FileGDB follows
-# the ESRI convention (outer ring CW, holes CCW), which is what ONLY_CCW assumes.
+# Must be set before GDAL initialises. The default ring organisation is pathologically slow on
+# the >100-part polygons here; FileGDB follows the ESRI convention (outer rings clockwise, holes
+# counter-clockwise), which is what ONLY_CCW assumes.
 os.environ.setdefault("OGR_ORGANIZE_POLYGONS", "ONLY_CCW")
 
 import geopandas as gpd
@@ -40,15 +31,19 @@ import pandas as pd
 import pyogrio
 
 RAW = Path("data/raw/nfhl")
-OUT = Path("data/interim/nfhl_states"); OUT.mkdir(parents=True, exist_ok=True)
+OUT = Path("data/interim/nfhl_states")
+ATTRS_OUT = Path("data/interim/nfhl_haz_attrs_10state.parquet")   # read by aotil/o5_polygons.py
 
 FIPS = {"FL": "12", "TX": "48", "LA": "22", "IA": "19", "MN": "27",
         "MO": "29", "AZ": "04", "CO": "08", "VT": "50", "NC": "37"}
+# Pass 2 order: smallest first, so a crash surfaces early and cheaply.
+GEOMETRY_ORDER = ["VT", "CO", "AZ", "MO", "MN", "IA", "LA", "NC", "TX", "FL"]
 
+# Zone A share (%) of the A + AE SFHA polygons per state, from FEMA's REST service.
 EXPECTED_A_SHARE = {"IA": 76.7, "FL": 60.9, "LA": 41.1, "TX": 28.9, "MN": 28.3,
                     "AZ": 21.5, "MO": 21.4, "VT": 20.5, "CO": 12.3, "NC": 0.7}
 
-# Everything we need downstream; skipping the rest cuts memory materially.
+# Only the columns needed downstream; skipping the rest cuts memory materially.
 HAZ_COLS = ["DFIRM_ID", "FLD_AR_ID", "STUDY_TYP", "FLD_ZONE", "ZONE_SUBTY",
             "SFHA_TF", "STATIC_BFE", "DEPTH", "V_DATUM", "DUAL_ZONE", "SOURCE_CIT"]
 PAN_COLS = ["DFIRM_ID", "FIRM_PAN", "PANEL", "SUFFIX", "PANEL_TYP",
@@ -56,6 +51,7 @@ PAN_COLS = ["DFIRM_ID", "FIRM_PAN", "PANEL", "SUFFIX", "PANEL_TYP",
 
 
 def find_gdb() -> str:
+    """The first extracted .gdb under RAW; exits with extraction instructions if there is none."""
     hits = sorted(glob.glob(str(RAW / "*.gdb")))
     if not hits:
         sys.exit(
@@ -69,31 +65,39 @@ def find_gdb() -> str:
 
 
 def resolve_layers(gdb: str) -> tuple[str, str]:
-    layers = [l[0] for l in pyogrio.list_layers(gdb)]
-    def pick(want: str) -> str:
-        for l in layers:
-            if l.lower() == want.lower():
-                return l
-        sys.exit(f"layer {want!r} not in {layers}")
-    return pick("S_Fld_Haz_Ar"), pick("S_FIRM_Pan")
+    """The hazard-area and FIRM-panel layer names as the GDB spells them (matched ignoring case)."""
+    names = [layer[0] for layer in pyogrio.list_layers(gdb)]
+    return _pick_layer(names, "S_Fld_Haz_Ar"), _pick_layer(names, "S_FIRM_Pan")
+
+
+def _pick_layer(names: list[str], want: str) -> str:
+    for name in names:
+        if name.lower() == want.lower():
+            return name
+    sys.exit(f"layer {want!r} not in {names}")
 
 
 def pass1_attributes(gdb: str, haz_layer: str) -> pd.DataFrame:
-    """All states, attributes only. Fast and safe."""
-    where = " OR ".join(f"DFIRM_ID LIKE '{f}%'" for f in FIPS.values())
-    print(f"\n[pass 1] attributes for all 10 states...")
+    """Every state's hazard-area attributes in one query (no geometry, so fast and safe),
+    written to ATTRS_OUT and checked against the expected Zone A shares."""
+    clauses = [f"DFIRM_ID LIKE '{fips}%'" for fips in FIPS.values()]
+    print(f"\n[pass 1] attributes for all {len(FIPS)} states...")
     t0 = time.time()
-    df = gpd.read_file(gdb, layer=haz_layer, where=where,
+    df = gpd.read_file(gdb, layer=haz_layer, where=" OR ".join(clauses),
                        columns=HAZ_COLS, ignore_geometry=True)
-    inv = {v: k for k, v in FIPS.items()}
-    df["STATE"] = df["DFIRM_ID"].str[:2].map(inv)
+    state_of_fips = {fips: abbr for abbr, fips in FIPS.items()}
+    df["STATE"] = df["DFIRM_ID"].str[:2].map(state_of_fips)
     print(f"  {len(df):,} rows in {time.time()-t0:.0f}s")
 
-    df.to_parquet("data/interim/nfhl_haz_attrs_10state.parquet")
+    df.to_parquet(ATTRS_OUT)
+    print_a_share_check(df)
+    return df
 
+
+def print_a_share_check(df: pd.DataFrame) -> None:
+    """Zone A share of each state's A + AE SFHA polygons, against EXPECTED_A_SHARE."""
     sfha = df[df["SFHA_TF"] == "T"]
-    tab = pd.crosstab(sfha["STATE"], sfha["FLD_ZONE"])
-    tab = tab[[c for c in ("A", "AE") if c in tab.columns]]
+    tab = pd.crosstab(sfha["STATE"], sfha["FLD_ZONE"])[["A", "AE"]]
     tab["A_share_%"] = (100 * tab["A"] / (tab["A"] + tab["AE"])).round(1)
     tab["expected_%"] = tab.index.map(EXPECTED_A_SHARE)
     tab["delta"] = (tab["A_share_%"] - tab["expected_%"]).round(1)
@@ -103,15 +107,18 @@ def pass1_attributes(gdb: str, haz_layer: str) -> pd.DataFrame:
     print("=" * 62)
     print(tab.to_string())
     worst = tab["delta"].abs().max()
-    print(f"\nmax delta {worst:.1f}pt "
-          f"({'OK' if worst <= 2 else 'INVESTIGATE -- filter or layer may be wrong'})")
+    verdict = "OK" if worst <= 2 else "INVESTIGATE -- filter or layer may be wrong"
+    print(f"\nmax delta {worst:.1f}pt ({verdict})")
     print("(national extract is 2026-03-03, REST is live, so ~1pt drift is normal)")
-    return df
 
 
 def pass2_geometry(gdb: str, haz_layer: str, pan_layer: str, states: list[str]) -> None:
+    """Hazard areas and FIRM panels with geometry, one state per read, each written at once.
+
+    A state whose two files exist is skipped, so a rerun after a crash resumes.
+    """
     for abbr in states:
-        fips = FIPS[abbr]
+        where = f"DFIRM_ID LIKE '{FIPS[abbr]}%'"
         haz_out = OUT / f"haz_{abbr}.parquet"
         pan_out = OUT / f"pan_{abbr}.parquet"
         if haz_out.exists() and pan_out.exists():
@@ -121,31 +128,29 @@ def pass2_geometry(gdb: str, haz_layer: str, pan_layer: str, states: list[str]) 
         print(f"\n[{abbr}] reading geometry...", flush=True)
         t0 = time.time()
         try:
-            haz = gpd.read_file(gdb, layer=haz_layer,
-                                where=f"DFIRM_ID LIKE '{fips}%'",
-                                columns=HAZ_COLS)
+            haz = gpd.read_file(gdb, layer=haz_layer, where=where, columns=HAZ_COLS)
             haz["STATE"] = abbr
             haz.to_parquet(haz_out)
 
-            pan = gpd.read_file(gdb, layer=pan_layer,
-                                where=f"DFIRM_ID LIKE '{fips}%'",
-                                columns=PAN_COLS)
+            pan = gpd.read_file(gdb, layer=pan_layer, where=where, columns=PAN_COLS)
             pan["STATE"] = abbr
             pan.to_parquet(pan_out)
 
             mb = (haz_out.stat().st_size + pan_out.stat().st_size) / 1e6
             print(f"  {len(haz):,} haz + {len(pan):,} panels, "
                   f"{mb:.0f} MB, {time.time()-t0:.0f}s  CRS={haz.crs}")
-        except Exception as e:
-            print(f"  FAILED: {type(e).__name__}: {e}", file=sys.stderr)
-            print(f"  -> rerun; completed states are skipped. If {abbr} keeps "
-                  f"failing it is the biggest one; see the note below.",
-                  file=sys.stderr)
+        except Exception as err:
+            print(f"  FAILED: {type(err).__name__}: {err}", file=sys.stderr)
+            print("  -> rerun; completed states are skipped.", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
     attrs_only = "--attrs" in argv
-    argv = [a for a in argv if not a.startswith("--")]
+    states = [arg for arg in argv if not arg.startswith("--")]    # any other --flag is ignored
+    OUT.mkdir(parents=True, exist_ok=True)
 
     gdb = find_gdb()
     print(f"gdb: {gdb}")
@@ -156,18 +161,16 @@ def main(argv: list[str]) -> int:
     if attrs_only:
         return 0
 
-    # Smallest first, so a crash surfaces early and cheaply.
-    order = ["VT", "CO", "AZ", "MO", "MN", "IA", "LA", "NC", "TX", "FL"]
-    states = argv or order
-    bad = [s for s in states if s not in FIPS]
-    if bad:
-        sys.exit(f"unknown states: {bad}")
+    states = states or GEOMETRY_ORDER
+    unknown = [state for state in states if state not in FIPS]
+    if unknown:
+        sys.exit(f"unknown states: {unknown}")
 
     pass2_geometry(gdb, haz_layer, pan_layer, states)
 
     done = sorted(p.stem.split("_")[1] for p in OUT.glob("haz_*.parquet"))
-    print(f"\ncomplete: {len(done)}/10 states -> {done}")
-    if len(done) < 10:
+    print(f"\ncomplete: {len(done)}/{len(FIPS)} states -> {done}")
+    if len(done) < len(FIPS):
         print("rerun to continue; finished states are skipped.")
     return 0
 

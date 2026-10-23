@@ -1,29 +1,22 @@
 #!/usr/bin/env bash
-# fetch_nhdplus_fl.sh -- NHDPlus V2.1 for Florida only: VPUs 03N, 03S, 03W.
+# fetch_nhdplus_fl.sh -- download and extract NHDPlus V2.1 for Florida: VPUs 03N, 03S, 03W.
 #
-# 547 MB in nine archives, against 7.81 GB (about 20 GB extracted) for the national
-# seamless geodatabase that fetch_nhdplus.sh pulls. Every Florida catchment lies in
-# Region 03 (HUC4 0301-0318), split by EPA into 03N (0301-0307), 03S (0308-0310)
-# and 03W (0311-0318). Three layers per unit are what pull_hydro.py reads:
+# Every Florida catchment lies in Region 03, split into units 03N, 03S and 03W (547 MB in
+# nine archives). Per unit, only the files pull_hydro.py needs are extracted:
 #   NHDSnapshot        NHDFlowline: COMID, FTYPE, LENGTHKM + geometry
 #   NHDPlusAttributes  PlusFlowlineVAA (StreamOrde, TotDASqKM), elevslope (SLOPE)
 #   NHDPlusCatchment   Catchment: FEATUREID, AreaSqKM + geometry
-# prep_nhdplus_units.py then joins them into the one geodatabase pull_hydro.py
-# expects.
+# into data/raw/nhdplus/<unit>/<layer>/; prep_nhdplus_units.py then builds the geodatabase.
+# Finished downloads and extractions are skipped on a rerun.
 #
-# Same single-connection resume loop as fetch_nhdplus.sh. Sizes are the S3
-# Content-Length values checked 2026-10-14. Each archive is extracted only for
-# the members above, into its own folder:
-#     data/raw/nhdplus/03N/NHDSnapshot/ ...
-#
-#     ./fetch_nhdplus_fl.sh            # download, test, extract; skips finished work
+#     ./fetch_nhdplus_fl.sh
 
 set -uo pipefail
 
 BASE="https://dmap-data-commons-ow.s3.amazonaws.com/NHDPlusV21/Data/NHDPlusSA"
 DEST_DIR="data/raw/nhdplus"
 
-# unit  layer               file                                           bytes
+# unit  layer           archive                                     bytes (S3 Content-Length)
 FILES="
 03N NHDSnapshot       NHDPlusV21_SA_03N_NHDSnapshot_04.7z         56396271
 03N NHDPlusAttributes NHDPlusV21_SA_03N_NHDPlusAttributes_07.7z   13780514
@@ -46,6 +39,7 @@ members() {
     esac
 }
 
+# Resume the download until the file has its known size; give up after 20 attempts.
 fetch() {   # url dest bytes
     local url=$1 dest=$2 expect=$3 attempt=0 have
     while : ; do
@@ -60,7 +54,6 @@ fetch() {   # url dest bytes
     done
 }
 
-total=0
 echo "$FILES" | while read -r unit layer file bytes; do
     [ -z "$unit" ] && continue
     dl="$DEST_DIR/archives"
@@ -68,6 +61,7 @@ echo "$FILES" | while read -r unit layer file bytes; do
     mkdir -p "$dl" "$out"
     echo "$file ($(printf "%'d" "$bytes") bytes)"
     fetch "$BASE/NHDPlus$unit/$file" "$dl/$file" "$bytes" || exit 1
+    # .extracted marks a finished extraction (check_gis_inputs.py reads it too).
     if [ -f "$out/.extracted" ]; then
         echo "  extracted already"
         continue

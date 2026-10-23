@@ -1,44 +1,19 @@
 #!/usr/bin/env python3
-"""
-Summarise the paper-protocol OODSelect runs (oodselect_paper.py) the way the
-paper reports them, per cell and variant, plus the classic-vs-spatial contrast.
+"""Summarise the paper-protocol OODSelect runs (oodselect_paper.py) per cell and variant.
 
-Reads   <root>/<variant>/<cell>_S<budget>_{result.csv,theta.npy}
-Writes  <root>/<variant>/<cell>_summary.csv     one row per budget + the full set
-        <root>/<variant>/<cell>_jaccard.csv     the paper's Eq. 6 consistency
-        <root>/<cell>_model_convergence.csv     the paper's model-count rule
-        <root>/<cell>_comparison.csv            classic vs spatial, when both exist
+Reads   <root>/<variant>/<cell>_S<budget>_{result.csv,theta.npy}, and the cell from --cells
+Writes  <root>/<variant>/<cell>_summary.csv   one row per budget, plus the full OOD set
+        <root>/<variant>/<cell>_jaccard.csv   consistency across budgets (the paper's Eq. 6)
+        <root>/<cell>_model_convergence.csv   the paper's model-count rule
+        <root>/<cell>_comparison.csv          classic vs spatial per budget, when both exist
+Control variants (_null<N>, _trees2others, _others2trees) are scored on the split their
+result.csv records and are left out of the comparison, which needs one shared split.
+Unlike the authors' plotting script, which plots size n from the selection trained at the
+next larger size, each budget is reported from its own selection, with a Fisher interval
+over the test models.
 
-WHAT EACH COLUMN IS, AND ITS SOURCE
------------------------------------
-r_test        OODSelect's subset on the held-out TEST models, the authors'
-              TestSetFinder.test (probit Pearson with their eps). Fisher 95% CI
-              over the test models (the paper's "Fisher z-intervals").
-random_*      100 uniformly random subsets of the same size (Table 4: "we
-              randomly select N subsets"): mean r, sd, and the Fisher-mean
-              tanh(mean arctanh r) the authors' plotting code uses.
-hard_r        The N most-misclassified points, ranked by 1 - mean correctness
-              over the TEST models -- exactly generate_correlation_plots.py.
-              At small N this is 0 BY CONSTRUCTION: the top-ranked points are
-              wrong for every test model, so subset accuracy is constant, the
-              probit of it has zero variance, and the eps-regularised r is 0.
-              Read the paper's "most misclassified is near zero" with that in
-              mind; the baseline only carries information once N is large
-              enough to include points some test models get right.
-hard_sel_r    The same ranking from the SELECTION models only. Not in the paper;
-              it is this project's standing control (a ranking built from the
-              models it is scored on is scored on models it has already seen).
-aotil         r_test <= -0.3, the paper's threshold; the summary also prints the
-              largest AoTIL budget, the quantity in the paper's Table 1.
-coh_*         Coherence on the kNN graph (graph.coherence_metrics). Reported for
-              the classic run too, which never sees the graph -- that is the
-              baseline the spatial run is judged against.
-
-NOT REPRODUCED FROM THE AUTHORS' PLOTTING SCRIPT: it reports the size-n point
-using the selection trained at the NEXT larger size, with "error bars" from
-permute_top_k, which permutes values within the top-n and so leaves the top-n
-set unchanged. Here each budget is reported from its own selection, with a
-Fisher interval over test models.
+Example: python aotil/report_paper.py --root results/<date>/oodselect_paper \\
+             --cells data/interim/aotil/cells --tags FL_band_AE_s0 FL_band_A_s0
 """
 from __future__ import annotations
 
@@ -50,55 +25,88 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import graph  # noqa: E402
 import oodselect_paper as op  # noqa: E402
 
-N_RANDOM = 100
+N_RANDOM = 100        # random subsets per budget (the paper's Table 4)
+N_TIE_BREAKS = 100    # random tie orders for the most-misclassified baselines
+N_RANDOM_PURITY = 5   # random subsets per budget for the purity baseline
+COHERENCE_COLUMNS = ("coh_purity", "coh_n_cc", "coh_largest_cc_frac", "coh_tiles")
 
 
 def fisher_mean(rs) -> float:
+    """tanh(mean(arctanh r)) over the finite r, as the authors' plotting code averages."""
     rs = np.asarray(rs, float)
     rs = rs[np.isfinite(rs)]
-    return float(np.tanh(np.mean(np.arctanh(np.clip(rs, -0.999, 0.999))))) if len(rs) else np.nan
+    if len(rs) == 0:
+        return np.nan
+    return float(np.tanh(np.mean(np.arctanh(np.clip(rs, -0.999, 0.999)))))
 
 
 def top_mask(score: np.ndarray, k: int) -> np.ndarray:
+    """Mask of the k highest scores; ties go to the lower index."""
     m = np.zeros(len(score), bool)
     m[np.argsort(-score, kind="stable")[:k]] = True
     return m
 
 
-def normalised_jaccard(masks: list[np.ndarray], n_sim: int = 200, seed: int = 0) -> dict:
-    """Eq. 6: (J_bar - J_min) / (J_max - J_min) over consecutive budgets.
+def tie_broken_masks(score: np.ndarray, k: int, n: int, rng) -> list[np.ndarray]:
+    """Top-k masks of score with ties at the k-th value broken in random order:
+    one mask when nothing ties across the cut, otherwise n, one per order."""
+    m = top_mask(score, k)
+    if not (score[~m] == score[m].min()).any():
+        return [m]
+    masks = []
+    for _ in range(n):
+        order = rng.permutation(len(score))
+        mask = np.zeros(len(score), bool)
+        mask[order[np.argsort(-score[order], kind="stable")[:k]]] = True
+        masks.append(mask)
+    return masks
 
-    J_min: random selections of the same sizes. J_max: a nested sequence of the
-    same sizes (z_k subset of z_k+1), for which J(z_k, z_k+1) = |z_k| / |z_k+1|.
+
+def jaccard(a: np.ndarray, b: np.ndarray) -> float:
+    """Plain Jaccard index of two boolean masks (not graph.jaccard's chance-normalised one)."""
+    union = (a | b).sum()
+    if union == 0:
+        return np.nan
+    return (a & b).sum() / union
+
+
+def normalised_jaccard(masks: list[np.ndarray], n_sim: int = 200, seed: int = 0) -> dict:
+    """Eq. 6: (J_bar - J_min) / (J_max - J_min), J averaged over consecutive budgets.
+
+    J_min: random selections of the same sizes. J_max: a nested sequence of the same sizes
+    (z_k a subset of z_k+1), for which J(z_k, z_k+1) = |z_k| / |z_k+1|.
     """
     masks = sorted(masks, key=lambda m: m.sum())
     if len(masks) < 2:
         return dict(J_bar=np.nan, J_min=np.nan, J_max=np.nan, J_norm=np.nan, T=len(masks))
     d = len(masks[0])
     sizes = [int(m.sum()) for m in masks]
+    n_pairs = len(masks) - 1
 
-    def J(a, b):
-        u = (a | b).sum()
-        return (a & b).sum() / u if u else np.nan
-
-    j_bar = np.mean([J(masks[i], masks[i + 1]) for i in range(len(masks) - 1)])
-    j_max = np.mean([sizes[i] / sizes[i + 1] for i in range(len(sizes) - 1)])
+    j_bar = np.mean([jaccard(masks[i], masks[i + 1]) for i in range(n_pairs)])
+    j_max = np.mean([sizes[i] / sizes[i + 1] for i in range(n_pairs)])
     rng = np.random.default_rng(seed)
     sims = []
     for _ in range(n_sim):
-        rm = [np.isin(np.arange(d), rng.choice(d, s, replace=False)) for s in sizes]
-        sims.append(np.mean([J(rm[i], rm[i + 1]) for i in range(len(rm) - 1)]))
+        random_masks = []
+        for s in sizes:
+            random_masks.append(np.isin(np.arange(d), rng.choice(d, s, replace=False)))
+        sims.append(np.mean([jaccard(random_masks[i], random_masks[i + 1])
+                             for i in range(n_pairs)]))
     j_min = float(np.mean(sims))
-    return dict(J_bar=float(j_bar), J_min=j_min, J_max=float(j_max),
-                J_norm=float((j_bar - j_min) / (j_max - j_min)) if j_max > j_min else np.nan,
-                T=len(masks), sizes=" ".join(map(str, sizes)))
+    j_norm = np.nan
+    if j_max > j_min:
+        j_norm = float((j_bar - j_min) / (j_max - j_min))
+    return dict(J_bar=float(j_bar), J_min=j_min, J_max=float(j_max), J_norm=j_norm,
+                T=len(masks), sizes=" ".join(str(s) for s in sizes))
 
 
 def model_convergence(acc_id, Z, step: int = 10, n_orders: int = 25, seed: int = 0):
-    """The paper's model-count rule, on the full OOD set: add models until the
-    ID-OOD correlation changes by less than 1%. Averaged over random orders."""
+    """The paper's model-count rule on the full OOD set: add models until the ID-OOD
+    correlation changes by less than 1%. Averaged over random model orders."""
     from scipy.stats import norm
     x = norm.ppf(np.clip(acc_id, op.EPS, 1 - op.EPS))
     a = norm.ppf(np.clip(Z.mean(1), op.EPS, 1 - op.EPS))
@@ -114,9 +122,10 @@ def model_convergence(acc_id, Z, step: int = 10, n_orders: int = 25, seed: int =
             if n >= 4:
                 R[o, j] = np.corrcoef(x[perm[:n]], a[perm[:n]])[0, 1]
     r_mean = np.nanmean(R, 0)
-    rel = np.r_[np.nan, np.abs(np.diff(r_mean)) / np.maximum(np.abs(r_mean[:-1]), 1e-12)]
+    step_change = np.abs(np.diff(r_mean)) / np.maximum(np.abs(r_mean[:-1]), 1e-12)
+    rel = np.concatenate([[np.nan], step_change])
     df = pd.DataFrame(dict(n_models=sizes, r_mean=r_mean, r_sd=np.nanstd(R, 0), rel_change=rel))
-    # first size from which every later step moves the correlation by < 1%
+    # The first size from which every later step moves the correlation by < 1%.
     ok = (df.rel_change < 0.01).to_numpy()
     n_needed = np.nan
     for j in range(1, len(ok)):
@@ -128,83 +137,172 @@ def model_convergence(acc_id, Z, step: int = 10, n_orders: int = 25, seed: int =
     return df
 
 
+def mask_purity(mask: np.ndarray, A, knn: int, cell) -> float:
+    """Coherence purity of a mask on the kNN graph; NaN for a cell without lon/lat (A None)."""
+    if A is None:
+        return np.nan
+    metrics = graph.coherence_metrics(mask, A, knn, tiles=cell.tile_50km, blocks=cell.block_id)
+    return metrics["purity"]
+
+
 def summarise(root: Path, variant: str, tag: str, cells_dir: str, knn: int | None):
+    """Write and print <tag>_summary.csv and <tag>_jaccard.csv for one variant folder.
+    Returns (summary, {budget: selected mask}), or (None, {}) when the folder has no runs."""
     vdir = root / variant
-    rows = [pd.read_csv(p) for p in sorted(vdir.glob(f"{tag}_S*_result.csv"))]
-    if not rows:
+    frames = [pd.read_csv(p) for p in sorted(vdir.glob(f"{tag}_S*_result.csv"))]
+    if not frames:
         return None, {}
-    res = pd.concat(rows, ignore_index=True).sort_values("budget").reset_index(drop=True)
-    knn = int(res.knn.iloc[0]) if knn is None else knn
+    runs = pd.concat(frames, ignore_index=True)
+    runs = runs.sort_values("budget").reset_index(drop=True)
+    if knn is None:
+        knn = int(runs.knn.iloc[0])
 
     cell, Z, acc, info = op.load_paper_cell(cells_dir, tag)
-    tr, va, te = op.model_split(info["n_models"])
+    controls = set()
+    for _, result in runs.iterrows():
+        rule, null_seed, run_seed = op.run_controls(result)
+        if rule == "random":
+            run_seed = 0             # the seed only moves a family split
+        controls.add((rule, null_seed, run_seed))
+    if len(controls) > 1:
+        raise SystemExit(f"{vdir}: result.csv files disagree on (split, null seed, seed): "
+                         f"{sorted(controls, key=str)}")
+    rule, null_seed, run_seed = controls.pop()
+    if "variant" in runs:
+        named = set(runs.variant.astype(str))
+    else:
+        named = {variant}
+    if named != {variant}:
+        # A run copied into the wrong folder would be summarised as that folder's variant.
+        raise SystemExit(f"{vdir}: result.csv files name variant(s) {sorted(named)}, "
+                         f"not the folder's {variant!r}")
+    selection, _, test = op.make_split(info["n_models"], rule, cell.models.kind.to_numpy(),
+                                       run_seed)
     d = info["d"]
-    Zte, ate = Z[te], acc[te]
+    Z_test, acc_test = Z[test], acc[test]
     A = None
     if cell.has_spatial():
-        import graph
         A = graph.build_adjacency(cell.lon, cell.lat, k=knn)
 
-    def coh(mask):
-        if A is None:
-            return {}
-        import graph
-        cm = graph.coherence_metrics(mask, A, knn, tiles=cell.tile_50km, blocks=cell.block_id)
-        return cm
-
+    # Baselines per budget:
+    # random_*    N_RANDOM uniformly random subsets of the same size (the paper's Table 4):
+    #             mean r, sd, and the Fisher mean the authors' plotting code uses.
+    # hard_r      the S most-misclassified points, ranked by 1 - mean correctness over the test
+    #             models, as generate_correlation_plots.py does. At small S it is 0 by
+    #             construction: those points are wrong for every test model, so the subset
+    #             accuracy is constant. The score is a multiple of 1/n_test, so many points tie
+    #             at the cut, and the cell's columns put every y = 0 point first: hard_r,
+    #             hard_purity and overlap_hard are means over N_TIE_BREAKS random tie orders.
+    # hard_sel_r  the same ranking from the selection models (not in the paper), so it is
+    #             scored on models its ranking has not seen.
+    # coh_* (from result.csv) is reported for the classic run too, which never sees the graph:
+    # it is the baseline the spatial run is judged against.
     rng = np.random.default_rng(0)
-    hard_score = 1.0 - Zte.mean(0)                 # generate_correlation_plots.py
-    hard_sel_score = 1.0 - Z[tr].mean(0)
-    masks, out = {}, []
-    for _, r in res.iterrows():
-        S = int(r.budget)
+    tie_rng = np.random.default_rng(1)
+    hard_score = 1.0 - Z_test.mean(0)
+    hard_sel_score = 1.0 - Z[selection].mean(0)
+    masks = {}
+    rows = []
+    for _, result in runs.iterrows():
+        S = int(result.budget)
         theta = np.load(vdir / f"{tag}_S{S}_theta.npy")
-        m = top_mask(theta, S)
-        masks[S] = m
-        rr = [op.hard_corr(Zte, ate, top_mask(rng.random(d), S), S, is_mask=True)
-              for _ in range(N_RANDOM)]
-        rand_pur = [coh(top_mask(rng.random(d), S)).get("purity", np.nan) for _ in range(5)]
-        mh = top_mask(hard_score, S)
-        mhs = top_mask(hard_sel_score, S)
-        row = r.to_dict()
+        selected = top_mask(theta, S)
+        masks[S] = selected
+        random_rs = []
+        for _ in range(N_RANDOM):
+            random_mask = top_mask(rng.random(d), S)
+            random_rs.append(op.hard_corr(Z_test, acc_test, random_mask, S, is_mask=True))
+        random_purities = []
+        for _ in range(N_RANDOM_PURITY):
+            random_mask = top_mask(rng.random(d), S)
+            random_purities.append(mask_purity(random_mask, A, knn, cell))
+        hard_masks = tie_broken_masks(hard_score, S, N_TIE_BREAKS, tie_rng)
+        hard_sel_masks = tie_broken_masks(hard_sel_score, S, N_TIE_BREAKS, tie_rng)
+        hard_rs, hard_purities, overlaps = [], [], []
+        for hard_mask in hard_masks:
+            hard_rs.append(op.hard_corr(Z_test, acc_test, hard_mask, S, is_mask=True))
+            hard_purities.append(mask_purity(hard_mask, A, knn, cell))
+            overlaps.append((selected & hard_mask).sum() / S)
+        hard_sel_rs = []
+        for hard_mask in hard_sel_masks:
+            hard_sel_rs.append(op.hard_corr(Z_test, acc_test, hard_mask, S, is_mask=True))
+        row = result.to_dict()
         row.update(
-            random_r_mean=float(np.mean(rr)), random_r_sd=float(np.std(rr)),
-            random_r_fisher=fisher_mean(rr), random_purity=float(np.nanmean(rand_pur)),
-            hard_r=op.hard_corr(Zte, ate, mh, S, is_mask=True),
-            hard_sel_r=op.hard_corr(Zte, ate, mhs, S, is_mask=True),
-            hard_purity=coh(mh).get("purity", np.nan),
-            overlap_hard=float((m & mh).sum() / S),
+            random_r_mean=float(np.mean(random_rs)), random_r_sd=float(np.std(random_rs)),
+            random_r_fisher=fisher_mean(random_rs),
+            random_purity=float(np.nanmean(random_purities)),
+            hard_r=float(np.mean(hard_rs)), hard_sel_r=float(np.mean(hard_sel_rs)),
+            hard_purity=float(np.mean(hard_purities)), overlap_hard=float(np.mean(overlaps)),
         )
-        out.append(row)
-    full = dict(cell=tag, variant=variant, budget=d, d=d, frac=1.0,
-                r_test=op.hard_corr(Zte, ate, np.ones(d, np.float32), d, is_mask=True),
-                random_r_mean=np.nan, hard_r=np.nan, n_test=len(te))
-    full["r_test_ci_lo"], full["r_test_ci_hi"] = op.fisher_ci(full["r_test"], len(te))
-    summ = pd.DataFrame(out + [full])
-    summ.to_csv(vdir / f"{tag}_summary.csv", index=False)
+        rows.append(row)
+    full = dict(cell=tag, variant=variant, split=rule, null_seed=null_seed,
+                budget=d, d=d, frac=1.0,
+                r_test=op.hard_corr(Z_test, acc_test, np.ones(d, np.float32), d, is_mask=True),
+                random_r_mean=np.nan, hard_r=np.nan, n_test=len(test))
+    full["r_test_ci_lo"], full["r_test_ci_hi"] = op.fisher_ci(full["r_test"], len(test))
+    summary = pd.DataFrame(rows + [full])
+    summary.to_csv(vdir / f"{tag}_summary.csv", index=False)
 
     jac = normalised_jaccard(list(masks.values()))
-    pd.DataFrame([dict(cell=tag, variant=variant, **jac)]).to_csv(
-        vdir / f"{tag}_jaccard.csv", index=False)
+    jaccard_row = dict(cell=tag, variant=variant, **jac)
+    pd.DataFrame([jaccard_row]).to_csv(vdir / f"{tag}_jaccard.csv", index=False)
 
-    aot = res[res.r_test <= -0.3]
-    largest = int(aot.budget.max()) if len(aot) else 0
-    print(f"\n=== {tag} | {variant} | d = {d} | test models {len(te)} ===")
+    aotil_runs = runs[runs.r_test <= op.AOTIL_THRESHOLD]
+    largest = 0
+    if len(aotil_runs):
+        largest = int(aotil_runs.budget.max())
+    split_note = f"split {rule}"
+    if null_seed is not None:
+        split_note += f", null seed {null_seed}"
+    print(f"\n=== {tag} | {variant} | d = {d} | test models {len(test)} ({split_note}) ===")
     cols = ["budget", "frac", "r_test", "r_test_ci_lo", "r_test_ci_hi", "spearman_test",
             "random_r_mean", "hard_r", "hard_sel_r"]
-    cols += [c for c in ("coh_purity", "coh_n_cc", "coh_largest_cc_frac", "coh_tiles")
-             if c in summ]
+    cols += [c for c in COHERENCE_COLUMNS if c in summary]
     with pd.option_context("display.width", 200, "display.max_columns", 30,
                            "display.float_format", "{:+.3f}".format):
-        print(summ[cols].to_string(index=False))
-    print(f"  largest AoTIL subset (r_test <= -0.3): {largest} of {d} "
+        print(summary[cols].to_string(index=False))
+    # The largest AoTIL budget is the quantity in the paper's Table 1.
+    print(f"  largest AoTIL subset (r_test <= {op.AOTIL_THRESHOLD}): {largest} of {d} "
           f"({largest / d:.1%})")
     print(f"  normalised Jaccard across budgets (Eq. 6): {jac['J_norm']:.3f} "
           f"(J_bar {jac['J_bar']:.3f}, random {jac['J_min']:.3f}, nested {jac['J_max']:.3f})")
-    missing = [b for b in op.budgets_for(d) if b not in set(res.budget)]
+    done = set(runs.budget)
+    missing = [b for b in op.budgets_for(d) if b not in done]
     if missing:
         print(f"  MISSING budgets (task failed or still running): {missing}")
-    return summ, masks
+    return summary, masks
+
+
+def is_control(summary: pd.DataFrame) -> bool:
+    """True for a null-select or family-split run (oodselect_paper.py, TWO CONTROLS)."""
+    return op.run_controls(summary.iloc[0])[:2] != ("random", None)
+
+
+def comparison_rows(tag: str, d: int, summaries: dict, masks: dict) -> list[dict]:
+    """classic vs each spatial variant on the random split, at every budget both selected."""
+    classic = summaries["classic"].set_index("budget")
+    rows = []
+    for variant, summary in summaries.items():
+        if variant == "classic" or is_control(summary):
+            continue
+        spatial = summary.set_index("budget")
+        for b in sorted(set(classic.index) & set(spatial.index)):
+            if b not in masks["classic"] or b not in masks[variant]:
+                continue                   # the full-set row has no selection
+            overlap = jaccard(masks["classic"][b], masks[variant][b])
+            row = dict(cell=tag, variant=variant, budget=b, frac=b / d,
+                       r_test_classic=classic.at[b, "r_test"],
+                       r_test_spatial=spatial.at[b, "r_test"],
+                       cost_of_coherence=spatial.at[b, "r_test"] - classic.at[b, "r_test"],
+                       jaccard_masks=float(overlap),
+                       random_r=classic.at[b, "random_r_mean"],
+                       hard_r=classic.at[b, "hard_r"])
+            for c in COHERENCE_COLUMNS:
+                if c in classic and c in spatial:
+                    row[f"{c}_classic"] = classic.at[b, c]
+                    row[f"{c}_spatial"] = spatial.at[b, c]
+            rows.append(row)
+    return rows
 
 
 def main() -> int:
@@ -215,12 +313,14 @@ def main() -> int:
     ap.add_argument("--tags", nargs="+", required=True)
     ap.add_argument("--variants", nargs="*", default=None,
                     help="default: every subdirectory of --root")
-    a = ap.parse_args()
-    root = Path(a.root)
-    variants = a.variants or sorted(p.name for p in root.iterdir() if p.is_dir())
+    args = ap.parse_args()
+    root = Path(args.root)
+    variants = args.variants
+    if not variants:
+        variants = sorted(p.name for p in root.iterdir() if p.is_dir())
 
-    for tag in a.tags:
-        cell, Z, acc, info = op.load_paper_cell(a.cells, tag)
+    for tag in args.tags:
+        _, Z, acc, info = op.load_paper_cell(args.cells, tag)
         conv = model_convergence(acc, Z)
         conv.to_csv(root / f"{tag}_model_convergence.csv", index=False)
         print(f"\n##### {tag}: {info['n_models']} models, {info['d']} OOD points; "
@@ -228,47 +328,36 @@ def main() -> int:
               f"full-set ID->OOD r (all models) {conv.r_all_models.iloc[0]:+.3f}; "
               f"paper's <1% model-count rule met at {conv.n_needed.iloc[0]} models")
 
-        summaries, masks = {}, {}
-        for v in variants:
-            s, m = summarise(root, v, tag, a.cells, None)
-            if s is not None:
-                summaries[v], masks[v] = s, m
+        summaries = {}
+        masks = {}
+        for variant in variants:
+            summary, variant_masks = summarise(root, variant, tag, args.cells, None)
+            if summary is not None:
+                summaries[variant] = summary
+                masks[variant] = variant_masks
 
-        if "classic" in summaries and len(summaries) > 1:
-            base = summaries["classic"].set_index("budget")
-            rows = []
-            for v, s in summaries.items():
-                if v == "classic":
-                    continue
-                s = s.set_index("budget")
-                for b in sorted(set(base.index) & set(s.index)):
-                    if b not in masks["classic"] or b not in masks[v]:
-                        continue
-                    mc, mv = masks["classic"][b], masks[v][b]
-                    row = dict(cell=tag, variant=v, budget=b, frac=b / info["d"],
-                               r_test_classic=base.at[b, "r_test"],
-                               r_test_spatial=s.at[b, "r_test"],
-                               cost_of_coherence=s.at[b, "r_test"] - base.at[b, "r_test"],
-                               jaccard_masks=float((mc & mv).sum() / (mc | mv).sum()),
-                               random_r=base.at[b, "random_r_mean"],
-                               hard_r=base.at[b, "hard_r"])
-                    for c in ("coh_purity", "coh_n_cc", "coh_largest_cc_frac", "coh_tiles"):
-                        if c in base and c in s:
-                            row[f"{c}_classic"] = base.at[b, c]
-                            row[f"{c}_spatial"] = s.at[b, c]
-                    rows.append(row)
-            if rows:
-                comp = pd.DataFrame(rows)
-                comp.to_csv(root / f"{tag}_comparison.csv", index=False)
-                print(f"\n=== {tag}: classic vs spatial ===")
-                show = [c for c in ("variant", "budget", "r_test_classic", "r_test_spatial",
-                                    "cost_of_coherence", "coh_purity_classic",
-                                    "coh_purity_spatial", "coh_n_cc_classic",
-                                    "coh_n_cc_spatial", "coh_tiles_classic",
-                                    "coh_tiles_spatial", "jaccard_masks") if c in comp]
-                with pd.option_context("display.width", 220, "display.max_columns", 30,
-                                       "display.float_format", "{:+.3f}".format):
-                    print(comp[show].to_string(index=False))
+        if "classic" not in summaries:
+            continue
+        if is_control(summaries["classic"]):
+            print(f"  WARNING: {root}/classic holds a control run; no comparison written")
+            continue
+        if len(summaries) == 1:
+            continue
+        rows = comparison_rows(tag, info["d"], summaries, masks)
+        if not rows:
+            continue
+        comparison = pd.DataFrame(rows)
+        comparison.to_csv(root / f"{tag}_comparison.csv", index=False)
+        print(f"\n=== {tag}: classic vs spatial ===")
+        show = []
+        for c in ("variant", "budget", "r_test_classic", "r_test_spatial", "cost_of_coherence",
+                  "coh_purity_classic", "coh_purity_spatial", "coh_n_cc_classic",
+                  "coh_n_cc_spatial", "coh_tiles_classic", "coh_tiles_spatial", "jaccard_masks"):
+            if c in comparison:
+                show.append(c)
+        with pd.option_context("display.width", 220, "display.max_columns", 30,
+                               "display.float_format", "{:+.3f}".format):
+            print(comparison[show].to_string(index=False))
     return 0
 
 

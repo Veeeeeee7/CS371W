@@ -1,0 +1,17 @@
+# Model features: the predictor set of Woznicki et al. (2019), Table 2, mapped onto our columns,
+# minus its two SSURGO soil variables (flood frequency, fluvial class), which are held-out maps
+# for the boundary analysis (O5) and are only pulled inside the region boxes.
+#   NLCD land cover            -> landcover   (NLCD 2021, 30 m; categorical code)
+#   slope                      -> slope       (3DEP 10 m)
+#   DEM5x5 (std. dev. of a 5x5 window of the DEM) -> tri_300 (std. dev. of 10 m elevation in a 300 m cell)
+#   CTI (compound topographic index) -> wetindexcat (EPA StreamCat catchment mean)
+#   OFD / HOFD (distance to channel; coastlines count as channels) -> log10_dist_river, log10_dist_coast (NHDPlus V2)
+#   VOFD / VDC (vertical distance to channel)  -> hand (MERIT Hydro)
+# Decided 2026-10-16 (docs/PROJECT-PLAN.md v5). The 45-feature list stays in data/processed/FEATURES.txt.
+landcover
+slope
+tri_300
+wetindexcat
+log10_dist_river
+log10_dist_coast
+hand

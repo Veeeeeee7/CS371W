@@ -1,14 +1,75 @@
 # Project plan: label provenance as distribution shift in flood susceptibility
 
-**v4, 2026-10-13** (sampling protocol v2 added the same evening, §2a) · supersedes v3 (2026-09-19, in git history) · aligned with the paper draft
+**v5, 2026-10-16** (model features switched to the Woznicki et al. 2019 predictor set, §0a) ·
+v4 2026-10-13 (sampling protocol v2 added the same evening, §2a) · supersedes v3 (2026-09-19, in git history) · aligned with the paper draft
 `CS371_Cho_Li/acl_latex.tex` as uploaded 2026-10-13 (introduction, five anticipated outcomes,
 three contributions, related work; Methods and Results not written yet)
 **Scope:** AI Research Practicum (CS371W), Kevin Cho and Victor Li; assumed to end mid-November 2026
 **Companions:** `docs/REGION-ANALYSIS-FLORIDA.md` (v2, the boundary analysis in full),
-`docs/SPATIAL-OODSELECT.md` (the Laplacian term and the coherence metrics), `aotil/README.md`
-(run order), `docs/TASK-DATA-AUDIT.md` (the data-audit brief for Claude Code)
+`docs/SPATIAL-OODSELECT.md` (the Laplacian term and the coherence metrics), `docs/RUN-FL-V2.md`
+(the data routine, run order step 1), `aotil/README.md` (what each analysis module does, and the
+run order), `docs/TASK-DATA-AUDIT.md` (the data-audit brief, done 2026-10-15),
+**`docs/TASK-FULL-RUN-W7.md` (the full-run brief for Claude Code with the v5 features)**
 
 When this plan and the paper disagree, the paper wins and this file gets fixed.
+
+---
+
+## 0a. What changed in v5 (2026-10-16): the model features
+
+**Decision (Victor, 2026-10-16).** Every model trains on the predictor set of Woznicki et al.
+(2019, Table 2), mapped onto our columns, minus its two SSURGO soil variables. The list is
+`data/processed_w7/FEATURES.txt` (seven lines). `data/processed_w7/dataset_FL.parquet` is a link to
+`data/processed/dataset_FL.parquet`, so the points are unchanged. `data/processed/FEATURES.txt`
+(45) is unchanged and is no longer the model list.
+
+| Woznicki 2019 predictor | our column | source | difference from theirs |
+|---|---|---|---|
+| NLCD land cover | `landcover` | NLCD 2021, 30 m | theirs NLCD 2011; a class code every family reads as a number |
+| slope | `slope` | 3DEP, 10 m | theirs NED, 30 m |
+| DEM5x5 (std. dev. of a 5×5 DEM window) | `tri_300` | 3DEP, 10 m | std. dev. of 10 m elevation in a 300 m cell (theirs: a 150 m window) |
+| CTI (compound topographic index) | `wetindexcat` | EPA StreamCat (EnviroAtlas index) | a catchment mean, not a per-pixel value |
+| OFD / HOFD (distance to channel; coastlines count as channels) | `log10_dist_river`, `log10_dist_coast` | NHDPlus V2.1 | straight-line distance to mapped flowlines and to the coastline, not along the flow path to a DEM channel |
+| VOFD / VDC (vertical distance to channel) | `hand` | MERIT Hydro, 90 m | MERIT's own drainage network |
+| fldfreq, fluvclass (SSURGO / STATSGO) | none | none | left out: approximate studies draw Zone A partly from soil maps, so a soil feature could carry the approximate procedure into the model (`CS371_Cho_Li/CHANGES-2026-10-19.md`, item 3.5); SSURGO is pulled only inside the region boxes, for class S of O5 |
+
+**Why.** It is a published predictor list, not one we chose. It is also the model the paper's
+Related Work describes: Woznicki et al. trained random forests on pooled Zone A and Zone AE
+labels, which is the practice the paper tests.
+
+**What the feature checks said.** `results/2026-10-15/feature_sets/` and
+`results/2026-10-16/cited_feature_sets/` compared eight cited feature sets. Woznicki 7 was not the
+set with the largest gap (one strong model over 15 tile folds: Woznicki 0.101, all 45 0.084,
+Degiorgis/Manfreda 5 0.131).
+
+**First look with the real population** (`results/2026-10-16/w7_first_look/`, Claude's sandbox,
+seeds 0–2, reduced budgets; details in `docs/TASK-FULL-RUN-W7.md` §0):
+
+| outcome | seeds 0 / 1 / 2 | 45 features, seed 0 |
+|---|---|---|
+| O1 AUC gap, all points (share of models worse) | 0.004 (56%) / 0.072 (94%) / 0.063 (95%); intervals exclude 0 on seeds 1–2 | 0.020 (71%) |
+| O2 r, 60 test models | +0.729 / +0.863 / +0.872 | +0.880 |
+| O3 classic r, S = 500 (pieces, tiles) | −0.889 (305, 24) / −0.936 (325, 24) / −0.914 (303, 21) | −0.889 (221, 23) |
+| O4 spatial r, S = 500 (pieces, tiles) | −0.888 (13, 10) / −0.838 (26, 15) / −0.748 (10, 8) | −0.763 (20, 12) |
+| O5 | not run | not run |
+
+**What changes.**
+- Every model-dependent output is rebuilt with the seven features: cells in
+  `data/interim/aotil/cells_w7/`, selections, regions, lobes, and the DEM and SSURGO pulls for the
+  new region boxes. All numbers in §3 and in `REGION-ANALYSIS-FLORIDA.md` §2 are 45-feature results.
+- The other 38 columns stay in the point table as descriptive variables for the regions (soil,
+  climate, rainfall, catchment context). They are not model inputs.
+- The Atlas 14 refill no longer blocks the run: Atlas 14 is not a model input.
+- Two v4 issues disappear: `channel_slope`'s −9998 code and the `tmean8110*` latitude proxy are
+  not in the set.
+- One stays: `hand` and `wetindexcat` are missing on open water (8.1% and 9.3% of points, almost
+  all band negatives, mostly Zone AE), so "missing" still leans toward "negative" for the hgb and
+  xgb families. Report O1 on all points and on land points. In the first look, two seed-1 regions
+  are band negatives on Lake Okeechobee's open water.
+- Paper: "45 covariates from seven public sources" becomes the seven Woznicki predictors from five
+  sources (3DEP, MERIT Hydro, NLCD, NHDPlus, StreamCat). Before/after in
+  `CS371_Cho_Li/CHANGES-2026-10-16.md`. Methods must give the mapping table above.
+- The full run, seeds 0–2 through the boundary statistic: `docs/TASK-FULL-RUN-W7.md`.
 
 ---
 
@@ -221,11 +282,13 @@ comparison is made on the part of the boundary that is not explained by a level 
 - Region boundaries that are level sets like Zone AE's: the approximate map may be right and
   the models wrong (Story 2 in `REGION-ANALYSIS-FLORIDA.md` §4).
 
-**The label-noise check from Related Work.** "We test whether lower-quality labels in Zone A
-explain where it inverts" (citing Sanyal et al. 2025). Their inversion needs models that
-interpolate the noisy labels. So record each model's training accuracy and check whether the
-inversion survives among models that do not interpolate (shallow trees, LR, NB). **Needs
-per-model training metrics, which the cells do not store today.**
+**The label-noise check from Related Work.** "...we test whether memorized noise explains our
+inversions" (the paper's current wording, citing Sanyal et al. 2025). Their inversion needs
+models that interpolate noisy training labels. Our models train on Zone AE only, so the check asks
+whether models memorizing noise in their Zone AE training labels explain the inversion; it cannot
+tell whether the Zone A labels they are scored on are noisy. So record each model's training
+accuracy and check whether the inversion survives among models that do not interpolate (shallow
+trees, LR, NB). **Needs per-model training metrics, which the cells do not store today.**
 
 **The map (Contribution 3).** Florida with Zone A / AE, the regions from all seeds, and each
 region's boundary coloured by class. The Flood Insurance Study (FIS) reports for the region
@@ -252,9 +315,9 @@ the audit should edit.
 
 | data | used by | where | status (2026-10-15) |
 |---|---|---|---|
-| Florida sample rebuilt with protocol v2 (§2a), covariates re-pulled | all | `data/processed/dataset_FL.parquet` | done 2026-10-14: 80,000 points; Earth Engine and NHDPlus covariates re-pulled for the new points, Atlas 14 (1,629 cached blocks at v1 block-mean positions) and StreamCat (per-county cache of 2026-09-19) from caches. Atlas 14 missing for 191 points (0.24%, 35 new blocks; every request failed, PFDS answered HTTP 503 to manual checks 23:12–00:14): refill when it answers (open-water blocks may still fail), then rerun from step 7 with `--overwrite` (DATA-AUDIT §12) |
+| Florida sample rebuilt with protocol v2 (§2a), covariates re-pulled | all | `data/processed/dataset_FL.parquet` | done 2026-10-14: 80,000 points; Earth Engine and NHDPlus covariates re-pulled for the new points, Atlas 14 (1,629 cached blocks at v1 block-mean positions) and StreamCat (per-county cache of 2026-09-19) from caches. Atlas 14 missing for 191 points (0.24%, 35 new blocks; every request failed, PFDS answered HTTP 503 to manual checks 23:12–00:14): refill when it answers (open-water blocks may still fail), then rerun from step 7 with `--overwrite` (DATA-AUDIT §12). 2026-10-21: the code review fixed the sampler and the Earth Engine and NHDPlus covariates, so this table is stale until rebuilt (`docs/DATA-SUMMARY.md` §7; `docs/RUN-FL-V2.md`, "Still to run") |
 | NHDPlus V2 catchments and flowlines for Florida (03N, 03S, 03W) | covariates for the new points | `data/raw/nhdplus/` | on disk: 03N/03S/03W (547 MB download, 2.0 GB with the extracted units and `NHDPlusV21_FL.gdb`); the gdb reproduces v1's COMIDs exactly and its distances within 7.4e-5 m (smoke test) |
-| point table: 45 features, label, domain, neg_protocol, point_id, lon/lat, tile_50km, county_fips, meta_* | all | `data/processed/dataset_FL.parquet` | done: 80,000 rows, 85 columns incl. `meta_src_row_id`, `meta_neg_rank`; audited (`results/2026-10-14/data_audit/`: 12 OK, 1 WRONG (B7: 2 AE positives up to 214 m outside the TIGER state line, accepted), 6 DECIDE (B2, B3, B4, B14, A4.2, A4.3)) |
+| point table: 45 features, label, domain, neg_protocol, point_id, lon/lat, tile_50km, county_fips, meta_* | all | `data/processed/dataset_FL.parquet` | done: 80,000 rows, 85 columns incl. `meta_src_row_id`, `meta_neg_rank` (86 after the post-review rebuild, which adds `meta_point_county`); audited (`results/2026-10-14/data_audit/`: 12 OK, 1 WRONG (B7: 2 AE positives up to 214 m outside the TIGER state line, accepted), 6 DECIDE (B2, B3, B4, B14, A4.2, A4.3)) |
 | feature → source → script → resolution table | Methods ("seven public sources") | — | done: `docs/FEATURE-SOURCES.md` (seven sources, 45 features) |
 | how band negatives get a zone | Methods | `sample_points.py` | done: Methods text in `docs/DATA-AUDIT-2026-10-14.md` §5 |
 | cell: per-model per-point scores on ID and OOD halves, labels, lon/lat, tile, county | O1–O4 | `data/interim/aotil/cells/FL_band_AE_s0.*` | done v2 seed 0 (audit PASS); seeds 1–2 still to run |
@@ -266,7 +329,7 @@ the audit should edit.
 | region lobes, matched unselected Zone A lobes, Zone AE lobes; 30 m edge-vertex table | O5 | — | done for spatial S = 250, 500 (`results/2026-10-14/boundary/`); the matched-lobe target (3 per region lobe) is not met in 7 of 12 components, and some regions are mostly band negatives (S = 250 Palm Beach: 0 positives) |
 | per-point extras: `meta_firm_pan`, `meta_near_fld_ar_id`, `edge_dist_m` | O5, map | — | done: `data/interim/analysis/point_extras_FL.parquet` (`meta_edge_dist_m`) |
 | 10 m DEM over the analysis areas (elevation at vertices and at displaced vertices) | O5 class E | 3DEP 1/3″ (TNM tiles or GEE `USGS/3DEP/10m`) | done: 3DEP 1/3″ rasters in `data/interim/gis/dem/`; z, z_in, z_out at every vertex; 6 tiles newer than 2024, their version against GEE `USGS/3DEP/10m_collection` unchecked |
-| SSURGO map-unit polygons + `muaggatt` (flodfreqdcd, hydclprs, drclassdcd, hydgrpdcd) | O5 class S | Soil Data Access | done: `data/interim/gis/ssurgo/` (197,241 unique polygons; lines with attribute differences); topology warnings in S = 500 components 0, 3, 6, 7 to inspect |
+| SSURGO map-unit polygons + `muaggatt` (flodfreqdcd, hydclprs, drclassdcd, hydgrpdcd) | O5 class S | Soil Data Access | done: `data/interim/gis/ssurgo/` (197,241 unique polygons; lines with attribute differences). W7 pulls (`results/2026-10-16/gis/ssurgo/`): topology warnings for seed 0 in S = 250 components 0–3 and S = 500 components 0, 1 and 3, and in component 1 of the seed-1 and seed-2 recurring regions (`logs/2026-10-16/C6_ssurgo*.log`). Cause: split pieces, and survey joins written twice where two polygons overlap by a sliver; effect on `d_soil_*` under 0.2 m. Since 2026-10-21 `pull_ssurgo.py` also counts the doubled joins and warns on them (seed-0 S = 500 component 4: about 1.8 km, unwarned before); rerun step 14 of `docs/RUN-FL-V2.md` with `--overwrite` for those log lines |
 | county boundaries | O5 class M | TIGER/Line | done: `data/interim/gis/county_lines_FL.parquet` (TIGER 2026) |
 | FIRM panel polygons (map-sheet edges) | O5 class M | `data/interim/nfhl_states/pan_FL.parquet` | done: `data/interim/gis/panel_edges_FL.parquet` (per DFIRM) |
 | NWI wetlands, PLSS sections, roads, canals | O5 optional classes | USFWS, BLM, Census, USGS | canals from NHDPlus in the vertex-layer table; NWI, PLSS, roads not built |
@@ -293,8 +356,8 @@ Assumes the project ends mid-November; shift the weeks if the deadline differs.
 | week of | do |
 |---|---|
 | Oct 13 | rebuild Florida with sampling protocol v2 and re-pull its covariates; data audit; seed-0 cell and classic + spatial selections on v2; `aotil/regions.py`; the missing GIS collectors (all in `docs/TASK-DATA-AUDIT.md`) |
-| Oct 20 | seeds 1–2 cells; classic and spatial selections on them; null-select and family-disjoint split; paper-protocol μ sweep at three budgets; smoothed-classic ablation |
-| Oct 27 | boundary classification on the vertex table with the displaced-edge null; matched unselected lobes; Zone AE contrast |
+| Oct 20 | **v5:** the full run with the seven Woznicki features, `docs/TASK-FULL-RUN-W7.md` Parts A–C5: seeds 0–2 cells; classic and spatial selections; null-select and family-disjoint split (code in B1); paper-protocol μ sweep at three budgets; smoothed-classic ablation; regions and their recurrence |
+| Oct 27 | `docs/TASK-FULL-RUN-W7.md` C6–C7: lobes, DEM and SSURGO for the new region boxes; the boundary statistic (code in B3) with the displaced-edge null, matched unselected lobes and the Zone AE contrast; the report |
 | Nov 3 | the Florida map (C3); interpolation check; FIS reading; Methods and Results draft |
 | Nov 10 | Discussion, figures, trim to length; presentation |
 
@@ -327,16 +390,22 @@ unselected lobes and the displaced-edge null; one map.
 
 - Paper: `CS371_Cho_Li/acl_latex.tex`, `custom.bib` (gitignored; Overleaf is its version
   control). Cited PDFs in `refs/cited/`.
-- Data: `data/processed/dataset_FL.parquet` + `FEATURES.txt`; polygons
+- Model features (v5): `data/processed_w7/FEATURES.txt` (7), with `data/processed_w7/dataset_FL.parquet`
+  linking to the table below; cells `data/interim/aotil/cells_w7/`.
+- Data: `data/processed/dataset_FL.parquet` + `FEATURES.txt` (the 45-feature list, v4); polygons
   `data/interim/prep/haz_FL_5070.parquet`; panels, BFE lines, LOMRs
   `data/interim/nfhl_states/{pan,s_bfe,s_lomr}_FL.parquet`; flowlines and StreamCat
   `data/interim/hydro/`; the raw NFHL gdb `data/raw/nfhl/NFHL_Key_Layers.gdb.zip` (19 GB).
-- Models and selections: cells `data/interim/aotil/cells/FL_band_{AE,A}_s0.*`; selections
-  `results/2026-09-24/oodselect_paper/{classic,spatial_mu3_knn10}/`; harness
-  `run_oodselect_local.sh`, `submit_oodselect_{classic,spatial}.sh`.
+- Models and selections: cells `data/interim/aotil/cells/FL_band_AE_s0.*` (v2, 45 features; the
+  v1 cells, `FL_band_A_s0` included, are in `data/interim/archive/sampling-v1/`); selections
+  `results/2026-09-24/oodselect_paper/{classic,spatial_mu3_knn10}/` (v1),
+  `results/2026-10-14/oodselect_paper/` (v2) and `results/2026-10-16/oodselect_paper/` (v5); harness
+  `run_oodselect_local.sh` (`aotil/README.md`).
 - Specs: `docs/REGION-ANALYSIS-FLORIDA.md` (boundary analysis), `docs/SPATIAL-OODSELECT.md`
   (Laplacian term, coherence metrics, validation rules), `docs/COVARIATES.md`,
-  `docs/COVARIATE-AUDIT.md`, `docs/SAMPLING-RESULTS.md`, `docs/LABELING-PROBLEMS.md`.
-  `docs/REGION-ANALYSIS.md` (v1) is history.
+  `docs/LABELING-PROBLEMS.md`. The data as built: `docs/DATA-SUMMARY.md`,
+  `docs/DATA-AUDIT-2026-10-14.md`. `docs/REGION-ANALYSIS.md` (v1) is history; the v1 ten-state
+  notes (`COVARIATE-AUDIT.md`, `SAMPLING-RESULTS.md`, `ASSEMBLY-SHORTCUTS.md`, `DOWNLOAD-GUIDE.md`)
+  are in `Claude outputs/removed-2026-10-21/docs/`.
 - claude.ai Project docs: `claude/project-index.md` (pointer doc),
   `claude/experiment-plan.md` (mirror of this file).

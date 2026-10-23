@@ -1,117 +1,78 @@
 #!/usr/bin/env python3
 """
-Loading a cell and splitting its model population.
+Load a cell written by zoo.py.
 
-A "cell" is one (state, protocol, train-domain, seed): a population of models
-trained on one domain, with their per-example scores on the in-domain and
-out-of-domain halves of the same held-out tiles. zoo.py writes it; everything
-downstream reads it through here so the model splits are defined in exactly one
-place.
+A cell is one (state, protocol, train domain, seed): a population of models trained
+on one domain, with their scores on the in-domain (ID) and out-of-domain (OOD)
+halves of the same held-out tiles. Inputs: <cells_dir>/<tag>.npz and
+<cells_dir>/<tag>_models.csv. Every downstream stage reads cells through
+load_cell(cells_dir, tag).
 """
 from __future__ import annotations
+
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-# Tree ensembles vs everything else. The family-disjoint split exists because a
-# RANDOM split of the model population does not make the halves independent when
-# the population varies mainly along one axis (overall quality): a subset tuned
-# to anti-correlate with quality in one half keeps anti-correlating in the other
-# whether or not any spurious feature is involved. Disjoint learner families
-# break that shared axis. This is the analogue of the paper's ResNet/ViT
-# ablation, and it is the control that decides whether a result is real.
+# Tree ensembles vs every other learner family. A random split of the model
+# population leaves both halves varying along one shared axis (overall quality),
+# so a subset on which accuracy anti-correlates with quality in one half keeps
+# doing so in the other whether or not anything spurious is involved. Splitting by
+# learner family breaks that shared axis.
 TREE_FAMILIES = {"hgb", "rf", "et", "dt", "xgb"}
 
-# Per-OOD-point arrays (zoo.SPATIAL_COLS) and the ID half's keys (zoo.ID_COLS,
-# stored as <col>_id, plus its labels y_id). Absent keys load as None: the v1
-# cells of 2026-09-24 carry y_id but no point_id, point_id_id, lon_id or lat_id.
+# Optional per-point arrays: one value per OOD point (zoo.SPATIAL_COLS), and the
+# ID half's point keys and labels (zoo.ID_COLS stored as <col>_id, plus y_id).
 SPATIAL_COLS = ["point_id", "lon", "lat", "block_id", "tile_50km", "county_fips",
                 "meta_comid", "meta_source_cit"]
 ID_KEYS = ["point_id_id", "lon_id", "lat_id", "y_id"]
 
 
 class Cell:
-    """Arrays for one cell, plus the model-split bookkeeping."""
+    """The arrays of one cell and its model table."""
 
     def __init__(self, tag: str, npz, models: pd.DataFrame):
         self.tag = tag
         self.S_ood = npz["S_ood"]                 # (n_models, n_ood_points)
-        self.S_id = npz["S_id"]
+        self.S_id = npz["S_id"]                   # (n_models, n_id_points)
         self.y_ood = npz["y_ood"]
         self.models = models
         self.n_models, self.d = self.S_ood.shape
-        for c in SPATIAL_COLS + ID_KEYS + ["tiles_ood"]:
-            setattr(self, c, np.asarray(npz[c]) if c in npz.files else None)
-        if self.tile_50km is None and self.tiles_ood is not None:
-            self.tile_50km = self.tiles_ood       # pilot-era cells
 
-    @property
-    def x(self) -> np.ndarray:
-        """Probit ID performance, one value per model."""
-        from oodselect import probit
-        return probit(self.models.score_id.to_numpy())
+        # One attribute per optional key, named after the key (callers iterate
+        # SPATIAL_COLS by name); a key the cell lacks loads as None.
+        for key in SPATIAL_COLS + ID_KEYS + ["tiles_ood"]:
+            value = np.asarray(npz[key]) if key in npz.files else None
+            setattr(self, key, value)
+
+        # Cells without tile_50km (the pilot's) carry their tiles as tiles_ood.
+        if self.tile_50km is None and self.tiles_ood is not None:
+            self.tile_50km = self.tiles_ood
 
     def has_spatial(self) -> bool:
         return self.lon is not None and self.lat is not None
 
     def require_spatial(self) -> None:
         if not self.has_spatial():
-            raise SystemExit(
-                f"{self.tag}: no lon/lat in the cell. These were added to zoo.py "
-                f"for the spatial work; regenerate the cell with the current "
-                f"zoo.py before running anything that needs a graph.")
-
-    def splits(self, seed: int = 0) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """(selection, validation, reporting) model indices, by split rule.
-
-        'random-split' is the paper's 60/20/20. The two family splits hold out
-        an entire learner family; they have no separate validation block, so the
-        restart is chosen on the training objective there.
-        """
-        rng = np.random.default_rng(seed)
-        N = self.n_models
-        perm = rng.permutation(N)
-        n_tr, n_va = int(0.6 * N), int(0.2 * N)
-        out = {"random-split": (perm[:n_tr], perm[n_tr:n_tr + n_va], perm[n_tr + n_va:])}
-
-        is_tree = self.models.kind.isin(TREE_FAMILIES).to_numpy()
-        tr_i, nt_i = np.where(is_tree)[0], np.where(~is_tree)[0]
-        if len(tr_i) >= 8 and len(nt_i) >= 8:
-            out["trees->others"] = (tr_i, np.array([], int), nt_i)
-            out["others->trees"] = (nt_i, np.array([], int), tr_i)
-        return out
-
-
-def cell_tag(state: str, protocol: str, train_dom: str, seed: int) -> str:
-    return f"{state}_{protocol}_{train_dom}_s{seed}"
-
-
-def result_tag(state: str, protocol: str, train_dom: str, seed: int,
-               mu: float, gph: str) -> str:
-    """The naming every result file carries, so a row can be traced to its run."""
-    mu_s = f"{mu:g}".replace(".", "p")
-    return f"{state}_{protocol}_{train_dom}_s{seed}_mu{mu_s}_{gph}"
+            raise SystemExit(f"{self.tag}: the cell has no lon/lat; rebuild it with "
+                             f"the current zoo.py before running anything that needs "
+                             f"a graph.")
 
 
 def load_cell(cells_dir: str | Path, tag: str) -> Cell:
     cells_dir = Path(cells_dir)
-    npz_p = cells_dir / f"{tag}.npz"
-    csv_p = cells_dir / f"{tag}_models.csv"
-    if not npz_p.exists():
-        raise SystemExit(f"missing cell {npz_p} -- run zoo.py for this cell first")
-    if not csv_p.exists():
-        raise SystemExit(f"missing {csv_p} (the model table that pairs with the npz)")
+    npz_path = cells_dir / f"{tag}.npz"
+    csv_path = cells_dir / f"{tag}_models.csv"
+    if not npz_path.exists():
+        raise SystemExit(f"missing cell {npz_path} -- run zoo.py for this cell first")
+    if not csv_path.exists():
+        raise SystemExit(f"missing {csv_path} (the model table that pairs with the npz)")
     try:
-        models = pd.read_csv(csv_p)
+        models = pd.read_csv(csv_path)
     except pd.errors.EmptyDataError:
-        # zoo.py before 2026-10-14 wrote such a cell when no model could be
-        # fitted (a protocol with no negatives); it now refuses to.
-        raise SystemExit(f"{csv_p} is empty: a 0-model cell, of no use to any reader. "
-                         f"Delete {npz_p.name} and its table; the current zoo.py "
-                         f"refuses such a cell and says why") from None
-    return Cell(tag, np.load(npz_p, allow_pickle=True), models)
-
-
-def list_cells(cells_dir: str | Path) -> list[str]:
-    return sorted(p.stem for p in Path(cells_dir).glob("*.npz"))
+        # No model could be fitted in this cell (e.g. a protocol with no negatives).
+        raise SystemExit(f"{csv_path} is empty: a 0-model cell. Delete {npz_path.name} "
+                         f"and its table; zoo.py refuses to write such a cell and "
+                         f"says why.") from None
+    return Cell(tag, np.load(npz_path, allow_pickle=True), models)

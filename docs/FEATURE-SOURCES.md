@@ -1,10 +1,20 @@
 # Feature sources: where each of the 45 covariates comes from
 
 Written 2026-10-14 for `docs/TASK-DATA-AUDIT.md` Part B. Every row was checked against the
-code (line numbers as of 2026-10-14). Every quoted number was measured read-only on the
-**v1** Florida table, on the **band subset** the paper uses (positives + band negatives,
-62,578 rows of `dataset_FL.parquet`). The v2 rebuild changes the points, not the sources or
+code of 2026-10-14; since the 2026-10-21 refactor the code column names functions instead of
+line numbers, and notes marked 2026-10-21 record what that day's fixes changed. Every quoted
+number was measured read-only on the **v1** Florida table, on the **band subset** the paper
+uses (positives + band negatives, 62,578 rows of `dataset_FL.parquet`). The v2 rebuild changes the points, not the sources or
 the methods, except for the NHDPlus input (§8). §9 re-runs the quoted numbers on v2.
+
+> **2026-10-16 (plan v5):** the models now use seven of these 45, the Woznicki et al. (2019)
+> predictor set (`data/processed_w7/FEATURES.txt`): rows 10 `landcover`, 1 `slope`, 6 `tri_300`,
+> 21 `wetindexcat`, 37 `log10_dist_river`, 38 `log10_dist_coast`, 7 `hand` of the table in §3.
+> They come from five sources: NLCD, 3DEP, EPA StreamCat, NHDPlus V2.1 and MERIT Hydro.
+> The source, transform and missingness of each are as documented below. §7 items 1
+> (`channel_slope`) and the Atlas 14 gap no longer touch the models; item 2 (open-water
+> missingness) still does, through `hand` and `wetindexcat`; item 7 (`landcover` read as a
+> number) still applies.
 
 ---
 
@@ -21,6 +31,8 @@ the methods, except for the NHDPlus input (§8). §9 re-runs the quoted numbers 
   code as a number; band negatives on open water make MERIT and NHDPlus missingness a label
   cue; Florida catchments are much larger than the "~1–3 km²" the code comments state; the
   NLCD citation in `DATA-SOURCES.md` is for a different product; the GSW version is not logged.
+  (2026-10-21: the first is fixed, `pull_hydro.py` now writes NaN for −9998, and
+  `DATA-SOURCES.md` §6 now names the NLCD 2021 release.)
 
 ---
 
@@ -42,16 +54,21 @@ the methods, except for the NHDPlus input (§8). §9 re-runs the quoted numbers 
 
 How a value is attached to a point:
 
-- **pixel**: the raster cell containing the point. `pull_gee.py:sample_group` (L173–189)
-  runs `reduceRegions` with `ee.Reducer.first()` at the group's scale: 10 m for 3DEP, 90 m
-  for MERIT, 30 m for NLCD and GSW.
+- **pixel**: the raster cell containing the point. `pull_gee.py:sample_group` runs
+  `reduceRegions` with `ee.Reducer.first()` on the source's own grid (`crs` = the source's
+  projection, no `scale`). 2026-10-21: before this fix the pull passed a scale (10 m for 3DEP,
+  90 m for MERIT, 30 m for NLCD and GSW), which made Earth Engine rescale the 3DEP and MERIT
+  grids: about 42% of points read a neighbouring MERIT cell, 3DEP reads moved by up to about
+  6.6 m and slope came out about 3% high. NLCD and GSW were already on their native grid. The
+  stored dataset keeps the old values until the Earth Engine pull is rerun.
 - **grid window W**: a statistic over the fixed W-sized grid cell that contains the point
   (`reduceResolution` then `reproject`, read back at the point). The window is a grid cell,
   not a window centred on the point, so the point can sit anywhere inside it. W is nominal:
   both grids are geographic, and Earth Engine measures their scale at the equator, so in
   Florida the east–west extent is about 0.86–0.91 W.
 - **nearest reach**: distance to, or an attribute of, the nearest NHDPlus flowline of the
-  river FTYPEs (StreamRiver, ArtificialPath, Connector, CanalDitch; `pull_hydro.py` L126),
+  river FTYPEs (StreamRiver, ArtificialPath, Connector, CanalDitch; `pull_hydro.py`
+  `RIVER_FTYPES`),
   planar in EPSG:5070 (`STRtree.nearest`). The search is not routed: the nearest reach need
   not be the reach the point drains to.
 - **catchment**: the NHDPlus catchment containing the point (`sjoin`, predicate `within`,
@@ -59,31 +76,31 @@ How a value is attached to a point:
 - **cat / ws**: StreamCat areal mean over that catchment (cat), or over its whole upstream
   watershed including it (ws), joined on `meta_comid`.
 - **block**: one Atlas 14 request per 10 km `block_id`, at the mean lon/lat of the block's
-  own points (`pull_atlas14.py:block_targets`, L161–179); every point in the block gets it.
+  own points (`pull_atlas14.py:block_targets`); every point in the block gets it.
 
 NaN is passed to the models as NaN: hgb and xgb route it natively, and the other six families
-impute the training median (`aotil/zoo.py:build`, L245–267; the imputer is L252). "NaN x%" is
-the band-subset share.
+impute the training median (`aotil/zoo.py:build`, a `SimpleImputer(strategy="median")` in each
+pipeline). "NaN x%" is the band-subset share.
 
 | # | feature | source (asset / field) | code | native res. | attached as | units | transform, NaN |
 |---:|---|---|---|---|---|---|---|
-| 1 | `slope` | 3DEP `elevation` → `ee.Terrain.slope` | `pull_gee.py:build_groups` L112 | 10 m | pixel (10 m) | degrees | none. NaN 0% |
-| 2 | `aspect_sin` | 3DEP → `ee.Terrain.aspect` | `build_groups` L113; `derive` L334–341 | 10 m | pixel (10 m) | unitless | sin(aspect); NaN where slope < 0.5° (`FLAT_SLOPE_DEG`, L289). NaN 64.1% |
+| 1 | `slope` | 3DEP `elevation` → `ee.Terrain.slope` | `pull_gee.py:terrain_group` | 10 m | pixel (10 m) | degrees | none. NaN 0% |
+| 2 | `aspect_sin` | 3DEP → `ee.Terrain.aspect` | `terrain_group`; `derive` | 10 m | pixel (10 m) | unitless | sin(aspect); NaN where slope < 0.5° (`FLAT_SLOPE_DEG`). NaN 64.1% |
 | 3 | `aspect_cos` | 3DEP → `ee.Terrain.aspect` | as 2 | 10 m | pixel (10 m) | unitless | cos(aspect), same mask. NaN 64.1% |
-| 4 | `curvature` | 3DEP → `convolve(ee.Kernel.laplacian8())` | `build_groups` L114 | 10 m | 3×3 kernel at the pixel | m | sum of the 8 neighbours minus 8 × centre, not divided by cell area; positive in hollows (Spearman −0.31 with `tpi_300`). NaN 0% |
-| 5 | `tpi_300` | 3DEP | `build_groups` L117–119 | 10 m | pixel minus mean of grid window 300 m | m | none. NaN 0% |
-| 6 | `tri_300` | 3DEP | `build_groups` L120–121 | 10 m | std. dev. of 10 m elevation in grid window 300 m | m | a standard deviation, not Riley's TRI. NaN 0% |
-| 7 | `hand` | MERIT `hnd` | `build_groups` L127 | 3″ | pixel (90 m) | m | none; values on 0.1 m steps, 19.2% exactly 0. NaN where MERIT has no land cell (open water): 5.82% |
-| 8 | `log10_upa` | MERIT `upa` | `build_groups` L128–129; `derive` L328–331 | 3″ | pixel (90 m) | log10 km² | EE returns log1p(upa); the merge takes expm1, clips at ≥ 0.0081 km² (one cell), log10. 47.5% sit at the floor (−2.09). NaN as `hand` |
-| 9 | `tpi_broad` | MERIT `elv` | `build_groups` L130–133 | 3″ | pixel minus mean of grid window 900 m (10 × 10 cells) | m | none. NaN as `hand` |
-| 10 | `landcover` | NLCD 2021 `landcover` | `build_groups` L136–138 | 30 m | pixel (30 m) | class code | none; 15 codes (11–95) in Florida. A number to every model: `zoo.py` has no one-hot, so lr, mlp and nb read it as ordinal. NaN 0% |
-| 11 | `impervious` | NLCD 2021 `impervious` | `build_groups` L136–138 | 30 m | pixel (30 m) | % | none. NaN 0% |
-| 12 | `gsw_occurrence` | GSW `occurrence` | `build_groups` L152 (asset from `gsw_asset`, L92–100) | 30 m | pixel (30 m) | % of valid observations with water | `unmask(0)`: never-water and no-data both read 0, so never NaN |
-| 13 | `water_frac_900m` | GSW `max_extent` | `build_groups` L153–156 | 30 m | mean of grid window 900 m | fraction 0–1 | `unmask(0)`, then the share of 30 m pixels ever seen as water. Never NaN |
-| 14 | `catch_area_km2` | NHDPlus `Catchment.AreaSqKM` | `pull_hydro.py:catchments` L244–257 | catchment | catchment | km² | NHDPlus's published area, no transform. NaN outside every catchment: 7.17% |
-| 15 | `nearest_stream_order` | NHDPlus `PlusFlowlineVAA.StreamOrde` | `flowlines` L322–337 | 1:100k | nearest reach | Strahler order | none; 1–8 in Florida (−9 occurs only on Coastline, which is excluded). NaN 0% |
-| 16 | `drainage_density` | NHDPlus `LENGTHKM` / `AreaSqKM` | `flowlines` L351–361 | catchment | catchment | km/km² | length of the one flowline whose COMID is the catchment's, over the catchment's area. NaN without a catchment or when that flowline is not in the read: 8.78% |
-| 17 | `bfiws` | StreamCat `BFIWs` | `streamcat` L398–400; `_merge_body` L542–546 | watershed | ws | % | none. NaN 7.77% |
+| 4 | `curvature` | 3DEP → `convolve(ee.Kernel.laplacian8())` | `terrain_group` | 10 m | 3×3 kernel at the pixel | m | sum of the 8 neighbours minus 8 × centre, not divided by cell area; positive in hollows (Spearman −0.31 with `tpi_300`). NaN 0% |
+| 5 | `tpi_300` | 3DEP | `terrain_group` | 10 m | pixel minus mean of grid window 300 m | m | none. NaN 0% |
+| 6 | `tri_300` | 3DEP | `terrain_group` | 10 m | std. dev. of 10 m elevation in grid window 300 m | m | a standard deviation, not Riley's TRI. NaN 0% |
+| 7 | `hand` | MERIT `hnd` | `merit_group` | 3″ | pixel (90 m) | m | none; values on 0.1 m steps, 19.2% exactly 0. NaN where MERIT has no land cell (open water): 5.82% |
+| 8 | `log10_upa` | MERIT `upa` | `merit_group`; `derive` | 3″ | pixel (90 m) | log10 km² | EE returns log1p(upa); the merge takes expm1, clips at ≥ 0.0081 km² (one cell, `MERIT_CELL_KM2`), log10. 47.5% sit at the floor (−2.09). NaN as `hand` |
+| 9 | `tpi_broad` | MERIT `elv` | `merit_group` | 3″ | pixel minus mean of grid window 900 m (10 × 10 cells) | m | none. NaN as `hand` |
+| 10 | `landcover` | NLCD 2021 `landcover` | `nlcd_group` | 30 m | pixel (30 m) | class code | none; 15 codes (11–95) in Florida. A number to every model: `zoo.py` has no one-hot, so lr, mlp and nb read it as ordinal. NaN 0% |
+| 11 | `impervious` | NLCD 2021 `impervious` | `nlcd_group` | 30 m | pixel (30 m) | % | none. NaN 0% |
+| 12 | `gsw_occurrence` | GSW `occurrence` | `surface_water_group` (asset from `gsw_asset`) | 30 m | pixel (30 m) | % of valid observations with water | `unmask(0)`: never-water and no-data both read 0, so never NaN |
+| 13 | `water_frac_900m` | GSW `max_extent` | `surface_water_group` | 30 m | mean of grid window 900 m | fraction 0–1 | `unmask(0)`, then the share of 30 m pixels ever seen as water. Never NaN |
+| 14 | `catch_area_km2` | NHDPlus `Catchment.AreaSqKM` | `pull_hydro.py:join_catchments` | catchment | catchment | km² | NHDPlus's published area, no transform. NaN outside every catchment: 7.17% |
+| 15 | `nearest_stream_order` | NHDPlus `PlusFlowlineVAA.StreamOrde` | `measure_flowlines` (`REACH_ATTRIBUTES`) | 1:100k | nearest reach | Strahler order | none; 1–8 in Florida (−9 occurs only on Coastline, which is excluded). NaN 0% |
+| 16 | `drainage_density` | NHDPlus `LENGTHKM` / `AreaSqKM` | `add_drainage_density` | catchment | catchment | km/km² | length of the one flowline whose COMID is the catchment's, over the catchment's area; 0 for a sink catchment (negative FEATUREID: an area that drains into a closed sink and has no flowline of its own; since 2026-10-21, NaN before). NaN 8.78% on v1. On the whole v2 table the sink catchments were the whole excess over `catch_area_km2` (11.27% against 9.30% NaN; 1,582 points in 159 catchments), so the fix takes the rate to 9.30% |
+| 17 | `bfiws` | StreamCat `BFIWs` | `pull_streamcat`; joined in `join_hydro_files` | watershed | ws | % | none. NaN 7.77% |
 | 18 | `bficat` | StreamCat `BFICat` | as 17 | catchment | cat | % | none. NaN 7.86% |
 | 19 | `hydrlcondws` | StreamCat `HydrlCondWs` | as 17 | watershed | ws | µm/s | none. NaN 7.76% |
 | 20 | `hydrlcondcat` | StreamCat `HydrlCondCat` | as 17 | catchment | cat | µm/s | none. NaN 7.78% |
@@ -103,15 +120,15 @@ the band-subset share.
 | 34 | `sandws` | StreamCat `SandWs` | as 17 | watershed | ws | % | none. NaN 7.77% |
 | 35 | `permcat` | StreamCat `PermCat` | as 17 | catchment | cat | cm/h | none. NaN 8.21% |
 | 36 | `permws` | StreamCat `PermWs` | as 17 | watershed | ws | cm/h | none. NaN 7.77% |
-| 37 | `log10_dist_river` | NHDPlus flowline geometry | `flowlines` L322–327; `_merge_body` L563–569 | 1:100k | distance to nearest reach | log10 m | clip at ≥ 1 m (50 points), log10; raw value in `meta_dist_to_river_m`. NaN 0% |
-| 38 | `log10_dist_coast` | NHDPlus Coastline flowlines | `flowlines` L341–346; `_merge_body` L563–569 | 1:100k | distance to nearest Coastline flowline | log10 m | clip at ≥ 1 m (2 points), log10; raw in `meta_dist_to_coast_m`. NaN 0% |
-| 39 | `log10_upstream_area` | NHDPlus `PlusFlowlineVAA.TotDASqKM` | `flowlines` L332–337; `_merge_body` L563–569 | 1:100k | nearest reach | log10 km² | clip at ≥ 0.01 km² (170 points at −2, 69 of them raw 0), log10; raw in `meta_upstream_area_km2`. NaN 0% |
-| 40 | `p100_24hr` | Atlas 14, 100-yr 24-hr depth | `pull_atlas14.py:parse` L125–147 (`WANT` L105–108); `_merge_body` L386 | 30″ | block | mm | none; whole mm as served. NaN where the block's request failed: 1 point (block 147_40) |
+| 37 | `log10_dist_river` | NHDPlus flowline geometry | `measure_flowlines`; `quarantine_and_log_scale` | 1:100k | distance to nearest reach | log10 m | clip at ≥ 1 m (50 points), log10; raw value in `meta_dist_to_river_m`. NaN 0% |
+| 38 | `log10_dist_coast` | NHDPlus Coastline flowlines | `measure_flowlines` (`read_coastline`); `quarantine_and_log_scale` | 1:100k | distance to nearest Coastline flowline (since 2026-10-21 island shorelines are kept and the search box is wider, §8) | log10 m | clip at ≥ 1 m (2 points), log10; raw in `meta_dist_to_coast_m`. NaN 0% |
+| 39 | `log10_upstream_area` | NHDPlus `PlusFlowlineVAA.TotDASqKM` | `measure_flowlines` (`REACH_ATTRIBUTES`); `quarantine_and_log_scale` | 1:100k | nearest reach | log10 km² | clip at ≥ 0.01 km² (170 points at −2, 69 of them raw 0), log10; raw in `meta_upstream_area_km2`. NaN 0% |
+| 40 | `p100_24hr` | Atlas 14, 100-yr 24-hr depth | `pull_atlas14.py:parse` (`WANT`); merged by `pull_atlas14.py:_merge_body` | 30″ | block | mm | none; whole mm as served. NaN where the block's request failed: 1 point (block 147_40) on v1. On v2, 191 points in 35 blocks (7 A negatives, 176 AE negatives, 8 AE positives) after the 2026-10-14 PFDS outage; the refill is still pending (`DATA-AUDIT-2026-10-14.md` §3 and §12) |
 | 41 | `p100_60min` | Atlas 14, 100-yr 60-min depth | as 40 | 30″ | block | mm | as 40 |
 | 42 | `p100_4day` | Atlas 14, 100-yr 4-day depth | as 40 | 30″ | block | mm | as 40 |
 | 43 | `p2_24hr` | Atlas 14, 2-yr 24-hr depth | as 40 | 30″ | block | mm | as 40 |
-| 44 | `growth_100_2` | Atlas 14, derived from 40 and 43 | `parse` L145–146 | 30″ | block | ratio | `p100_24hr / p2_24hr` of the whole-mm values. As 40 |
-| 45 | `channel_slope` | NHDPlus `elevslope.SLOPE` | `flowlines` L332–337 | 1:100k | nearest reach | m/m | **none: NHDPlus's −9998 no-value code passes through as a number** (30 points). 1e-5 is NHDPlus's smallest assigned slope; 36.7% of points sit at it. NaN 0% |
+| 44 | `growth_100_2` | Atlas 14, derived from 40 and 43 | `parse` | 30″ | block | ratio | `p100_24hr / p2_24hr` of the whole-mm values. As 40 |
+| 45 | `channel_slope` | NHDPlus `elevslope.SLOPE` | `measure_flowlines` (`REACH_ATTRIBUTES`, `SLOPE_NO_DATA`) | 1:100k | nearest reach | m/m | v1: **none, NHDPlus's −9998 no-value code passed through as a number** (30 points). Since 2026-10-21 −9998 becomes NaN (§7 item 1). 1e-5 is NHDPlus's smallest assigned slope; 36.7% of points sit at it. NaN 0% on v1 |
 
 Atlas 14 in numbers: 1,683 blocks hold the band subset, median 32 points each, and
 `p100_24hr` takes 194 distinct values.
@@ -122,7 +139,8 @@ Atlas 14 in numbers: 1,683 blocks hold the band subset, median 32 points each, a
 
 **Yes, counted as the datasets the pipeline reads.** 6 + 3 + 2 + 2 + 7 + 20 + 5 = 45. The
 expected seven are exactly the seven in §2. `log10_dist_coast` comes from NHDPlus Coastline
-flowlines, not from an eighth source. `pull_climate.py` (the retired GRIDMET proxy) and
+flowlines, not from an eighth source. `pull_climate.py` (the retired GRIDMET proxy, removed
+2026-10-21) and
 `pull_extras.py` (NFHL BFE and LOMR lines; `sample_points.py:bfe_density_map` turns the BFE
 lines into `meta_bfe_km_per_km2`) produce none of the 45.
 
@@ -169,9 +187,9 @@ seven independent measurements. Suggested wording:
 The last three rows are the **27 regional-context features**. The three reach attributes sit
 in between: each is constant over the area for which that reach is the nearest one.
 
-**Florida catchments are large.** The `FEATURES.txt` header and the `pull_hydro.py`
-docstring call StreamCat values "constant across a ~1–3 km² catchment". In the band subset the
-median distinct catchment is 3.7 km², but points are drawn in proportion to area, so they land
+**Florida catchments are large.** The `FEATURES.txt` header (written from `pull_hydro.py`'s
+`FEATURES_HEADER`) calls StreamCat values "constant across a ~1–3 km² catchment". In the band
+subset the median distinct catchment is 3.7 km², but points are drawn in proportion to area, so they land
 in big catchments: the median **per point** is 24.1 km² (quartiles 6.8 and 92.2 km²). Three
 catchments over 1,000 km² hold 3,668 points (5.9%): COMID 89748 (7,984 km², 1,993 points in
 six counties, mostly 12099, 12086 and 12051), 16770632 (1,893 km², 945) and 16770182
@@ -188,19 +206,21 @@ comment (it is never edited).
 
 | column | made by | what it is | why not a feature |
 |---|---|---|---|
-| `meta_elev` | `pull_gee.py:derive` L324–325 | 3DEP 10 m elevation, m | identifies the state at 58.3% against a 10% baseline (`COVARIATE-AUDIT.md` §2.1) |
-| `meta_aspect_raw` | `derive` L341 | aspect, degrees, unmasked | replaced by the masked sin/cos |
-| `meta_log1p_upa` | `derive` L331 | MERIT log1p(upa) as pulled | replaced by `log10_upa` |
-| `meta_comid` | `pull_hydro.py:_merge_body` L536 | FEATUREID of the point's catchment | an identifier |
-| `meta_dist_to_river_m`, `meta_dist_to_coast_m`, `meta_upstream_area_km2` | `_merge_body` L563–569 | raw values behind the three log10 features | kept for diagnostics |
-| `meta_nearest_ftype` | `flowlines` L338–339 | FTYPE of the nearest reach | provenance of the distance |
-| `meta_elevcat`, `meta_elevws` | `_merge_body` L556–558 | StreamCat catchment / watershed mean elevation (from NHDPlusV2) | same fingerprint risk as `meta_elev` |
+| `meta_elev` | `pull_gee.py:derive` | 3DEP 10 m elevation, m | identifies the state at 58.3% against a 10% baseline (the ten-state covariate audit of 2026-09-19, §2.1; archived in `Claude outputs/removed-2026-10-21/docs/COVARIATE-AUDIT.md`) |
+| `meta_aspect_raw` | `derive` | aspect, degrees, unmasked | replaced by the masked sin/cos |
+| `meta_log1p_upa` | `derive` | MERIT log1p(upa) as pulled | replaced by `log10_upa` |
+| `meta_comid` | `pull_hydro.py:join_hydro_files` | FEATUREID of the point's catchment | an identifier |
+| `meta_dist_to_river_m`, `meta_dist_to_coast_m`, `meta_upstream_area_km2` | `quarantine_and_log_scale` | raw values behind the three log10 features | kept for diagnostics |
+| `meta_nearest_ftype` | `measure_flowlines` | FTYPE of the nearest reach | provenance of the distance |
+| `meta_elevcat`, `meta_elevws` | `quarantine_and_log_scale` (`STREAMCAT_ELEVATION`) | StreamCat catchment / watershed mean elevation (from NHDPlusV2) | same fingerprint risk as `meta_elev` |
 
 **From sampling (`sample_points.py`), describing how FEMA made the map:** `meta_fld_zone`,
 `meta_zone_subty`, `meta_study_typ`, `meta_study_regime`, `meta_static_bfe`, `meta_depth`,
 `meta_source_cit`, `meta_fld_ar_id`, `meta_poly_area_km2`, `meta_dist_to_sfha_m`,
 `meta_eff_date`, `meta_panel_scale`, `meta_panel_typ`, `meta_bfe_km_per_km2`; v2 adds
-`meta_src_row_id` and `meta_neg_rank`.
+`meta_src_row_id` and `meta_neg_rank`. Since 2026-10-21 the sampler also writes
+`meta_point_county` (the county polygon the point lies in, from `--state-polygons`); it reaches
+the dataset when the points are rebuilt.
 
 **Identifiers, labels and split columns:** `point_id`, `state`, `county_fips`, `dfirm_id`,
 `block_id`, `domain`, `label`, `neg_protocol`, `lon`, `lat`, `geometry`, `tile_30km`,
@@ -222,6 +242,10 @@ None of these is in `FEATURES.txt` (checked against its 45 lines).
    `prep_nhdplus_units.py` keeps it on purpose so v1 and v2 match. **Decision:** map −9998 to
    NaN in `pull_hydro.py --merge` (one line; v1 is then not reproducible exactly), or keep it and
    say so in Methods. Separately, 36.7% of points sit at NHDPlus's 1e-5 floor.
+   **Done 2026-10-21:** `pull_hydro.py` maps −9998 (`SLOPE_NO_DATA`) to NaN in
+   `measure_flowlines`, when it writes `river_FL.parquet` (the `--flowlines` stage, not
+   `--merge`). The geodatabase still holds −9998. The stored dataset changes once
+   `river_FL.parquet` is rebuilt and merged again. `channel_slope` is not a W7 feature.
 2. **Band negatives on open water make missingness a label cue.** In the band subset (% of each
    stratum):
 
@@ -246,9 +270,10 @@ None of these is in `FEATURES.txt` (checked against its 45 lines).
    two points 100 m apart can share one. v1 (200 m within a class, 100 m across classes) has 54
    band-subset pairs under 125 m, and 3 of them share both `hand` and `log10_upa`. v2 puts every
    pair at ≥ 100 m, so expect more; Part A4 counts them (the §9 check prints it).
-5. **"Drains to" is "nearest".** The comment at `pull_hydro.py` L328 calls the reach attributes
+5. **"Drains to" is "nearest".** A comment in `pull_hydro.py` called the reach attributes
    those of "the reach a point drains to". The code takes the nearest river-type flowline by
-   planar distance. Methods should say nearest.
+   planar distance. Methods should say nearest. (The comment above `REACH_ATTRIBUTES` now says
+   "nearest river reach (not necessarily the reach the point drains to)".)
 6. **`log10_upa` floor.** 0.0081 km² is a 90 m square; a Florida MERIT cell is about
    0.0074–0.0078 km², so the clip also lifts single-cell values slightly. 47.5% of points sit at the floor, which is
    the "channel proximity, not contributing area" reading in `COVARIATES.md` §4.
@@ -259,7 +284,7 @@ None of these is in `FEATURES.txt` (checked against its 45 lines).
    `ee.Image("JRC/GSW1_4/GlobalSurfaceWater").bandNames().getInfo()` under the pulling account.
 9. **NLCD citation.** `DATA-SOURCES.md` §6 says to cite Fleckenstein et al. 2026 (Annual NLCD),
    but `pull_gee.py` reads the NLCD 2021 epoch release. Cite Dewitz 2023
-   (doi:10.5066/P9JZ7AO3).
+   (doi:10.5066/P9JZ7AO3). (`DATA-SOURCES.md` §6 says so since 2026-10-21.)
 10. **StreamCat gaps beyond missing catchments.** 377 band-subset points have a COMID but no
     StreamCat row: 130 COMIDs, 121 of them absent from the county responses and 9 served with
     null values. Some metrics have more nulls (with a COMID: `runoffcat` 616, `sandcat` 653,
@@ -291,14 +316,31 @@ None of these is in `FEATURES.txt` (checked against its 45 lines).
   on the extracted files: every river-type network flowline has an `elevslope` row, so v2
   introduces no new NaN in `channel_slope`; the only network flowlines without one are the
   7,326 Coastline features, which never feed a slope.
+- **Coastline (2026-10-21).** Island and barrier-island shorelines are non-network lines, so
+  the VAA cut above dropped them, and v1's national layer lacked them too: points on the Keys
+  and barrier islands read their distance to a farther coastline (one Boca Chica point read
+  34,679 m instead of 3.9 m). `prep_nhdplus_units.py` now keeps every Coastline
+  line whether or not it has a VAA record, and `pull_hydro.py` (`read_coastline`) searches for
+  the coast 1° (`COAST_PAD_DEG`) beyond the points' box instead of the rivers' 0.05°, because
+  western-panhandle points are nearest a coast outside that box. Checked on a scratch rebuild:
+  917 points get a smaller `meta_dist_to_coast_m` and none a larger one. 858 come from the island
+  shorelines (6 A negatives, 710 AE negatives, 142 AE positives; up to 57 km, 641 of them by more
+  than 0.3 in log10, all AE and mostly in Monroe County), 59 western-panhandle Zone A points from
+  the wider box (up to 12.6 km). The river attributes do not change. The stored dataset changes
+  once the geodatabase, `river_FL.parquet` and the merge are rebuilt (`docs/RUN-FL-V2.md`
+  step 5); `log10_dist_coast` is a W7 feature, so the W7 models and everything built on them
+  change on the rerun.
 - **COMIDs are NHDPlus V2.1 in both**, so the cached `streamcat_FL.parquet` (left in place by
   `archive_sampling_v1.sh`) still joins. A v2 point in a county that v1 never queried would get
   no StreamCat row; the §9 check counts them.
 - Earth Engine assets, the StreamCat API and the Atlas 14 endpoint are unchanged.
-- **Still open for v2, not decided here:** whether `channel_slope` keeps −9998 (§7.1), and
-  whether band negatives that fall outside Florida stay in (1,038 of 22,652 v1 band negatives,
-  4.6%, lie in Alabama or Georgia by the Census county polygons; `sample_points.py
-  --state-polygons` is off by default; `audit_dataset.py` B7 counts them).
+- **Open for v2 when this was written, both decided since:** whether `channel_slope` keeps
+  −9998 (§7.1; NaN since 2026-10-21), and whether band negatives that fall outside Florida stay
+  in (1,038 of 22,652 v1 band negatives, 4.6%, lie in Alabama or Georgia by the Census county
+  polygons; `sample_points.py --state-polygons` is off by default; `audit_dataset.py` B7 counts
+  them). The second was decided on 2026-10-14 (decision 1(b) in `DATA-AUDIT-2026-10-14.md`):
+  v2 is built with `--state-polygons` and the 67 TIGER/Line 2026 Florida counties, and has 0
+  band negatives outside Florida.
 
 ---
 
@@ -334,7 +376,9 @@ print(f"Atlas 14 NaN rows: {int(b.p100_24hr.isna().sum())}; "
 EOF
 ```
 
-On v1, pass `data/interim/archive/sampling-v1/data/processed/dataset_FL.parquet` once it has
-been archived. v1 output (2026-10-14): channel_slope −9998 30, at 1e-5 36.7%; `log10_upa` at the
+After the 2026-10-21 `channel_slope` fix the −9998 count is 0 on a rebuilt table; those
+reaches read NaN. On v1, pass
+`data/interim/archive/sampling-v1/data/processed/dataset_FL.parquet` once it has been
+archived. v1 output (2026-10-14): channel_slope −9998 30, at 1e-5 36.7%; `log10_upa` at the
 floor 47.5%; the table in §7.2; catchment median 24.1 / 3.7 km², 3,668 points over 1,000 km²;
 54 pairs under 125 m, 3 sharing; Atlas 14 NaN 1; COMID but no StreamCat 377.

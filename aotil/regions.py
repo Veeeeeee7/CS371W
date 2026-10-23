@@ -1,103 +1,20 @@
 #!/usr/bin/env python3
 """
-Regions: the connected pieces of an OODSelect subset, written as two tables the
-boundary analysis reads (docs/REGION-ANALYSIS-FLORIDA.md sections 2-3).
+Regions: the connected components of an OODSelect selection, one row per component.
 
-WHAT A REGION IS
-----------------
-The top-S points of one selection (*_S<S>_theta.npy), joined by the kNN graph
-the selection was penalised on. A region is one connected component of the
-subgraph those points induce. On v1, the spatial AE->A selection at S = 500 is 8
-components, four of them basin-scale pieces of >= 20 points; the classic one is
-186 fragments. Everything downstream (aotil/lobes.py, the GIS layers) works one
-component at a time, so this script writes one row per component.
+A region is a connected component of the subgraph that the top-S points of a selection
+(<cell>_S<S>_theta.npy) induce in the kNN graph the selection was penalised on. The graph is
+rebuilt exactly as oodselect_paper.py built it, and each budget is checked against what the
+selection run recorded (seed, variant, k, component and tile counts). A budget that fails a check
+writes nothing and the run exits 1. See docs/REGION-ANALYSIS-FLORIDA.md sections 2-3.
 
-DECISIONS, EACH WITH ITS REASON
--------------------------------
-1. THE GRAPH IS REBUILT, NOT APPROXIMATED. oodselect_paper.py calls
-   graph.build_adjacency(cell.lon, cell.lat, k=knn) with its defaults (EPSG:3086,
-   k nearest neighbours with self excluded, OR-symmetrised), and so does this
-   script. That way the components are the ones the penalty saw. k comes from the
-   run's own records: the knn column of *_result.csv, or *_meta.json if it ever
-   stores one, then the variant name (..._knn10). It is never guessed; --knn is
-   only a cross-check. Each budget is then checked against the component and tile
-   counts the selection run recorded (coh_n_cc, coh_tiles), and a mismatch fails
-   that budget. A different graph would give different regions without raising
-   any error.
-2. THE MASK IS THE PAPER'S. np.argsort(-theta, kind="stable")[:S], exactly as
-   oodselect_paper.py and report_paper.py take it (ties go to the lower index).
-3. COMPONENT IDS ARE 0..n-1 BY SIZE, LARGEST FIRST. Ties go to the component
-   holding the lowest OOD column index. scipy's own labels follow visiting order,
-   which shifts whenever the cell's row order does; "component 0 is the largest"
-   survives a rebuild. REGION-ANALYSIS-FLORIDA.md section 2.1 numbers the v1
-   components by scipy's labels: its cc 0, 1, 4, 2 are components 0, 1, 2, 3 here.
-4. POINT_ID. A v2 cell stores the point_id of its OOD half (zoo.py). The join to
-   --data is checked: every id must be found, lon/lat must equal the cell's to
-   1e-9, and labels must equal y_ood. A v1 cell has no point_id, so its OOD rows
-   are rebuilt the way zoo.run_cell made them: zoo.split_tiles(df, cell seed),
-   then zoo.subset(df, eval domain, protocol) on the test tiles, in dataset
-   order. The same checks apply and the script aborts if any fails. The cell
-   seed comes from the tag (_s<seed>), so --data must be the dataset the cell
-   was built from.
-5. DISTANCES ARE IN EPSG:5070, taken from the dataset's own point geometry (the
-   CRS the sampler measured its 100 m floor in). Lon/lat are projected only when
-   a dataset has no 5070 geometry. The graph stays on 3086 because that is what
-   the selection used.
-       extent_km            diagonal of the component's bounding box, in km.
-                            It matches the "extent" column of section 2.1 to
-                            about 1 km (40.0 / 32.3 / 21.0 / 14.6 against 41 /
-                            33 / 22 / 14); extent_x_km and extent_y_km give the
-                            two spans.
-       median_nn_spacing_m  median distance from each point to its nearest
-                            neighbour WITHIN the component (NaN for one point).
-6. SOURCE POLYGON. meta_src_row_id is the idx_<ST> row_id of the polygon behind
-   a point (sample_points.py note 8), and it is read from the dataset when the
-   dataset carries it. v1 does not. For v1 positives the id is recovered from
-   (dfirm_id, meta_fld_ar_id) through prep/idx_<ST>.parquet; the pair is used
-   because FLD_AR_ID alone repeats. Where the pair itself names several rows
-   (39 in Florida), the id is taken from the candidate polygon that covers the
-   point, reading only those polygons' row groups (sample_points.read_geoms). The
-   ring polygon behind a v1 band negative was never recorded, so its id stays
-   null.
-7. --seed IS THE SELECTION SEED (oodselect_paper.py --seed). The theta file name
-   does not carry it, so it is checked against each budget's *_result.csv.
-8. THE VARIANT IS THE RUN'S, NOT THE FOLDER'S. The outputs are named after
-   --variant (default: the --results-dir name), and that name must equal what
-   each *_result.csv records: its variant column, or, in a file without one,
-   the name oodselect_paper.py builds from its mu and knn columns ("classic" at
-   mu = 0, else spatial_mu<mu>_knn<k>). The column comes first because a
-   suffixed variant (null-select, a family split) would record its own name
-   there while its mu reads like the plain variant's. A disagreement fails the
-   budget. Without this, a typo that points a spatial label at the classic
-   folder writes the 186 classic fragments as the spatial regions, every other
-   check passes (they come from the same folder), and lobes.py analyses the
-   wrong set. With no result.csv the name cannot be checked, and the run prints
-   that it is unverified.
+Outputs in --out (prefix = <cell>_<variant>_S<S>):
+  <prefix>_points.parquet   one row per selected point, ordered by component
+  <prefix>_components.csv   one row per component; ge_min_size flags those of >= --min-size points
 
-Nothing written here is a model feature: the outputs are per-region tables, and
-their point columns are identifiers and meta_ provenance.
-
-OUTPUTS (prefix = <cell>_<variant>_S<S>)
--------
-<out>/<prefix>_points.parquet     one row per selected point, ordered by component:
-                                  point_id, lon, lat, label, component,
-                                  component_size, tile_50km, county_fips,
-                                  meta_fld_ar_id, meta_src_row_id, dfirm_id,
-                                  then cell, variant, S, seed (constant per
-                                  file, so tables from several seeds or budgets
-                                  can be stacked and still told apart)
-<out>/<prefix>_components.csv     one row per component, ALL of them; ge_min_size
-                                  flags those of >= --min-size points. tiles,
-                                  counties and dfirm_ids are ';'-joined, most
-                                  points first.
-
-USAGE
------
     python aotil/regions.py --cells-dir data/interim/aotil/cells --cell FL_band_AE_s0 \\
         --results-dir results/<date>/oodselect_paper/spatial_mu3_knn10 \\
-        --budgets 250 500 --data data/processed/dataset_FL.parquet
-    ... --out results/<date>/regions   (default: results/<today>/regions)
-    ... --overwrite                    (redo budgets whose two outputs exist)
+        --budgets 250 500 --data data/processed/dataset_FL.parquet --out results/<date>/regions
 """
 from __future__ import annotations
 
@@ -112,24 +29,31 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+import shapely
+from pyproj import Transformer
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))     # sample_points
+sys.path.insert(0, str(HERE))            # graph, cells, zoo
 import graph  # noqa: E402
+import sample_points as sp  # noqa: E402
 from cells import load_cell  # noqa: E402
 
 PREP_DIR = Path("data/interim/prep")
 CRS_POINTS = 5070          # the sampler's metric CRS; every distance here is in it
 LONLAT_TOL = 1e-9          # degrees; the cell's lon/lat are copies of the dataset's
+DEFAULT_KNN = 10           # oodselect_paper.py's default, used when no record states k
 
 DATA_COLS = ["point_id", "domain", "label", "neg_protocol", "tile_50km", "lon", "lat",
              "county_fips", "dfirm_id", "meta_fld_ar_id", "landcover", "hand",
              "meta_dist_to_river_m"]
-OPTIONAL_COLS = ["meta_src_row_id", "geometry"]
+OPTIONAL_COLS = ["meta_src_row_id", "meta_point_county", "geometry"]
+# The points table; cell, variant, S and seed follow, so tables of several runs can be stacked.
 POINT_COLS = ["point_id", "lon", "lat", "label", "component", "component_size",
-              "tile_50km", "county_fips", "meta_fld_ar_id", "meta_src_row_id", "dfirm_id"]
+              "tile_50km", "county_fips", "meta_point_county", "meta_fld_ar_id",
+              "meta_src_row_id", "dfirm_id"]
 
 # NLCD class names, for the dominant land cover of each component.
 NLCD = {11: "open water", 12: "perennial ice/snow", 21: "developed, open space",
@@ -148,13 +72,23 @@ class BudgetFailed(RuntimeError):
 
 # ----------------------------------------------------------------- inputs
 def parse_tag(tag: str) -> dict:
-    """cells.cell_tag in reverse: FL_band_AE_s0 -> state, protocol, domains, seed."""
-    m = TAG_RE.match(tag)
-    if not m:
+    """FL_band_AE_s0 -> state, protocol, train and eval domains, cell seed."""
+    match = TAG_RE.match(tag)
+    if not match:
         raise SystemExit(f"cannot parse cell tag {tag!r} (expected <ST>_<protocol>_<A|AE>_s<seed>)")
-    d = m.groupdict()
-    return dict(state=d["state"], protocol=d["protocol"], train=d["train"],
-                eval="AE" if d["train"] == "A" else "A", seed=int(d["seed"]))
+    fields = match.groupdict()
+    eval_domain = "AE" if fields["train"] == "A" else "A"
+    return dict(state=fields["state"], protocol=fields["protocol"], train=fields["train"],
+                eval=eval_domain, seed=int(fields["seed"]))
+
+
+def geometry_crs_id(pf: pq.ParquetFile) -> dict:
+    """The CRS id GeoParquet metadata states for the geometry column, e.g.
+    {"authority": "EPSG", "code": 5070}; {} when it states none."""
+    metadata = pf.schema_arrow.metadata or {}
+    geo = json.loads(metadata.get(b"geo") or b"{}")
+    crs = geo.get("columns", {}).get("geometry", {}).get("crs") or {}
+    return crs.get("id", {})
 
 
 def load_dataset(path: Path) -> pd.DataFrame:
@@ -166,8 +100,7 @@ def load_dataset(path: Path) -> pd.DataFrame:
         raise SystemExit(f"{path}: missing columns {missing}")
     cols = DATA_COLS + [c for c in OPTIONAL_COLS if c in names]
     if "geometry" in cols:
-        geo = json.loads((pf.schema_arrow.metadata or {}).get(b"geo", b"{}") or b"{}")
-        crs = (geo.get("columns", {}).get("geometry", {}).get("crs") or {}).get("id", {})
+        crs = geometry_crs_id(pf)
         if not (crs.get("authority") == "EPSG" and int(crs.get("code", -1)) == CRS_POINTS):
             print(f"  note: {path.name} geometry CRS is {crs or 'unstated'}, not "
                   f"EPSG:{CRS_POINTS}; projecting lon/lat instead", flush=True)
@@ -175,14 +108,24 @@ def load_dataset(path: Path) -> pd.DataFrame:
     df = pq.read_table(path, columns=cols).to_pandas()
     if not df.point_id.is_unique:
         raise SystemExit(f"{path}: point_id is not unique")
+    if "meta_point_county" not in df:
+        print(f"  note: {path.name} has no meta_point_county; counties fall back to "
+              f"county_fips, the DFIRM's county, which a band negative need not lie in",
+              flush=True)
+        df["meta_point_county"] = pd.array([pd.NA] * len(df), dtype="string")
     return df
 
 
 def ood_rows(cell, df: pd.DataFrame, info: dict) -> tuple[pd.DataFrame, str]:
-    """Dataset rows in the cell's OOD column order, verified against the cell."""
-    pid = getattr(cell, "point_id", None)
-    if pid is not None:
-        pid = np.asarray(pid).astype(str)
+    """Dataset rows in the cell's OOD column order, verified against the cell.
+
+    A v2 cell stores the point_id of its OOD points. A v1 cell does not, so its OOD rows are
+    rebuilt as zoo.py made them: the test tiles of zoo.split_tiles(cell seed), then the eval
+    domain's rows of zoo.subset in dataset order. Either way lon/lat, labels and tiles must
+    reproduce the cell's, or the run aborts (--data is not the dataset the cell was built from).
+    """
+    if cell.point_id is not None:
+        pid = np.asarray(cell.point_id).astype(str)
         by_id = df.set_index("point_id")
         absent = ~pd.Index(pid).isin(by_id.index)
         if absent.any():
@@ -191,7 +134,7 @@ def ood_rows(cell, df: pd.DataFrame, info: dict) -> tuple[pd.DataFrame, str]:
         rows = by_id.loc[pid].reset_index()
         how = "the cell's point_id"
     else:
-        import zoo                       # sklearn and xgboost load only on this path
+        import zoo                       # loads sklearn and xgboost, so only on this path
         _, test = zoo.split_tiles(df, info["seed"])
         rows = zoo.subset(df, info["eval"], info["protocol"])
         rows = rows[rows.tile_50km.isin(test)].reset_index(drop=True)
@@ -204,8 +147,10 @@ def ood_rows(cell, df: pd.DataFrame, info: dict) -> tuple[pd.DataFrame, str]:
     dlon = float(np.abs(rows.lon.to_numpy(float) - cell.lon.astype(float)).max())
     dlat = float(np.abs(rows.lat.to_numpy(float) - cell.lat.astype(float)).max())
     bad_y = int((rows.label.to_numpy() != np.asarray(cell.y_ood)).sum())
-    bad_t = (int((rows.tile_50km.astype(str).to_numpy() != cell.tile_50km.astype(str)).sum())
-             if cell.tile_50km is not None else 0)
+    if cell.tile_50km is None:
+        bad_t = 0
+    else:
+        bad_t = int((rows.tile_50km.astype(str).to_numpy() != cell.tile_50km.astype(str)).sum())
     print(f"  OOD rows: {how}; max |dlon| {dlon:.1e}, |dlat| {dlat:.1e}, "
           f"label mismatches {bad_y}, tile mismatches {bad_t}", flush=True)
     if dlon > LONLAT_TOL or dlat > LONLAT_TOL or bad_y or bad_t:
@@ -214,22 +159,37 @@ def ood_rows(cell, df: pd.DataFrame, info: dict) -> tuple[pd.DataFrame, str]:
 
 
 def points_5070(rows: pd.DataFrame) -> tuple[np.ndarray, str]:
-    """(x, y) in EPSG:5070: the dataset's geometry, else lon/lat projected."""
-    import shapely
+    """(x, y) in EPSG:5070, the CRS the sampler measured in: the dataset's own geometry, else
+    lon/lat projected. Only distances use it; the graph stays on the selection's EPSG:3086."""
     if "geometry" in rows:
         xy = shapely.get_coordinates(shapely.from_wkb(rows.geometry.to_numpy()))
         if len(xy) == len(rows):
             return xy, "dataset geometry (EPSG:5070)"
-    from pyproj import Transformer
     tf = Transformer.from_crs("EPSG:4269", f"EPSG:{CRS_POINTS}", always_xy=True)
     x, y = tf.transform(rows.lon.to_numpy(float), rows.lat.to_numpy(float))
     return np.column_stack([x, y]), f"lon/lat projected EPSG:4269 -> {CRS_POINTS}"
 
 
+def covering_polygons(row_ids, geoms: dict, point) -> list:
+    """The row_ids among row_ids whose polygon covers point."""
+    hits = []
+    for r in row_ids:
+        g = geoms.get(r)
+        if g is not None and g.covers(point):
+            hits.append(r)
+    return hits
+
+
 def source_row_ids(sel: pd.DataFrame, xy: np.ndarray, state: str,
                    prep_dir: Path) -> tuple[pd.Series, str]:
-    """meta_src_row_id for the selected points (decision 6). sel has a RangeIndex
-    aligned with xy."""
+    """meta_src_row_id of each selected point: the idx_<ST> row_id of the polygon the point was
+    sampled from (for a band negative, the polygon whose ring produced it).
+
+    A v2 dataset carries it. For v1 positives it is recovered from (dfirm_id, meta_fld_ar_id)
+    through idx_<ST>, as FLD_AR_ID alone repeats; where even the pair names several rows (39 in
+    Florida), from the candidate polygon that covers the point. v1 never recorded a band
+    negative's ring polygon, so its id stays null. sel has a RangeIndex aligned with xy.
+    """
     if "meta_src_row_id" in sel:
         s = sel.meta_src_row_id.astype("Int64")
         return s, f"from the dataset ({int(s.notna().sum())} of {len(s)} set)"
@@ -239,84 +199,94 @@ def source_row_ids(sel: pd.DataFrame, xy: np.ndarray, state: str,
         return out, f"unavailable: no meta_src_row_id in the dataset and {idx_p} missing"
 
     idx = pq.read_table(idx_p, columns=["row_id", "DFIRM_ID", "FLD_AR_ID"]).to_pandas()
-    has = sel.meta_fld_ar_id.notna().to_numpy()
-    key = pd.DataFrame(dict(i=np.flatnonzero(has),
-                            DFIRM_ID=sel.dfirm_id[has].astype(str).to_numpy(),
-                            FLD_AR_ID=sel.meta_fld_ar_id[has].astype(str).to_numpy()))
-    cand = key.merge(idx.astype({"DFIRM_ID": str, "FLD_AR_ID": str}),
-                     on=["DFIRM_ID", "FLD_AR_ID"], how="inner")
+    idx = idx.astype({"DFIRM_ID": str, "FLD_AR_ID": str})
+    has_key = sel.meta_fld_ar_id.notna().to_numpy()
+    keys = pd.DataFrame(dict(i=np.flatnonzero(has_key),
+                             DFIRM_ID=sel.dfirm_id[has_key].astype(str).to_numpy(),
+                             FLD_AR_ID=sel.meta_fld_ar_id[has_key].astype(str).to_numpy()))
+    cand = keys.merge(idx, on=["DFIRM_ID", "FLD_AR_ID"], how="inner")
     n_cand = cand.groupby("i").row_id.transform("size")
-    one = cand[n_cand == 1]
-    out.iloc[one.i.to_numpy()] = one.row_id.to_numpy()
+    unique = cand[n_cand == 1]
+    out.iloc[unique.i.to_numpy()] = unique.row_id.to_numpy()
 
-    amb = cand[n_cand > 1]
-    n_amb, n_res = int(amb.i.nunique()), 0
-    if n_amb:
-        import shapely
-        sys.path.insert(0, str(HERE.parent))
-        import sample_points as sp
-        # read_geoms opens <PREP_DIR>/haz_<ST>_5070.parquet; point it at --prep-dir.
+    repeated = cand[n_cand > 1]
+    n_repeated = int(repeated.i.nunique())
+    n_resolved = 0
+    if n_repeated:
+        # read_geoms opens <sp.PREP_DIR>/haz_<ST>_5070.parquet; point it at prep_dir.
         sp.PREP_DIR = prep_dir
-        rid = amb.row_id.unique()
+        rid = repeated.row_id.unique()
         geoms = dict(zip(rid.tolist(), sp.read_geoms(state, rid)))
-        for i, grp in amb.groupby("i"):
-            pt = shapely.Point(xy[i])
-            hits = [r for r in grp.row_id if geoms.get(r) is not None and geoms[r].covers(pt)]
+        for i, grp in repeated.groupby("i"):
+            hits = covering_polygons(grp.row_id, geoms, shapely.Point(xy[i]))
             if len(hits) == 1:
                 out.iloc[i] = hits[0]
-                n_res += 1
-    n_none = int(has.sum()) - int(cand.i.nunique())
+                n_resolved += 1
+    n_unknown = int(has_key.sum()) - int(cand.i.nunique())
     n_null = int(out.isna().sum())
     neg_null = int((out.isna() & (sel.label == 0)).sum())
     return out, (f"recovered from (dfirm_id, meta_fld_ar_id) via {idx_p.name}: "
-                 f"{len(one)} points by a unique key, {n_res} of {n_amb} points with a "
-                 f"repeated key by point-in-polygon, {n_none} points whose key is not in "
+                 f"{len(unique)} points by a unique key, {n_resolved} of {n_repeated} points with "
+                 f"a repeated key by point-in-polygon, {n_unknown} points whose key is not in "
                  f"the index; {n_null} null ({neg_null} negatives, whose source ring this "
                  f"dataset never recorded)")
 
 
 def resolve_knn(results_dir: Path, stem: str, variant: str, cli_knn: int | None) -> tuple[int, str]:
-    """k from the run's records (decision 1); every source present must agree."""
+    """k of the selection's graph and where it was read.
+
+    Sources: the knn column of <stem>_result.csv, <stem>_meta.json, the variant name (..._knn10)
+    and --knn as a cross-check. Every source present must agree: a different k would give
+    different regions without raising any error.
+    """
     found = {}
     res_p = results_dir / f"{stem}_result.csv"
     if res_p.exists():
-        r = pd.read_csv(res_p)
-        if "knn" in r and r.knn.notna().any():
-            found["result.csv"] = int(r.knn.iloc[0])
+        result = pd.read_csv(res_p)
+        if "knn" in result and result.knn.notna().any():
+            found["result.csv"] = int(result.knn.iloc[0])
     meta_p = results_dir / f"{stem}_meta.json"
     if meta_p.exists():
         meta = json.loads(meta_p.read_text())
         if "knn" in meta:
             found["meta.json"] = int(meta["knn"])
-    m = re.search(r"knn(\d+)", variant)
-    if m:
-        found["variant name"] = int(m.group(1))
+    k_in_name = re.search(r"knn(\d+)", variant)
+    if k_in_name:
+        found["variant name"] = int(k_in_name.group(1))
     if cli_knn is not None:
         found["--knn"] = int(cli_knn)
     if len(set(found.values())) > 1:
         raise BudgetFailed(f"k disagrees across sources: {found}")
     if not found:
-        return 10, "oodselect_paper.py default (nothing recorded)"
-    return next(iter(found.values())), " = ".join(found)
+        return DEFAULT_KNN, "oodselect_paper.py default (nothing recorded)"
+    return list(found.values())[0], " = ".join(found)
 
 
 def recorded(results_dir: Path, stem: str) -> dict:
     """What the selection run itself wrote about this budget, if anything."""
-    p = results_dir / f"{stem}_result.csv"
-    if not p.exists():
+    res_p = results_dir / f"{stem}_result.csv"
+    if not res_p.exists():
         return {}
-    return pd.read_csv(p).iloc[0].to_dict()
+    return pd.read_csv(res_p).iloc[0].to_dict()
 
 
 def check_variant(rec: dict, variant: str, stem: str) -> str:
-    """The variant the run recorded must be the one the outputs are named after
-    (decision 8). Returns where the name was confirmed."""
+    """The outputs' variant name must be the one the run recorded; returns where it was found.
+
+    Without this check, a spatial label pointed at the classic folder would pass every other
+    check (they read the same folder) and write the classic fragments as the spatial regions.
+    The variant column comes before the name built from mu and knn, because a suffixed variant
+    (null-select, a family split) records its own name while its mu reads like the plain one's.
+    """
     if pd.notna(rec.get("variant")):
         src, name = "result.csv variant", str(rec["variant"])
     elif pd.notna(rec.get("mu")) and pd.notna(rec.get("knn")):
         mu = float(rec["mu"])
         src = "result.csv mu/knn"
-        name = "classic" if mu == 0 else f"spatial_mu{mu:g}_knn{int(rec['knn'])}"
+        if mu == 0:
+            name = "classic"
+        else:
+            name = f"spatial_mu{mu:g}_knn{int(rec['knn'])}"
     else:
         return "unverified: no result.csv records it"
     if name != variant:
@@ -328,22 +298,38 @@ def check_variant(rec: dict, variant: str, stem: str) -> str:
 
 # ----------------------------------------------------------------- regions
 def top_mask(theta: np.ndarray, S: int) -> np.ndarray:
-    """oodselect_paper.main's mask, verbatim."""
-    m = np.zeros(len(theta), bool)
-    m[np.argsort(-theta, kind="stable")[:S]] = True
-    return m
+    """The selection as oodselect_paper.py and report_paper.py take it: the S largest theta,
+    ties to the lower index (stable argsort)."""
+    mask = np.zeros(len(theta), bool)
+    mask[np.argsort(-theta, kind="stable")[:S]] = True
+    return mask
 
 
 def components(A, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Component id per selected point (decision 3) and the sizes in id order."""
-    n, lab = connected_components(A[mask][:, mask], directed=False)
-    sizes = np.bincount(lab, minlength=n)
+    """Component id of each selected point, and the component sizes in id order.
+
+    Ids are 0..n-1 by size, largest first, ties to the component holding the lowest OOD column
+    index. scipy's own labels follow visiting order, which shifts with the cell's row order.
+    """
+    n, labels = connected_components(A[mask][:, mask], directed=False)
+    sizes = np.bincount(labels, minlength=n)
     first = np.full(n, mask.sum())
-    np.minimum.at(first, lab, np.arange(len(lab)))      # lowest OOD index per component
+    np.minimum.at(first, labels, np.arange(len(labels)))    # lowest OOD index per component
     order = np.lexsort((first, -sizes))
     rank = np.empty(n, int)
     rank[order] = np.arange(n)
-    return rank[lab], sizes[order]
+    return rank[labels], sizes[order]
+
+
+def point_county(t: pd.DataFrame) -> pd.Series:
+    """The county each point lies in: meta_point_county, else county_fips.
+
+    county_fips is the point's DFIRM's county, and a band negative takes the DFIRM
+    of the polygon whose ring produced it, which can be the next county's.
+    """
+    if "meta_point_county" not in t:
+        return t.county_fips
+    return t.meta_point_county.astype(object).where(t.meta_point_county.notna(), t.county_fips)
 
 
 def _ranked(s: pd.Series) -> list:
@@ -352,43 +338,67 @@ def _ranked(s: pd.Series) -> list:
     return sorted(vc.index, key=lambda v: (-vc[v], v))
 
 
+def polygon_keys(sel: pd.DataFrame) -> np.ndarray:
+    """A name for each point's source polygon: 'r<row_id>', else '<dfirm_id>|<fld_ar_id>',
+    else '' when neither is known."""
+    by_row_id = "r" + sel.meta_src_row_id.astype(str)
+    by_pair = sel.dfirm_id.astype(str) + "|" + sel.meta_fld_ar_id.astype(str)
+    pair_or_blank = np.where(sel.meta_fld_ar_id.notna(), by_pair, "")
+    return np.where(sel.meta_src_row_id.notna(), by_row_id, pair_or_blank)
+
+
+def nn_spacing_m(points_xy: np.ndarray) -> np.ndarray:
+    """Each point's distance to its nearest other point; [nan] for a single point."""
+    if len(points_xy) > 1:
+        # k=2 because each point's nearest neighbour in the tree is itself.
+        return cKDTree(points_xy).query(points_xy, k=2)[0][:, 1]
+    return np.array([np.nan])
+
+
+def dominant_landcover(landcover: pd.Series) -> tuple:
+    """(NLCD code, class name, share of points) of the most common class, ties to the lower
+    code; (NA, "", nan) when no point has one."""
+    lc = landcover.dropna()
+    if not len(lc):
+        return pd.NA, "", np.nan
+    vc = lc.round().astype(int).value_counts()
+    code = int(sorted(vc.index, key=lambda v: (-vc[v], v))[0])
+    return code, NLCD.get(code, ""), float(vc[code] / len(lc))
+
+
 def component_table(sel: pd.DataFrame, xy: np.ndarray, comp: np.ndarray,
                     sizes: np.ndarray, min_size: int) -> pd.DataFrame:
-    """One row per component (decision 5 for the distance columns)."""
-    poly = np.where(sel.meta_src_row_id.notna(), "r" + sel.meta_src_row_id.astype(str),
-                    np.where(sel.meta_fld_ar_id.notna(),
-                             sel.dfirm_id.astype(str) + "|" + sel.meta_fld_ar_id.astype(str), ""))
+    """One row per component. Distances are in EPSG:5070: extent_km is the diagonal of the
+    points' bounding box, median_nn_spacing_m is within the component. tiles, counties and
+    dfirm_ids are ';'-joined, most points first."""
+    poly = polygon_keys(sel)
     rows = []
     for c in range(len(sizes)):
-        m = comp == c
-        s, p = sel[m], xy[m]
-        dx, dy = np.ptp(p[:, 0]) / 1e3, np.ptp(p[:, 1]) / 1e3
-        nn = cKDTree(p).query(p, k=2)[0][:, 1] if len(p) > 1 else np.array([np.nan])
-        lc = s.landcover.dropna()
-        if len(lc):
-            vc = lc.round().astype(int).value_counts()
-            code = sorted(vc.index, key=lambda v: (-vc[v], v))[0]
-            lc_code, lc_frac = int(code), float(vc[code] / len(lc))
-        else:
-            lc_code, lc_frac = pd.NA, np.nan
-        tiles, counties, dfirms = _ranked(s.tile_50km), _ranked(s.county_fips), _ranked(s.dfirm_id)
-        pk = poly[m][(s.label == 1).to_numpy()]
+        members = comp == c
+        pts, pts_xy = sel[members], xy[members]
+        dx = np.ptp(pts_xy[:, 0]) / 1e3
+        dy = np.ptp(pts_xy[:, 1]) / 1e3
+        lc_code, lc_name, lc_frac = dominant_landcover(pts.landcover)
+        tiles = _ranked(pts.tile_50km)
+        counties = _ranked(point_county(pts))
+        dfirms = _ranked(pts.dfirm_id)
+        positive_keys = poly[members][(pts.label == 1).to_numpy()]
         rows.append(dict(
-            component=c, n_points=int(m.sum()), n_positive=int((s.label == 1).sum()),
+            component=c, n_points=int(members.sum()), n_positive=int((pts.label == 1).sum()),
             n_tiles=len(tiles), tiles=";".join(tiles),
             n_counties=len(counties), counties=";".join(counties),
             extent_km=float(np.hypot(dx, dy)),
-            median_nn_spacing_m=float(np.median(nn)),
+            median_nn_spacing_m=float(np.median(nn_spacing_m(pts_xy))),
             dominant_landcover=lc_code,
-            median_hand=float(s.hand.median()),
-            median_dist_to_river_m=float(s.meta_dist_to_river_m.median()),
-            ge_min_size=bool(m.sum() >= min_size),
-            dominant_landcover_name=NLCD.get(lc_code, "") if lc_code is not pd.NA else "",
+            median_hand=float(pts.hand.median()),
+            median_dist_to_river_m=float(pts.meta_dist_to_river_m.median()),
+            ge_min_size=bool(members.sum() >= min_size),
+            dominant_landcover_name=lc_name,
             dominant_landcover_frac=lc_frac,
             extent_x_km=float(dx), extent_y_km=float(dy),
-            n_polygons=int(len(set(pk[pk != ""]))),
+            n_polygons=int(len(set(positive_keys[positive_keys != ""]))),
             dfirm_ids=";".join(dfirms),
-            lon_center=float(s.lon.mean()), lat_center=float(s.lat.mean()),
+            lon_center=float(pts.lon.mean()), lat_center=float(pts.lat.mean()),
         ))
     out = pd.DataFrame(rows)
     out["dominant_landcover"] = out.dominant_landcover.astype("Int64")
@@ -409,63 +419,80 @@ def print_components(tab: pd.DataFrame, min_size: int) -> None:
               f"{r.dominant_landcover_name} ({r.dominant_landcover_frac:.0%})")
 
 
-def run_budget(S: int, cell, rows, xy, a, variant: str, adj: dict, paths) -> None:
-    stem = f"{a.cell}_S{S}"
-    th_p = a.results_dir / f"{stem}_theta.npy"
+def load_theta(th_p: Path, d: int, S: int) -> np.ndarray:
+    """The selection's theta, one entry per OOD point, with S a proper budget."""
     if not th_p.exists():
         raise BudgetFailed(f"{th_p} missing")
     theta = np.load(th_p)
-    if len(theta) != cell.d:
-        raise BudgetFailed(f"{th_p.name} has {len(theta):,} entries, the cell {cell.d:,} OOD points")
-    if not 0 < S < cell.d:
-        raise BudgetFailed(f"budget {S} outside (0, d = {cell.d})")
-    rec = recorded(a.results_dir, stem)
-    if rec and "seed" in rec and int(rec["seed"]) != a.seed:
+    if len(theta) != d:
+        raise BudgetFailed(f"{th_p.name} has {len(theta):,} entries, the cell {d:,} OOD points")
+    if not 0 < S < d:
+        raise BudgetFailed(f"budget {S} outside (0, d = {d})")
+    return theta
+
+
+def coherence_check(rec: dict, n_cc: int, n_tiles: int) -> str:
+    """The component and tile counts must equal those the selection run recorded; otherwise the
+    graph or the mask is not the selection's. Returns the report's wording."""
+    if "coh_n_cc" not in rec or "coh_tiles" not in rec:
+        return "; no recorded coh_n_cc/coh_tiles to check against"
+    want_cc, want_tiles = int(rec["coh_n_cc"]), int(rec["coh_tiles"])
+    if want_cc != n_cc or want_tiles != n_tiles:
+        raise BudgetFailed(f"{n_cc} components / {n_tiles} tiles here against "
+                           f"{want_cc} / {want_tiles} recorded: "
+                           f"the graph or the mask is not the selection's")
+    return f"; the selection run recorded {want_cc} components, {want_tiles} tiles: match"
+
+
+def run_budget(S: int, args, state: str, variant: str, cell, rows: pd.DataFrame, xy: np.ndarray,
+               graphs: dict, paths: tuple[Path, Path]) -> None:
+    """Find, check, report and write the regions of one budget. graphs caches k -> adjacency
+    across budgets. Raises BudgetFailed, before writing anything, when a check fails."""
+    stem = f"{args.cell}_S{S}"
+    theta = load_theta(args.results_dir / f"{stem}_theta.npy", cell.d, S)
+    rec = recorded(args.results_dir, stem)
+    # The theta file name does not carry the selection seed, so it is checked here.
+    if "seed" in rec and int(rec["seed"]) != args.seed:
         raise BudgetFailed(f"{stem}_result.csv records selection seed {int(rec['seed'])}, "
-                           f"--seed is {a.seed}")
+                           f"--seed is {args.seed}")
     v_src = check_variant(rec, variant, stem)
-    knn, k_src = resolve_knn(a.results_dir, stem, variant, a.knn)
-    if knn not in adj:
-        adj[knn] = graph.build_adjacency(cell.lon, cell.lat, k=knn)
+    knn, k_src = resolve_knn(args.results_dir, stem, variant, args.knn)
+    if knn not in graphs:
+        # oodselect_paper.py's call: build_adjacency's defaults (EPSG:3086, self excluded,
+        # OR-symmetrised), so the components are the ones the penalty saw.
+        graphs[knn] = graph.build_adjacency(cell.lon, cell.lat, k=knn)
 
     mask = top_mask(theta, S)
-    comp, sizes = components(adj[knn], mask)
+    comp, sizes = components(graphs[knn], mask)
     sel = rows[mask].reset_index(drop=True)
     sxy = xy[mask]
-    src, src_note = source_row_ids(sel, sxy, a.info["state"], a.prep_dir)
+    src, src_note = source_row_ids(sel, sxy, state, args.prep_dir)
     sel["meta_src_row_id"] = src
     sel["component"] = comp.astype(np.int32)
     sel["component_size"] = sizes[comp].astype(np.int32)
-    tab = component_table(sel, sxy, comp, sizes, a.min_size)
+    tab = component_table(sel, sxy, comp, sizes, args.min_size)
 
-    n_cc, n_tiles = len(sizes), int(sel.tile_50km.nunique())
+    n_cc = len(sizes)
+    n_tiles = int(sel.tile_50km.nunique())
     n_pos = int((sel.label == 1).sum())
     print(f"\n--- S = {S}: {S:,} of {cell.d:,} OOD points ({n_pos} positive, "
           f"{S - n_pos} negative) | variant {variant} ({v_src}) | k = {knn} ({k_src})",
           flush=True)
-    check = ""
-    if "coh_n_cc" in rec and "coh_tiles" in rec:
-        ok = int(rec["coh_n_cc"]) == n_cc and int(rec["coh_tiles"]) == n_tiles
-        check = (f"; the selection run recorded {int(rec['coh_n_cc'])} components, "
-                 f"{int(rec['coh_tiles'])} tiles: {'match' if ok else 'MISMATCH'}")
-        if not ok:
-            raise BudgetFailed(f"{n_cc} components / {n_tiles} tiles here against "
-                               f"{int(rec['coh_n_cc'])} / {int(rec['coh_tiles'])} recorded: "
-                               f"the graph or the mask is not the selection's")
-    else:
-        check = "; no recorded coh_n_cc/coh_tiles to check against"
+    check = coherence_check(rec, n_cc, n_tiles)
     print(f"  {n_cc} components across {n_tiles} tiles{check}")
     big = tab[tab.ge_min_size]
-    print(f"  {len(big)} components of >= {a.min_size} points hold "
-          f"{int(big.n_points.sum())} points ({big.n_points.sum() / S:.1%}); sizes "
-          f"{', '.join(map(str, big.n_points)) or '-'}")
+    big_sizes = ", ".join(map(str, big.n_points)) or "-"
+    print(f"  {len(big)} components of >= {args.min_size} points hold "
+          f"{int(big.n_points.sum())} points ({big.n_points.sum() / S:.1%}); sizes {big_sizes}")
     print(f"  meta_src_row_id: {src_note}")
-    print_components(tab, a.min_size)
+    print_components(tab, args.min_size)
 
     pts = sel[POINT_COLS].sort_values("component", kind="stable").reset_index(drop=True)
     pts = pts.astype({"point_id": str, "label": np.int8, "tile_50km": str})
-    pts["cell"], pts["variant"] = a.cell, variant
-    pts["S"], pts["seed"] = np.int32(S), np.int32(a.seed)
+    pts["cell"] = args.cell
+    pts["variant"] = variant
+    pts["S"] = np.int32(S)
+    pts["seed"] = np.int32(args.seed)
     pts_p, comp_p = paths
     pts_p.parent.mkdir(parents=True, exist_ok=True)
     pts.to_parquet(pts_p, index=False)
@@ -480,9 +507,10 @@ def main() -> int:
     ap.add_argument("--cells-dir", required=True, type=Path)
     ap.add_argument("--cell", required=True, help="cell tag, e.g. FL_band_AE_s0")
     ap.add_argument("--results-dir", required=True, type=Path,
-                    help="one variant directory, e.g. results/<date>/oodselect_paper/spatial_mu3_knn10")
-    ap.add_argument("--variant", help="name used in the output files (default: the "
-                                      "--results-dir directory name)")
+                    help="one variant directory, e.g. "
+                         "results/<date>/oodselect_paper/spatial_mu3_knn10")
+    ap.add_argument("--variant", help="name used in the output files, checked against "
+                                      "*_result.csv (default: the --results-dir directory name)")
     ap.add_argument("--budgets", type=int, nargs="+", default=[250, 500])
     ap.add_argument("--seed", type=int, default=0,
                     help="selection seed (oodselect_paper.py --seed), checked against *_result.csv")
@@ -494,17 +522,18 @@ def main() -> int:
     ap.add_argument("--out", type=Path, help="default: results/<today>/regions")
     ap.add_argument("--min-size", type=int, default=20,
                     help="components of at least this many points are flagged and printed")
-    ap.add_argument("--overwrite", action="store_true")
-    a = ap.parse_args()
-    a.info = parse_tag(a.cell)
-    variant = a.variant or a.results_dir.name
-    out = a.out or Path("results") / date.today().isoformat() / "regions"
+    ap.add_argument("--overwrite", action="store_true",
+                    help="redo budgets whose two outputs exist")
+    args = ap.parse_args()
+    info = parse_tag(args.cell)
+    variant = args.variant or args.results_dir.name
+    out = args.out or Path("results") / date.today().isoformat() / "regions"
 
     todo = []
-    for S in a.budgets:
-        prefix = f"{a.cell}_{variant}_S{S}"
+    for S in args.budgets:
+        prefix = f"{args.cell}_{variant}_S{S}"
         paths = (out / f"{prefix}_points.parquet", out / f"{prefix}_components.csv")
-        if all(p.exists() for p in paths) and not a.overwrite:
+        if all(p.exists() for p in paths) and not args.overwrite:
             print(f"{prefix}: outputs exist; skipping (--overwrite to redo)")
             continue
         todo.append((S, paths))
@@ -512,25 +541,27 @@ def main() -> int:
         return 0
 
     t0 = time.time()
-    print(f"=== regions {a.cell} | {variant} | budgets {[S for S, _ in todo]} ===", flush=True)
-    cell = load_cell(a.cells_dir, a.cell)
+    print(f"=== regions {args.cell} | {variant} | budgets {[S for S, _ in todo]} ===", flush=True)
+    cell = load_cell(args.cells_dir, args.cell)
     cell.require_spatial()
-    df = load_dataset(a.data)
+    df = load_dataset(args.data)
     print(f"  cell: {cell.n_models} models x {cell.d:,} OOD points | dataset "
-          f"{a.data.name}: {len(df):,} rows", flush=True)
-    rows, _ = ood_rows(cell, df, a.info)
+          f"{args.data.name}: {len(df):,} rows", flush=True)
+    rows, _ = ood_rows(cell, df, info)
     xy, xy_src = points_5070(rows)
     print(f"  distances from {xy_src}", flush=True)
 
-    adj, failed = {}, []
+    graphs, failed = {}, []
     for S, paths in todo:
         try:
-            run_budget(S, cell, rows, xy, a, variant, adj, paths)
+            run_budget(S, args, info["state"], variant, cell, rows, xy, graphs, paths)
         except BudgetFailed as e:
             print(f"\n--- S = {S}: FAILED, nothing written: {e}", flush=True)
             failed.append(S)
-    print(f"\ndone in {time.time() - t0:.0f}s: {len(todo) - len(failed)} budget(s) written "
-          f"to {out}" + (f"; FAILED {failed}" if failed else ""), flush=True)
+    summary = f"{len(todo) - len(failed)} budget(s) written to {out}"
+    if failed:
+        summary += f"; FAILED {failed}"
+    print(f"\ndone in {time.time() - t0:.0f}s: {summary}", flush=True)
     return 1 if failed else 0
 
 

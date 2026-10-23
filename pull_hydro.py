@@ -1,441 +1,455 @@
 #!/usr/bin/env python3
 """
-pull_hydro.py -- NHDPlus V2 + EPA StreamCat: the climate, soil and river covariates.
+Attach NHDPlus V2 and EPA StreamCat hydrology covariates to data/processed/dataset_{ST}.parquet.
 
-This closes the one categorical gap left in the feature set. The Earth Engine stack
-covers terrain and land surface, but it has no rainfall, no soil, no drainage
-density and no real distance to water -- and removing absolute elevation (which
-alone identifies the state at 58.3% against a 10% baseline) left a climate-shaped
-hole, because elevation was partly standing in for orography. A flood-susceptibility
-model with no precipitation and no soil permeability is a gap a reviewer will find
-before anything else.
+Stages, run in this order (the three fetch stages write to data/interim/hydro/ and skip a
+state whose output already exists; --merge can be rerun safely):
+  --inspect     list the layers and id fields of the .gdb under data/raw/nhdplus
+  --catchments  the catchment (COMID, area) containing each point    -> comid_{ST}.parquet
+  --flowlines   distance to the nearest river reach and to the coast, attributes of that
+                reach, drainage density of the point's catchment     -> river_{ST}.parquet
+  --streamcat   StreamCat metrics by county for the catchment (cat) and its upstream
+                watershed (ws): catchment context, not point values  -> streamcat_{ST}.parquet
+  --merge       join the three files onto dataset_{ST}.parquet and add new features to
+                FEATURES.txt
 
-WHAT EACH STAGE DOES
-====================
-
---inspect     List the layers and fields in the extracted geodatabase. Run this
-              FIRST. NHDPlus V2 names its catchment identifier `FEATUREID`, not
-              `COMID`, and layer names have varied across releases, so nothing else
-              here should run on an assumption about either.
-
---catchments  Per state, read only the catchments inside that state's point bounding
-              box and spatially join points -> COMID. Bounding-box reads keep this
-              off the 2.6M-polygon national layer; the same streaming discipline
-              that got the NFHL subset working.
-
---flowlines   Per state, distance from each point to the nearest NHD flowline, plus
-              drainage density (flowline km per km2) of its catchment. The distance
-              is what `water_frac_900m` was standing in for: that band is the
-              fraction of a 900 m neighbourhood JRC Global Surface Water has ever
-              seen as water, so it saturates near large rivers and reads zero on any
-              stream too small to detect -- and it is currently the LEADING
-              discriminator between Zone A and Zone AE (median 0.000 vs 0.087). A
-              real distance replaces a saturating proxy in the variable that matters
-              most for the explanation.
-
---streamcat   Pull EPA StreamCat metrics. Queried by county FIPS, which the point
-              data already carries for 99.86% of rows, so no COMID list has to be
-              uploaded. Both `cat` (the point's own catchment) and `ws` (its whole
-              upstream watershed) are fetched: the first is local conditions, the
-              second is what arrives from upstream, and for flooding they are
-              different questions.
-
---merge       Join everything onto data/processed/dataset_{ST}.parquet and rewrite
-              FEATURES.txt.
-
-A NOTE ON WHAT COUNTS AS A FEATURE
-==================================
-StreamCat metrics are catchment areal means, constant across a ~1-3 km2 catchment.
-They are legitimate covariates -- catchment context genuinely drives flooding -- but
-they are NOT point measurements, and a catchment is a spatial unit, so they can act
-as a location fingerprint the way absolute elevation did. Folds are grouped on
-`tile_50km` (50 km), which contains many catchments, so this is bounded rather than
-eliminated. If a StreamCat variable turns out to dominate the A-vs-AE separability
-the way `elev` did, quarantine it the same way.
-
-USAGE
-=====
-    7z x data/raw/nhdplus/NHDPlusV21_*.7z -odata/raw/nhdplus     # ~20 GB
-    python pull_hydro.py --inspect                  # confirm layers and fields
-    python pull_hydro.py --catchments               # points -> COMID
-    python pull_hydro.py --flowlines                # distance + drainage density
-    python pull_hydro.py --streamcat                # EPA metrics by county
-    python pull_hydro.py --merge                    # into dataset_{ST}.parquet
-    python pull_hydro.py --catchments VT            # one state, for a dry run
+    python pull_hydro.py --catchments FL
 """
-from __future__ import annotations
-
 import argparse
 import glob
-import io
-import json
 import os
 import sys
 import time
 from pathlib import Path
 
+# Set before GDAL loads. ONLY_CCW makes GDAL take counter-clockwise rings as holes instead
+# of testing every ring against every other, which is slow on many-part catchments; FileGDB
+# follows that ESRI ring convention.
 os.environ.setdefault("OGR_ORGANIZE_POLYGONS", "ONLY_CCW")
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-import geopandas as gpd
+import pyarrow.parquet as pq
 import pyogrio
+import requests
 import shapely
+from requests.adapters import HTTPAdapter
 from shapely import STRtree
+from urllib3.util.retry import Retry
 
 RAW = Path("data/raw/nhdplus")
 PROC = Path("data/processed")
 HYDRO = Path("data/interim/hydro")
 
-STATES = ["VT", "CO", "AZ", "MO", "MN", "IA", "LA", "NC", "TX", "FL"]
-CRS_GEO = 4269
-CRS_WORK = 5070          # metres: distances and densities are computed here
+STATES = ["FL"]
+CRS_GEO = 4269           # NAD83 lon/lat, as NHDPlus ships
+CRS_WORK = 5070          # CONUS Albers, metres: distances and densities are computed here
+BBOX_PAD_DEG = 0.05      # ~5 km around the points, so edge points still find a catchment
+# The nearest coastline can lie well outside the points' box (western-panhandle points
+# are nearest Perdido Bay), so Coastline is read with this wider pad.
+COAST_PAD_DEG = 1.0
 
-# StreamCat metrics. `cat` is the point's own catchment, `ws` its upstream watershed.
+# StreamCat metrics, each for the point's own catchment (cat) and its upstream watershed (ws).
 SC_METRICS = ["precip8110", "tmean8110", "runoff", "wetindex", "bfi",
               "clay", "sand", "perm", "kffact", "hydrlcond", "elev"]
 SC_URL = "https://api.epa.gov/StreamCat/streams/metrics"
 
-# Confirmed against the extracted national geodatabase, 2026-09-19:
-#   Catchment            2,647,454 features, EPSG:4269, id field FEATUREID
-#   NHDFlowline_Network  2,691,339 features, EPSG:4269, id field COMID
+# Layer and id-field names vary across NHDPlus releases; the first of each is what
+# prep_nhdplus_units.py writes. Catchments call their COMID `FEATUREID`.
 CATCHMENT_LAYERS = ["Catchment", "CatchmentSP", "NHDPlusCatchment"]
 FLOWLINE_LAYERS = ["NHDFlowline_Network", "NHDFlowline", "NHDFlowlineVAA"]
 COMID_FIELDS = ["FEATUREID", "COMID", "ComID", "comid"]
 
-# Fields worth taking off the flowline. The layer carries 157 of them -- most are
-# monthly flow and velocity estimates -- so the subset matters for memory.
+# The flowline layer has 157 fields, mostly monthly flow estimates; read only these.
 FLOW_FIELDS = ["COMID", "LENGTHKM", "StreamOrde", "TotDASqKM", "SLOPE", "FTYPE"]
-CATCH_FIELDS = ["FEATUREID", "AreaSqKM"]
 
-# FTYPE decides what "distance to river" means, and getting it wrong would have
-# been invisible. NHDFlowline_Network includes Coastline features: the shoreline
-# itself. Left in, every coastal point in Florida, Louisiana, North Carolina and
-# Texas would read a distance to "river" of nearly zero, and since Zone AE contains
-# 6,161 COASTAL FLOODPLAIN polygons the feature would have encoded coastal-versus-
-# riverine directly into what is supposed to be a terrain covariate.
-#
-# So Coastline is excluded from the river distance and measured separately as
-# `dist_to_coast_m`. That turns a contaminant into an honest feature: coastal and
-# riverine flooding are different processes, and the A/AE contrast sits across that
-# split. Pipelines are underground and excluded entirely.
+# Coastline is the shoreline itself. Counted as a river, every coastal point would read
+# ~0 m to a "river" and the feature would encode coastal-versus-riverine flooding, so it
+# is measured separately as dist_to_coast_m. Pipelines are underground and ignored.
 RIVER_FTYPES = {"StreamRiver", "ArtificialPath", "Connector", "CanalDitch"}
-COAST_FTYPES = {"Coastline"}
+
+# Attributes of the nearest river reach (not necessarily the reach the point drains to).
+REACH_ATTRIBUTES = [("StreamOrde", "nearest_stream_order"),   # stream order
+                    ("TotDASqKM", "upstream_area_km2"),       # total upstream drainage area
+                    ("SLOPE", "channel_slope")]               # reach gradient, m/m
+SLOPE_NO_DATA = -9998    # NHDPlus code for "no slope computed"
+
+# Heavy-tailed distances and areas enter models as log10, floored so zero stays finite.
+LOG_SCALED = [("dist_to_river_m", "log10_dist_river", 1.0),        # floor 1 m
+              ("dist_to_coast_m", "log10_dist_coast", 1.0),        # floor 1 m
+              ("upstream_area_km2", "log10_upstream_area", 0.01)]  # floor 0.01 km2
+# StreamCat catchment and watershed mean elevation: a location fingerprint like the
+# quarantined Earth Engine elevation, so kept only as meta_ columns. tmean8110 stays a
+# feature: mean annual temperature is near-constant within a state.
+STREAMCAT_ELEVATION = ["elevcat", "elevws"]
+
+FEATURES_HEADER = (
+    "# columns a model may use. everything else in dataset_*.parquet is an\n"
+    "# identifier or provenance metadata and must stay out.\n"
+    "# split on tile_50km (or tile_100km), never on block_id or point level.\n"
+    "# StreamCat metrics are catchment areal means, constant across a\n"
+    "# ~1-3 km2 catchment -- catchment context, not point measurements.\n")
 
 
+# ----------------------------------------------------------------- shared helpers
 def session() -> requests.Session:
-    s = requests.Session()
-    # connect=6 is the parameter that survives the connection resets these
-    # government endpoints hand out under sustained querying.
-    r = Retry(total=6, connect=6, read=6, backoff_factor=1.5,
-              status_forcelist=(429, 500, 502, 503, 504),
-              allowed_methods=frozenset(["GET", "POST"]), raise_on_status=False)
-    s.mount("https://", HTTPAdapter(max_retries=r, pool_maxsize=8))
-    return s
+    """HTTPS session that retries the resets and 5xx answers the EPA API gives under load."""
+    retry = Retry(total=6, connect=6, read=6, backoff_factor=1.5,
+                  status_forcelist=(429, 500, 502, 503, 504),
+                  allowed_methods=frozenset(["GET", "POST"]), raise_on_status=False)
+    http = requests.Session()
+    http.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=8))
+    return http
 
 
 def find_gdb() -> str:
+    """The first .gdb under RAW, in sorted order."""
     hits = sorted(glob.glob(str(RAW / "**" / "*.gdb"), recursive=True))
     if not hits:
-        sys.exit(
-            f"No extracted .gdb under {RAW}.\n"
-            f"    7z x {RAW}/NHDPlusV21_*.7z -o{RAW}\n"
-            f"(~20 GB extracted. macOS cannot read .7z natively: brew install p7zip)")
+        sys.exit(f"No .gdb under {RAW}. Build it with ./fetch_nhdplus_fl.sh, then "
+                 f"python prep_nhdplus_units.py")
     return hits[0]
 
 
-def pick(layers: list[str], candidates: list[str]) -> str | None:
-    low = {l.lower(): l for l in layers}
-    for c in candidates:
-        if c.lower() in low:
-            return low[c.lower()]
+def pick(names: list[str], candidates: list[str]) -> str | None:
+    """The first candidate present in `names`, ignoring case, spelled as in `names`."""
+    by_lower = {name.lower(): name for name in names}
+    for candidate in candidates:
+        if candidate.lower() in by_lower:
+            return by_lower[candidate.lower()]
     return None
 
 
 def pick_field(fields: list[str], candidates: list[str]) -> str | None:
-    low = {f.lower(): f for f in fields}
-    for c in candidates:
-        if c.lower() in low:
-            return low[c.lower()]
-    return None
+    """pick() for field names."""
+    return pick(fields, candidates)
 
 
-# =========================================================================
+def list_layers(gdb: str) -> list[str]:
+    return [row[0] for row in pyogrio.list_layers(gdb)]
+
+
+def layer_fields(gdb: str, layer: str) -> list[str]:
+    return list(pyogrio.read_info(gdb, layer=layer)["fields"])
+
+
+def find_layer(gdb: str, candidates: list[str], kind: str) -> str:
+    """The first candidate layer present in the .gdb; exits if there is none."""
+    layers = list_layers(gdb)
+    layer = pick(layers, candidates)
+    if not layer:
+        sys.exit(f"no {kind} layer among {layers[:20]} -- run --inspect")
+    return layer
+
+
+def points_bbox(state: str) -> tuple:
+    """Lon/lat box around the state's points plus BBOX_PAD_DEG; () if there is no dataset."""
+    path = PROC / f"dataset_{state}.parquet"
+    if not path.exists():
+        return ()
+    df = pd.read_parquet(path, columns=["lon", "lat"])
+    return (df.lon.min() - BBOX_PAD_DEG, df.lat.min() - BBOX_PAD_DEG,
+            df.lon.max() + BBOX_PAD_DEG, df.lat.max() + BBOX_PAD_DEG)
+
+
+def pad_bbox(bbox: tuple, pad_deg: float) -> tuple:
+    return (bbox[0] - pad_deg, bbox[1] - pad_deg, bbox[2] + pad_deg, bbox[3] + pad_deg)
+
+
+def read_layer(gdb: str, layer: str, columns: list[str], bbox: tuple,
+               where: str | None = None) -> gpd.GeoDataFrame:
+    """Features inside `bbox` (degrees), in CRS_WORK, without null or empty geometries.
+
+    Reading by bounding box keeps memory small: the layers cover more than the points do.
+    """
+    gdf = gpd.read_file(gdb, layer=layer, columns=columns, bbox=bbox, where=where)
+    if gdf.crs is None:
+        gdf = gdf.set_crs(CRS_GEO)
+    gdf = gdf.to_crs(CRS_WORK)
+    return gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
+
+
+def read_points(state: str) -> gpd.GeoDataFrame:
+    """point_id and geometry; dataset geometry is already in CRS_WORK."""
+    return gpd.read_parquet(PROC / f"dataset_{state}.parquet", columns=["point_id", "geometry"])
+
+
+def nearest(points: np.ndarray, lines: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Index of each point's nearest line, and the planar distance to it in metres."""
+    index = STRtree(lines).nearest(points)
+    return index, shapely.distance(points, lines[index])
+
+
+# ----------------------------------------------------------------- --inspect
 def inspect() -> int:
     gdb = find_gdb()
     print(f"gdb: {gdb}\n")
-    layers = [l[0] for l in pyogrio.list_layers(gdb)]
+    layers = list_layers(gdb)
     print(f"{len(layers)} layers:")
-    for l in sorted(layers):
-        print(f"  {l}")
+    for name in sorted(layers):
+        print(f"  {name}")
 
-    cat = pick(layers, CATCHMENT_LAYERS)
-    flw = pick(layers, FLOWLINE_LAYERS)
-    print(f"\ncatchment layer -> {cat}")
-    print(f"flowline  layer -> {flw}")
+    catchment_layer = pick(layers, CATCHMENT_LAYERS)
+    flowline_layer = pick(layers, FLOWLINE_LAYERS)
+    print(f"\ncatchment layer -> {catchment_layer}")
+    print(f"flowline  layer -> {flowline_layer}")
 
-    for name in (cat, flw):
+    for name in (catchment_layer, flowline_layer):
         if not name:
             continue
         info = pyogrio.read_info(gdb, layer=name)
+        fields = list(info["fields"])
         print(f"\n--- {name} ---")
         print(f"  features : {info['features']:,}")
         print(f"  crs      : {info['crs']}")
         print(f"  geometry : {info['geometry_type']}")
-        print(f"  fields   : {list(info['fields'])}")
-        idf = pick_field(list(info["fields"]), COMID_FIELDS)
-        print(f"  id field -> {idf}")
+        print(f"  fields   : {fields}")
+        print(f"  id field -> {pick_field(fields, COMID_FIELDS)}")
 
-    print("\nIf the id field or either layer came back None, paste this and I will "
-          "fix the candidate lists rather than you guessing.")
+    print("\nIf a layer or the id field is None, add its name to CATCHMENT_LAYERS, "
+          "FLOWLINE_LAYERS or COMID_FIELDS.")
     return 0
 
 
-def points_bbox(state: str) -> tuple:
-    p = PROC / f"dataset_{state}.parquet"
-    if not p.exists():
-        return ()
-    df = pd.read_parquet(p, columns=["lon", "lat"])
-    pad = 0.05                     # ~5 km, so edge points still find a catchment
-    return (df.lon.min() - pad, df.lat.min() - pad,
-            df.lon.max() + pad, df.lat.max() + pad)
-
-
+# ----------------------------------------------------------------- --catchments
 def catchments(states: list[str]) -> int:
     gdb = find_gdb()
-    layers = [l[0] for l in pyogrio.list_layers(gdb)]
-    lyr = pick(layers, CATCHMENT_LAYERS)
-    if not lyr:
-        sys.exit(f"no catchment layer among {layers[:20]} -- run --inspect")
-    fields = list(pyogrio.read_info(gdb, layer=lyr)["fields"])
-    idf = pick_field(fields, COMID_FIELDS)
-    areaf = pick_field(fields, ["AreaSqKM"])
-    if not idf:
-        sys.exit(f"no COMID-like field in {lyr} -- run --inspect")
-    cols = [c for c in (idf, areaf) if c]
-    print(f"catchments from {lyr}, fields {cols}")
+    layer = find_layer(gdb, CATCHMENT_LAYERS, "catchment")
+    fields = layer_fields(gdb, layer)
+    id_field = pick_field(fields, COMID_FIELDS)
+    area_field = pick_field(fields, ["AreaSqKM"])
+    if not id_field:
+        sys.exit(f"no COMID-like field in {layer} -- run --inspect")
+    columns = [id_field]
+    if area_field:
+        columns.append(area_field)
+    print(f"catchments from {layer}, fields {columns}")
 
     HYDRO.mkdir(parents=True, exist_ok=True)
-    for st in states:
-        out = HYDRO / f"comid_{st}.parquet"
+    for state in states:
+        out = HYDRO / f"comid_{state}.parquet"
         if out.exists():
-            print(f"[{st}] already joined -- skipping")
+            print(f"[{state}] already joined -- skipping")
             continue
-        bb = points_bbox(st)
-        if not bb:
-            print(f"[{st}] no dataset -- skipping")
+        bbox = points_bbox(state)
+        if not bbox:
+            print(f"[{state}] no dataset -- skipping")
             continue
-        t0 = time.time()
-        # Bounding-box read: never touch the 2.6M-polygon national extent.
-        cat = gpd.read_file(gdb, layer=lyr, columns=cols, bbox=bb)
-        if cat.crs is None:
-            cat = cat.set_crs(CRS_GEO)
-        cat = cat.to_crs(CRS_WORK)
-        cat = cat[cat.geometry.notna() & ~cat.geometry.is_empty]
-        bad = ~cat.geometry.is_valid
-        if bad.any():
-            cat.loc[bad, "geometry"] = cat.loc[bad, "geometry"].make_valid()
-        # NHDPlus ships its own catchment area; use it rather than a reprojected
-        # geometry area, so drainage density matches the published numbers.
-        if areaf:
-            cat["catch_area_km2"] = pd.to_numeric(cat[areaf], errors="coerce")
-        else:
-            cat["catch_area_km2"] = cat.geometry.area / 1e6
-
-        pts = gpd.read_parquet(PROC / f"dataset_{st}.parquet",
-                               columns=["point_id", "geometry"])
-        j = gpd.sjoin(pts, cat[[idf, "catch_area_km2", "geometry"]],
-                      how="left", predicate="within")
-        j = j[~j.index.duplicated(keep="first")].reindex(pts.index)
-
-        res = pd.DataFrame({"point_id": pts.point_id.values,
-                            "comid": pd.to_numeric(j[idf], errors="coerce").values,
-                            "catch_area_km2": j["catch_area_km2"].values})
-        res.to_parquet(out, index=False)
-        hit = 100 * res.comid.notna().mean()
-        print(f"[{st}] {len(cat):,} catchments read, {len(res):,} points, "
-              f"{hit:.1f}% matched a COMID, {res.comid.nunique():,} distinct "
-              f"({time.time()-t0:.0f}s)", flush=True)
-        if hit < 95:
-            print(f"     NOTE only {hit:.1f}% matched. NHDPlus has no catchment "
-                  f"over open water or tidal flats, so coastal states legitimately "
-                  f"miss some; anything below ~85% is worth looking at.")
+        join_catchments(state, bbox, out, gdb, layer, columns, id_field, area_field)
     return 0
 
 
+def join_catchments(state, bbox, out, gdb, layer, columns, id_field, area_field) -> None:
+    """Write point_id, comid and catch_area_km2 for every point of one state."""
+    t0 = time.time()
+    cat = read_layer(gdb, layer, columns, bbox)
+    invalid = ~cat.geometry.is_valid
+    if invalid.any():
+        cat.loc[invalid, "geometry"] = cat.loc[invalid, "geometry"].make_valid()
+    # Prefer NHDPlus's published area, so drainage density matches the published numbers.
+    if area_field:
+        cat["catch_area_km2"] = pd.to_numeric(cat[area_field], errors="coerce")
+    else:
+        cat["catch_area_km2"] = cat.geometry.area / 1e6
+
+    pts = read_points(state)
+    joined = gpd.sjoin(pts, cat[[id_field, "catch_area_km2", "geometry"]],
+                       how="left", predicate="within")
+    # A point inside overlapping catchments matches more than once: keep the first.
+    joined = joined[~joined.index.duplicated(keep="first")].reindex(pts.index)
+
+    res = pd.DataFrame({"point_id": pts.point_id.values,
+                        "comid": pd.to_numeric(joined[id_field], errors="coerce").values,
+                        "catch_area_km2": joined["catch_area_km2"].values})
+    res.to_parquet(out, index=False)
+    hit = 100 * res.comid.notna().mean()
+    print(f"[{state}] {len(cat):,} catchments read, {len(res):,} points, "
+          f"{hit:.1f}% matched a COMID, {res.comid.nunique():,} distinct "
+          f"({time.time() - t0:.0f}s)", flush=True)
+    if hit < 95:
+        print(f"     NOTE only {hit:.1f}% matched. NHDPlus has no catchment over open "
+              f"water or tidal flats, so coastal points miss some; below ~85% is worth "
+              f"a look.")
+
+
+# ----------------------------------------------------------------- --flowlines
 def flowlines(states: list[str]) -> int:
     gdb = find_gdb()
-    layers = [l[0] for l in pyogrio.list_layers(gdb)]
-    lyr = pick(layers, FLOWLINE_LAYERS)
-    if not lyr:
-        sys.exit(f"no flowline layer among {layers[:20]} -- run --inspect")
-    fields = list(pyogrio.read_info(gdb, layer=lyr)["fields"])
-    cols = [f for f in FLOW_FIELDS if pick_field(fields, [f])]
-    cols = [pick_field(fields, [f]) for f in cols]
-    print(f"flowlines from {lyr}, fields {cols}")
-    print("(the 'Measured (M) geometry' warning is expected and harmless -- the M")
-    print(" values are river-mile measures and distances here are planar)")
+    layer = find_layer(gdb, FLOWLINE_LAYERS, "flowline")
+    fields = layer_fields(gdb, layer)
+    columns = []
+    for name in FLOW_FIELDS:
+        found = pick_field(fields, [name])
+        if found:
+            columns.append(found)
+    print(f"flowlines from {layer}, fields {columns}")
+    print("(a 'Measured (M) geometry' warning is harmless: M values are river-mile "
+          "measures and distances here are planar)")
 
     HYDRO.mkdir(parents=True, exist_ok=True)
-    for st in states:
-        out = HYDRO / f"river_{st}.parquet"
+    for state in states:
+        out = HYDRO / f"river_{state}.parquet"
         if out.exists():
-            print(f"[{st}] already computed -- skipping")
+            print(f"[{state}] already computed -- skipping")
             continue
-        bb = points_bbox(st)
-        if not bb:
-            print(f"[{st}] no dataset -- skipping")
+        bbox = points_bbox(state)
+        if not bbox:
+            print(f"[{state}] no dataset -- skipping")
             continue
-        t0 = time.time()
-        fl = gpd.read_file(gdb, layer=lyr, columns=cols, bbox=bb)
-        if fl.crs is None:
-            fl = fl.set_crs(CRS_GEO)
-        fl = fl.to_crs(CRS_WORK)
-        fl = fl[fl.geometry.notna() & ~fl.geometry.is_empty]
-        if fl.empty:
-            print(f"[{st}] no flowlines in bbox -- skipping")
-            continue
-        # The layer is MultiLineString Z; drop Z so nothing downstream has to
-        # reason about whether a distance is planar or three-dimensional.
-        fl["geometry"] = shapely.force_2d(fl.geometry.values)
-
-        ft = fl["FTYPE"].astype(str) if "FTYPE" in fl.columns else pd.Series(
-            "StreamRiver", index=fl.index)
-        counts = ft.value_counts().to_dict()
-        riv = fl[ft.isin(RIVER_FTYPES)]
-        cst = fl[ft.isin(COAST_FTYPES)]
-        print(f"[{st}] {len(fl):,} flowlines: {counts}")
-        print(f"       {len(riv):,} river, {len(cst):,} coastline "
-              f"(coastline measured separately, never as 'river')")
-        if riv.empty:
-            print(f"[{st}] no river-type flowlines -- skipping")
-            continue
-
-        pts = gpd.read_parquet(PROC / f"dataset_{st}.parquet",
-                               columns=["point_id", "geometry"])
-        P = shapely.points(pts.geometry.x.values, pts.geometry.y.values)
-
-        G = np.asarray(riv.geometry.values)
-        near = STRtree(G).nearest(P)
-        res = pd.DataFrame({
-            "point_id": pts.point_id.values,
-            "dist_to_river_m": shapely.distance(P, G[near]),
-        })
-        # Attributes of the reach a point drains to. TotDASqKM is NHDPlus's total
-        # upstream drainage area on the 1:100k network -- the honest version of what
-        # MERIT's `upa` was standing in for, which read under one 90 m cell at two of
-        # three test points. SLOPE is the channel gradient of that reach.
-        for src, dst in (("StreamOrde", "nearest_stream_order"),
-                         ("TotDASqKM", "upstream_area_km2"),
-                         ("SLOPE", "channel_slope")):
-            if src in riv.columns:
-                v = pd.to_numeric(riv[src], errors="coerce").to_numpy()
-                res[dst] = v[near]
-        if "FTYPE" in riv.columns:
-            res["meta_nearest_ftype"] = riv["FTYPE"].to_numpy()[near]
-
-        if not cst.empty:
-            C = np.asarray(cst.geometry.values)
-            cn = STRtree(C).nearest(P)
-            res["dist_to_coast_m"] = shapely.distance(P, C[cn])
-        else:
-            res["dist_to_coast_m"] = np.nan
-
-        # Drainage density: in NHDPlus V2 each flowline pairs 1:1 with the catchment
-        # of the same COMID, so reach length over catchment area is the standard
-        # local density, using both published values rather than reprojected ones.
-        cp = HYDRO / f"comid_{st}.parquet"
-        if cp.exists() and "LENGTHKM" in fl.columns and "COMID" in fl.columns:
-            cm = pd.read_parquet(cp)
-            per = (fl.assign(_c=pd.to_numeric(fl["COMID"], errors="coerce"),
-                             _l=pd.to_numeric(fl["LENGTHKM"], errors="coerce"))
-                   .groupby("_c")._l.sum())
-            res = res.merge(cm, on="point_id", how="left")
-            res["drainage_density"] = (res.comid.map(per) /
-                                       res.catch_area_km2.replace(0, np.nan))
-            res = res.drop(columns=[c for c in ("comid", "catch_area_km2")
-                                    if c in res.columns])
-
-        res.to_parquet(out, index=False)
-        d = res.dist_to_river_m
-        print(f"       river distance median {np.median(d):,.0f} m, "
-              f"p95 {np.percentile(d,95):,.0f} m; "
-              f"coast distance available for "
-              f"{100*res.dist_to_coast_m.notna().mean():.0f}% "
-              f"({time.time()-t0:.0f}s)", flush=True)
+        measure_flowlines(state, bbox, out, gdb, layer, columns)
     return 0
+
+
+def read_coastline(gdb: str, layer: str, bbox: tuple) -> gpd.GeoDataFrame:
+    """Coastline features within COAST_PAD_DEG of the points' box."""
+    return read_layer(gdb, layer, ["FTYPE"], pad_bbox(bbox, COAST_PAD_DEG),
+                      where="FTYPE IN ('Coastline')")
+
+
+def measure_flowlines(state, bbox, out, gdb, layer, columns) -> None:
+    """Write river and coast distances, nearest-reach attributes and drainage density."""
+    t0 = time.time()
+    fl = read_layer(gdb, layer, columns, bbox)
+    if fl.empty:
+        print(f"[{state}] no flowlines in bbox -- skipping")
+        return
+    # The layer is MultiLineString Z; drop Z so every distance is planar.
+    fl["geometry"] = shapely.force_2d(fl.geometry.values)
+
+    if "FTYPE" in fl.columns:
+        ftype = fl["FTYPE"].astype(str)
+        coast = read_coastline(gdb, layer, bbox)
+    else:
+        # Without FTYPE every line counts as a river and there is no coastline.
+        ftype = pd.Series("StreamRiver", index=fl.index)
+        coast = fl.iloc[:0]
+    rivers = fl[ftype.isin(RIVER_FTYPES)]
+    print(f"[{state}] {len(fl):,} flowlines: {ftype.value_counts().to_dict()}")
+    print(f"       {len(rivers):,} river, {len(coast):,} coastline "
+          f"(coastline measured separately, never as 'river')")
+    if rivers.empty:
+        print(f"[{state}] no river-type flowlines -- skipping")
+        return
+
+    pts = read_points(state)
+    points = shapely.points(pts.geometry.x.values, pts.geometry.y.values)
+    near_river, river_dist = nearest(points, np.asarray(rivers.geometry.values))
+    res = pd.DataFrame({"point_id": pts.point_id.values, "dist_to_river_m": river_dist})
+    for source, column in REACH_ATTRIBUTES:
+        if source in rivers.columns:
+            values = pd.to_numeric(rivers[source], errors="coerce").to_numpy()
+            if source == "SLOPE":
+                values = np.where(values == SLOPE_NO_DATA, np.nan, values)
+            res[column] = values[near_river]
+    if "FTYPE" in rivers.columns:
+        res["meta_nearest_ftype"] = rivers["FTYPE"].to_numpy()[near_river]
+
+    if coast.empty:
+        res["dist_to_coast_m"] = np.nan
+    else:
+        coast_lines = shapely.force_2d(np.asarray(coast.geometry.values))
+        _, coast_dist = nearest(points, coast_lines)
+        res["dist_to_coast_m"] = coast_dist
+
+    comid_file = HYDRO / f"comid_{state}.parquet"
+    if comid_file.exists() and "LENGTHKM" in fl.columns and "COMID" in fl.columns:
+        res = add_drainage_density(res, fl, comid_file)
+
+    res.to_parquet(out, index=False)
+    dist = res.dist_to_river_m
+    print(f"       river distance median {np.median(dist):,.0f} m, "
+          f"p95 {np.percentile(dist, 95):,.0f} m; coast distance available for "
+          f"{100 * res.dist_to_coast_m.notna().mean():.0f}% "
+          f"({time.time() - t0:.0f}s)", flush=True)
+
+
+def add_drainage_density(res: pd.DataFrame, fl: gpd.GeoDataFrame,
+                         comid_file: Path) -> pd.DataFrame:
+    """Add drainage_density (km of flowline per km2) of each point's catchment.
+
+    Each NHDPlus flowline pairs 1:1 with the catchment of the same COMID, so reach length
+    over catchment area is the local density, from published values only. A sink catchment
+    (negative FEATUREID) has no flowline of its own, so its density is 0, not missing.
+    """
+    comid = pd.to_numeric(fl["COMID"], errors="coerce")
+    length_km = pd.to_numeric(fl["LENGTHKM"], errors="coerce")
+    length_per_comid = length_km.groupby(comid).sum()
+
+    res = res.merge(pd.read_parquet(comid_file), on="point_id", how="left")
+    length = res.comid.map(length_per_comid)
+    is_sink = length.isna() & (res.comid < 0)
+    length = length.mask(is_sink, 0.0)
+    res["drainage_density"] = length / res.catch_area_km2.replace(0, np.nan)
+    return res.drop(columns=["comid", "catch_area_km2"])
+
+
+# ----------------------------------------------------------------- --streamcat
+def fetch_county(http: requests.Session, county: str) -> list[dict]:
+    """StreamCat cat and ws metrics for every COMID in one county."""
+    # By county because the URL has an 8,192-character limit, too short for COMID lists;
+    # one county already returns thousands of COMIDs.
+    params = {"name": ",".join(SC_METRICS), "areaOfInterest": "cat,ws", "county": county}
+    response = http.get(SC_URL, params=params, timeout=180)
+    response.raise_for_status()
+    return response.json().get("items", [])
 
 
 def streamcat(states: list[str]) -> int:
     HYDRO.mkdir(parents=True, exist_ok=True)
-    s = session()
-    for st in states:
-        out = HYDRO / f"streamcat_{st}.parquet"
+    http = session()
+    for state in states:
+        out = HYDRO / f"streamcat_{state}.parquet"
         if out.exists():
-            print(f"[{st}] already pulled -- skipping")
+            print(f"[{state}] already pulled -- skipping")
             continue
-        p = PROC / f"dataset_{st}.parquet"
-        if not p.exists():
-            print(f"[{st}] no dataset -- skipping")
+        path = PROC / f"dataset_{state}.parquet"
+        if not path.exists():
+            print(f"[{state}] no dataset -- skipping")
             continue
-        fips = sorted(pd.read_parquet(p, columns=["county_fips"])
-                      .county_fips.dropna().astype(str).unique())
-        if not fips:
-            print(f"[{st}] no county FIPS -- skipping")
+        county_fips = pd.read_parquet(path, columns=["county_fips"]).county_fips
+        counties = sorted(county_fips.dropna().astype(str).unique())
+        if not counties:
+            print(f"[{state}] no county FIPS -- skipping")
             continue
-        print(f"[{st}] {len(fips)} counties", flush=True)
-
-        frames, failed = [], []
-        t0 = time.time()
-        for i, f in enumerate(fips, 1):
-            # One county per request: the URL has an 8,192-character ceiling and a
-            # single county already returns thousands of COMIDs.
-            try:
-                r = s.get(SC_URL, params={"name": ",".join(SC_METRICS),
-                                          "areaOfInterest": "cat,ws",
-                                          "county": f}, timeout=180)
-                r.raise_for_status()
-                items = r.json().get("items", [])
-                if items:
-                    frames.append(pd.DataFrame(items))
-            except Exception as e:
-                failed.append((f, str(e)[:90]))
-            if i % 20 == 0 or i == len(fips):
-                got = sum(len(x) for x in frames)
-                print(f"    {i}/{len(fips)} counties, {got:,} COMIDs "
-                      f"({time.time()-t0:.0f}s)", flush=True)
-
-        if not frames:
-            print(f"[{st}] StreamCat returned nothing")
-            continue
-        df = pd.concat(frames, ignore_index=True).drop_duplicates("comid")
-        df.columns = [c.lower() for c in df.columns]
-        df.to_parquet(out, index=False)
-        print(f"[{st}] {len(df):,} COMIDs, {df.shape[1]-1} metrics -> {out}")
-        if failed:
-            print(f"     {len(failed)} counties failed, e.g. {failed[:2]}")
-            print(f"     rerun after deleting {out} to retry them")
+        pull_streamcat(http, state, counties, out)
     return 0
 
 
-# =========================================================================
-# Concurrency guard
-# =========================================================================
-# This script and pull_atlas14.py both finish by read-modify-writing the SAME
-# dataset_{ST}.parquet files: each reads the whole file, adds its columns, writes
-# the whole thing back. Two overlapping merges therefore mean the second write
-# silently discards every column the first one added -- a failure that surfaces
-# days later as "why is this feature missing".
-#
-# The FETCH stages are safe to run concurrently: they only read the datasets and
-# write into their own directories. The MERGES are not. So an exclusive lockfile
-# makes overlap fail loudly instead of quietly, and dataset writes go to a temp
-# file renamed into place, which is atomic on POSIX -- a concurrent reader sees
-# either the old file or the new one, never a half-written one.
+def pull_streamcat(http: requests.Session, state: str, counties: list[str], out: Path) -> None:
+    print(f"[{state}] {len(counties)} counties", flush=True)
+    frames, failed = [], []
+    n_rows = 0
+    t0 = time.time()
+    for i, county in enumerate(counties, 1):
+        try:
+            items = fetch_county(http, county)
+            if items:
+                frames.append(pd.DataFrame(items))
+                n_rows += len(items)
+        except Exception as error:   # keep going; failed counties are listed at the end
+            failed.append((county, str(error)[:90]))
+        if i % 20 == 0 or i == len(counties):
+            print(f"    {i}/{len(counties)} counties, {n_rows:,} COMIDs "
+                  f"({time.time() - t0:.0f}s)", flush=True)
+
+    if not frames:
+        print(f"[{state}] StreamCat returned nothing")
+        return
+    df = pd.concat(frames, ignore_index=True).drop_duplicates("comid")
+    df.columns = [c.lower() for c in df.columns]
+    df.to_parquet(out, index=False)
+    print(f"[{state}] {len(df):,} COMIDs, {df.shape[1] - 1} metrics -> {out}")
+    if failed:
+        print(f"     {len(failed)} counties failed, e.g. {failed[:2]}")
+        print(f"     rerun after deleting {out} to retry them")
+
+
+# ----------------------------------------------------------------- merge guard
+# This script and pull_atlas14.py both end by read-modify-writing dataset_{ST}.parquet,
+# so two overlapping merges would silently drop the first one's columns. The fetch stages
+# are safe side by side; merges take an exclusive lockfile and write to a temp file that
+# is renamed into place (atomic on POSIX), so readers never see a half-written file.
 LOCK = PROC / ".merge.lock"
 
 
@@ -453,8 +467,7 @@ class MergeLock:
                 f"Merges rewrite the same dataset files, so they must not overlap.\n"
                 f"Wait for it to finish. If you are certain nothing is running:\n"
                 f"    rm {LOCK}\n")
-        os.write(self.fd,
-                 f"{os.getpid()} {time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
+        os.write(self.fd, f"{os.getpid()} {time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
         return self
 
     def __exit__(self, *exc):
@@ -476,174 +489,176 @@ def atomic_write_text(text: str, path) -> None:
     os.replace(tmp, path)
 
 
+# ----------------------------------------------------------------- --merge
 def merge(states: list[str]) -> int:
     with MergeLock():
         return _merge_body(states)
 
 
-def _added_columns(st: str) -> set[str]:
-    """Every column this merge will introduce for one state.
+def _added_columns(state: str) -> set[str]:
+    """Every column the merge adds for one state, so a re-run can drop them first.
 
-    Needed because the merge must be RE-RUNNABLE. The first version was not: a
-    second run re-added `comid` beside the `meta_comid` the first run had renamed,
-    pandas allowed the duplicate label, and the streamcat join then died on
-    "The column label 'meta_comid' is not unique". Nothing was corrupted -- the
-    atomic write meant the crash happened before any file was touched -- but the
-    only way to recover was to know that. Now the merge drops whatever it is about
-    to add before adding it, so running it twice is a no-op rather than a trap.
-
-    The set is derived from the source files rather than hardcoded, because the
-    last hardcoded list is exactly what silently dropped `channel_slope`.
+    Read from the hydro files' schemas rather than hardcoded, so a new column is never missed.
     """
-    import pyarrow.parquet as pq
-    cols: set[str] = set()
-    for name, key in ((f"comid_{st}", "point_id"),
-                      (f"river_{st}", "point_id"),
-                      (f"streamcat_{st}", "comid")):
-        f = HYDRO / f"{name}.parquet"
-        if f.exists():
-            cols |= set(pq.read_schema(f).names) - {key}
-    # plus the columns this function derives or renames into existence
-    cols |= {"meta_comid", "log10_dist_river", "log10_dist_coast",
-             "log10_upstream_area", "meta_elevcat", "meta_elevws"}
-    cols |= {f"meta_{c}" for c in
-             ("dist_to_river_m", "dist_to_coast_m", "upstream_area_km2")}
-    return cols
+    columns = set()
+    for name, key in ((f"comid_{state}", "point_id"),
+                      (f"river_{state}", "point_id"),
+                      (f"streamcat_{state}", "comid")):
+        path = HYDRO / f"{name}.parquet"
+        if path.exists():
+            columns |= set(pq.read_schema(path).names) - {key}
+    # plus the columns the merge derives or renames into existence
+    columns.add("meta_comid")
+    for raw, log_column, _ in LOG_SCALED:
+        columns.add(log_column)
+        columns.add(f"meta_{raw}")
+    for name in STREAMCAT_ELEVATION:
+        columns.add(f"meta_{name}")
+    return columns
+
+
+def percent_filled(frame: pd.DataFrame, column: str) -> float:
+    """Non-null share of a column in percent (one decimal); NaN if the column is absent."""
+    if column not in frame.columns:
+        return np.nan
+    return round(100 * frame[column].notna().mean(), 1)
+
+
+def join_hydro_files(dataset: gpd.GeoDataFrame, state: str) -> gpd.GeoDataFrame:
+    """Left-join the comid, river and StreamCat files that exist; comid becomes meta_comid."""
+    comid_file = HYDRO / f"comid_{state}.parquet"
+    if comid_file.exists():
+        dataset = dataset.merge(pd.read_parquet(comid_file), on="point_id", how="left")
+        dataset = dataset.rename(columns={"comid": "meta_comid"})
+
+    river_file = HYDRO / f"river_{state}.parquet"
+    if river_file.exists():
+        dataset = dataset.merge(pd.read_parquet(river_file), on="point_id", how="left")
+
+    streamcat_file = HYDRO / f"streamcat_{state}.parquet"
+    if streamcat_file.exists() and "meta_comid" in dataset.columns:
+        sc = pd.read_parquet(streamcat_file).rename(columns={"comid": "meta_comid"})
+        sc = sc.drop_duplicates("meta_comid")
+        dataset = dataset.merge(sc, on="meta_comid", how="left")
+    return dataset
+
+
+def quarantine_and_log_scale(dataset: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Rename StreamCat elevation to meta_; add log10 columns and keep the raw ones as meta_."""
+    for name in STREAMCAT_ELEVATION:
+        if name in dataset.columns:
+            dataset = dataset.rename(columns={name: f"meta_{name}"})
+    for raw, log_column, floor in LOG_SCALED:
+        if raw in dataset.columns:
+            values = pd.to_numeric(dataset[raw], errors="coerce")
+            dataset[log_column] = np.log10(values.clip(lower=floor))
+            dataset = dataset.rename(columns={raw: f"meta_{raw}"})
+    return dataset
+
+
+def merge_state(state: str) -> tuple[list[str], dict] | None:
+    """Merge one state's hydro files into its dataset; return its features and a summary row.
+
+    Returns None when the state has no dataset.
+    """
+    path = PROC / f"dataset_{state}.parquet"
+    if not path.exists():
+        print(f"[{state}] no dataset -- skipping")
+        return None
+    dataset = gpd.read_parquet(path)
+    n_rows = len(dataset)
+
+    # Drop what an earlier run of this merge added, so a re-run replaces rather than
+    # duplicates. Columns from other scripts are untouched.
+    stale = [c for c in _added_columns(state) if c in dataset.columns]
+    if stale:
+        dataset = dataset.drop(columns=stale)
+    columns_before = set(dataset.columns)
+
+    dataset = join_hydro_files(dataset, state)
+    dataset = quarantine_and_log_scale(dataset)
+
+    added = sorted(set(dataset.columns) - columns_before)
+    features = [c for c in added if not c.startswith("meta_") and not c.endswith("_pctfull")]
+    atomic_to_parquet(dataset, path)
+
+    coverage = {c: percent_filled(dataset, c) for c in features}
+    re_merge = "  [re-merge]" if stale else ""
+    print(f"\n[{state}] {n_rows:,} rows, {len(added)} columns added "
+          f"({len(features)} features, {len(added) - len(features)} meta){re_merge}")
+    print(f"  coverage %: {coverage}")
+    summary = {"state": state, "features": len(features),
+               "comid_matched": percent_filled(dataset, "meta_comid"),
+               "coast": percent_filled(dataset, "log10_dist_coast")}
+    return features, summary
+
+
+def update_features_txt(features: list[str]) -> None:
+    """Append the features FEATURES.txt does not list yet, keeping the listed order.
+
+    Comment lines are replaced by FEATURES_HEADER.
+    """
+    path = PROC / "FEATURES.txt"
+    listed = []
+    for line in path.read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            listed.append(line.strip())
+    new = [f for f in features if f not in listed]
+    all_features = listed + new
+    atomic_write_text(FEATURES_HEADER + "\n".join(all_features) + "\n", path)
+    print(f"\nFEATURES.txt: {len(listed)} -> {len(all_features)} features")
+    print(f"  added: {new if new else 'nothing new (already present)'}")
 
 
 def _merge_body(states: list[str]) -> int:
-    feats_added: list[str] = []
-    rows = []
-    for st in states:
-        p = PROC / f"dataset_{st}.parquet"
-        if not p.exists():
-            print(f"[{st}] no dataset -- skipping")
+    last_features: list[str] = []
+    summaries = []
+    for state in states:
+        result = merge_state(state)
+        if result is None:
             continue
-        d = gpd.read_parquet(p)
-        n0 = len(d)
+        last_features, summary = result
+        summaries.append(summary)
 
-        # Idempotence: clear anything a previous run of THIS merge left behind, so
-        # re-running replaces rather than duplicates. Columns from other scripts
-        # (Earth Engine, Atlas 14) are untouched.
-        stale = [c for c in _added_columns(st) if c in d.columns]
-        if stale:
-            d = d.drop(columns=stale)
-        before_all = set(d.columns)
-
-        cp = HYDRO / f"comid_{st}.parquet"
-        if cp.exists():
-            d = d.merge(pd.read_parquet(cp), on="point_id", how="left")
-            d = d.rename(columns={"comid": "meta_comid"})
-
-        rp = HYDRO / f"river_{st}.parquet"
-        if rp.exists():
-            d = d.merge(pd.read_parquet(rp), on="point_id", how="left")
-
-        sp = HYDRO / f"streamcat_{st}.parquet"
-        if sp.exists() and "meta_comid" in d.columns:
-            sc = pd.read_parquet(sp).rename(columns={"comid": "meta_comid"})
-            sc = sc.drop_duplicates("meta_comid")
-            d = d.merge(sc, on="meta_comid", how="left")
-
-        # StreamCat returns catchment and watershed mean ELEVATION, the same
-        # variable quarantined from the Earth Engine stack for identifying the
-        # state at 58.3% against a 10% baseline. Catchment-mean elevation varies
-        # within a state and correlates with where detailed studies get done, so it
-        # carries the identical risk and gets the identical treatment. (tmean8110
-        # stays: mean annual temperature is near-constant within a state, so it
-        # cannot separate A from AE in a within-state comparison -- but re-run the
-        # elevation leakage check on it before trusting a result that leans on it.)
-        for c in ("elevcat", "elevws"):
-            if c in d.columns:
-                d = d.rename(columns={c: f"meta_{c}"})
-
-        # Distances and areas are heavy-tailed, so they go in on a log scale for
-        # the same reason upstream area did: half the points sit in the first few
-        # percent of the raw range and the tail otherwise carries everything.
-        for raw, log in (("dist_to_river_m", "log10_dist_river"),
-                         ("dist_to_coast_m", "log10_dist_coast"),
-                         ("upstream_area_km2", "log10_upstream_area")):
-            if raw in d.columns:
-                v = pd.to_numeric(d[raw], errors="coerce")
-                d[log] = np.log10(v.clip(lower=1.0 if raw.endswith("_m") else 0.01))
-                d = d.rename(columns={raw: f"meta_{raw}"})
-
-        # What actually landed, rather than a list that has to be kept in sync by
-        # hand. The hand-kept version is what lost `channel_slope`: it was computed,
-        # stored and 100% populated, but never reached FEATURES.txt, so no model
-        # would ever have seen it.
-        added = sorted(set(d.columns) - before_all)
-        feature_cols = [c for c in added
-                        if not c.startswith("meta_") and not c.endswith("_pctfull")]
-
-        atomic_to_parquet(d, p)
-        cov = {c: round(100 * d[c].notna().mean(), 1) for c in feature_cols}
-        print(f"\n[{st}] {n0:,} rows, {len(added)} columns added "
-              f"({len(feature_cols)} features, "
-              f"{len(added)-len(feature_cols)} meta){'  [re-merge]' if stale else ''}")
-        print(f"  coverage %: {cov}")
-        rows.append(dict(state=st, features=len(feature_cols),
-                         comid_matched=round(100 * d.meta_comid.notna().mean(), 1)
-                         if "meta_comid" in d else np.nan,
-                         coast=round(100 * d.log10_dist_coast.notna().mean(), 1)
-                         if "log10_dist_coast" in d else np.nan))
-        feats_added = feature_cols
-
-    # rewrite the feature list, keeping provenance out of it
-    if feats_added:
-        base = [l.strip() for l in (PROC / "FEATURES.txt").read_text().splitlines()
-                if l.strip() and not l.startswith("#")]
-        new = [f for f in feats_added if f not in base]
-        allf = base + new
-        atomic_write_text(
-            "# columns a model may use. everything else in dataset_*.parquet is an\n"
-            "# identifier or provenance metadata and must stay out.\n"
-            "# split on tile_50km (or tile_100km), never on block_id or point level.\n"
-            "# StreamCat metrics are catchment areal means, constant across a\n"
-            "# ~1-3 km2 catchment -- catchment context, not point measurements.\n"
-            + "\n".join(allf) + "\n", PROC / "FEATURES.txt")
-        print(f"\nFEATURES.txt: {len(base)} -> {len(allf)} features")
-        print(f"  added: {new if new else 'nothing new (already present)'}")
-
-    if rows:
-        print("\n" + pd.DataFrame(rows).to_string(index=False))
-        print("\ncoast = % of points with a coastline within reach. Expect 0 for")
-        print("landlocked states and well above 0 for FL, LA, NC, TX -- that is the")
-        print("FTYPE split doing its job rather than being a no-op.")
-        print("\nNext: python baselines.py   (and then --null again, since the")
-        print("feature set changed and every number has to be re-earned)")
+    if last_features:
+        update_features_txt(last_features)
+    if summaries:
+        print("\n" + pd.DataFrame(summaries).to_string(index=False))
+        print("\ncoast = % of points with a coastline distance; well above 0 shows the")
+        print("FTYPE split doing its job.")
     return 0
 
 
+# ----------------------------------------------------------------- CLI
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("states", nargs="*")
-    ap.add_argument("--inspect", action="store_true")
-    ap.add_argument("--catchments", action="store_true")
-    ap.add_argument("--flowlines", action="store_true")
-    ap.add_argument("--streamcat", action="store_true")
-    ap.add_argument("--merge", action="store_true")
-    a = ap.parse_args(argv)
+    ap = argparse.ArgumentParser(description="NHDPlus V2 and StreamCat covariates.")
+    ap.add_argument("states", nargs="*", help=f"default: {' '.join(STATES)}")
+    ap.add_argument("--inspect", action="store_true", help="list geodatabase layers and fields")
+    ap.add_argument("--catchments", action="store_true", help="points -> catchment COMID")
+    ap.add_argument("--flowlines", action="store_true",
+                    help="river and coast distance, reach attributes, drainage density")
+    ap.add_argument("--streamcat", action="store_true", help="EPA StreamCat metrics by county")
+    ap.add_argument("--merge", action="store_true", help="join everything into dataset_{ST}")
+    args = ap.parse_args(argv)
 
-    states = a.states or STATES
-    bad = [s for s in states if s not in STATES]
-    if bad:
-        sys.exit(f"unknown states: {bad}")
+    states = args.states or STATES
+    unknown = [s for s in states if s not in STATES]
+    if unknown:
+        sys.exit(f"unknown states: {unknown}")
 
-    if a.inspect:
+    if args.inspect:
         return inspect()
-    if a.catchments:
+    if args.catchments:
         return catchments(states)
-    if a.flowlines:
+    if args.flowlines:
         return flowlines(states)
-    if a.streamcat:
+    if args.streamcat:
         return streamcat(states)
-    if a.merge:
+    if args.merge:
         return merge(states)
 
     ap.print_help()
-    print("\nOrder matters: --inspect, then --catchments, --flowlines, "
-          "--streamcat, --merge")
+    print("\nRun in order: --inspect, --catchments, --flowlines, --streamcat, --merge")
     return 1
 
 

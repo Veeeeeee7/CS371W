@@ -1,25 +1,22 @@
-# aotil -- spatially regularized OODSelect
+# pip install -r requirements.txt   (the project's .venv is Python 3.12)
 #
-# numpy/scipy/scikit-learn/pandas are required. Everything below them is
-# optional: the code runs without each one, more slowly or with a fallback, and
-# says which it is at startup.
+# --- models and analyses (aotil/) ---
 numpy>=1.24
 scipy>=1.11
 scikit-learn>=1.3
 pandas>=2.0
-pyarrow>=14          # reading data/processed/*.parquet
-joblib>=1.3          # parallel model fitting -- the wall clock of a cell
+pyarrow>=14          # parquet under data/ and results/
+joblib>=1.3          # zoo.py: parallel model fitting, the wall clock of a cell
 optuna>=3.0          # oodselect_paper.py: the authors' hyperparameter search
 torch>=2.0           # oodselect_paper.py: the authors' loss/optimiser (CPU is enough)
-# --- optional ---
-pytorch_lightning    # test_oodselect_paper.py only: runs the authors' TestSetFinder
-xgboost>=2.0         # one more learner family, and the only GPU-capable one
-pyproj>=3.6          # proper lon/lat projection; without it an equirectangular
-                     # approximation is used, fine for kNN ordering
+xgboost>=2.0         # zoo.py: one more learner family; skipped when not installed
 matplotlib>=3.7      # figures
+pytorch_lightning    # optional: test_oodselect_paper.py runs the authors' TestSetFinder with it
 # --- data pipeline (sample_points.py, pull_*.py, prep_nhdplus_units.py, aotil/lobes.py) ---
 geopandas>=1.0       # GeoParquet points, polygons and lines
 shapely>=2.1         # vectorised geometry; lobes.py needs orient_polygons (2.1)
-pyogrio>=0.7         # reads the NHDPlus shapefiles and writes the FileGDB pull_hydro.py reads
+pyproj>=3.6          # CRS transforms, e.g. lon/lat to the EPSG:5070 working CRS
+pyogrio>=0.7         # reads the NFHL and NHDPlus inputs and writes the FileGDB pull_hydro.py reads
 requests>=2.28       # Atlas 14, StreamCat, Soil Data Access, The National Map, TIGER
 rasterio>=1.3        # pull_dem.py: 3DEP 1/3" rasters and vertex sampling
+earthengine-api>=1.0 # pull_gee.py: 3DEP, MERIT Hydro, NLCD and JRC surface water from Earth Engine

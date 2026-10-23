@@ -44,7 +44,7 @@ boundaries and dates:
 | unit | where it is in the data |
 |---|---|
 | DFIRM (countywide study; 99.86% of rows) | `dfirm_id` on every point |
-| FIRM panel | `data/interim/nfhl_states/pan_FL.parquet`: `FIRM_PAN`, `EFF_DATE`, `PRE_DATE`, `SCALE`, `PANEL_TYP` (points carry `meta_eff_date`, `meta_panel_scale`, `meta_panel_typ` from the join at `sample_points.py:628`) |
+| FIRM panel | `data/interim/nfhl_states/pan_FL.parquet`: `FIRM_PAN`, `EFF_DATE`, `PRE_DATE`, `SCALE`, `PANEL_TYP` (points carry `meta_eff_date`, `meta_panel_scale`, `meta_panel_typ` from the join in `sample_points.py` `attach_panel_meta`) |
 | study / source | `meta_source_cit` (mostly `<NA>` in FL), `meta_study_typ`, `meta_study_regime` |
 | flood-hazard polygon | `meta_fld_ar_id` (positives only), geometry in `data/interim/prep/haz_FL_5070.parquet` |
 | hydraulic reach | `meta_comid`; flowlines in `data/interim/hydro/river_FL.parquet` (`COMID, LENGTHKM, StreamOrde, TotDASqKM, SLOPE, FTYPE`) |
@@ -114,7 +114,8 @@ is not repeated here.
 - **Seeds.** Regions are only objects if they recur. Run seeds 1–2 under the paper
   protocol first (already on the next-steps list); report components that recur across
   seeds (chance-normalised Jaccard, `graph.py`) as primary and the rest as
-  seed-specific.
+  seed-specific. (As run: `aotil/region_recurrence.py` calls a region recurring when at
+  least half of its points lie within 2 km of another seed's region points.)
 - **Naming.** Every output carries `{cell}_S{S}_{variant}_R{k}` — cell, budget, region
   set (`classic`, `spatial_mu3_knn10`, `smoothed`), component index.
 
@@ -130,14 +131,14 @@ Build once, in a new `aotil/regions.py`; every question below reads from it.
 2. **Unit tables.** Point → reach (`meta_comid`), polygon (`meta_fld_ar_id`), panel,
    DFIRM (`dfirm_id`), study (`meta_source_cit` → fallback `dfirm_id` × `meta_study_typ`
    where the citation is `<NA>`). Two columns have to be added to the dataset:
-   - `meta_firm_pan` — the panel id; the join at `sample_points.py:628` already touches
-     the panel table and keeps only `EFF_DATE`, `SCALE`, `PANEL_TYP`.
+   - `meta_firm_pan` — the panel id; the join in `sample_points.py` `attach_panel_meta`
+     already touches the panel table and keeps only `EFF_DATE`, `SCALE`, `PANEL_TYP`.
    - `meta_near_fld_ar_id` — nearest SFHA polygon for *negatives* (band negatives have
      `meta_fld_ar_id = <NA>`); the STRtree nearest query that produces
      `meta_dist_to_sfha_m` already finds it.
    - `edge_dist_m` — distance from a positive to its own polygon's boundary.
      `meta_dist_to_sfha_m` is 0 for every positive by construction (the sampling check
-     at `sample_points.py:853` requires it), so the "within ~30 m of the boundary"
+     in `sample_points.py` `audit_points` requires it), so the "within ~30 m of the boundary"
      mechanism from §9 of the method doc can only be measured with this column.
 3. **Along-network coordinate.** Project each point onto its reach's flowline →
    (`comid`, distance along). `river_FL.parquet` has no from/to node ids, so chain
@@ -525,14 +526,16 @@ enrichment and the candidate restudy list; R7 AUC by group × region set.
 Code: `aotil/regions.py` (R0), `aotil/breaks.py` (R1), `aotil/coverage.py` (R2),
 `aotil/labelgeom.py` (R3), `aotil/residuals.py` (R4), `aotil/external.py` (R5),
 `aotil/excise.py` (R6), `aotil/explain.py` (R7), `aotil/maps.py` (R8). Dataset
-additions: `meta_firm_pan`, `meta_near_fld_ar_id`, `edge_dist_m`.
+additions: `meta_firm_pan`, `meta_near_fld_ar_id`, `edge_dist_m`. (Of these files only
+`aotil/regions.py` was written; the Florida work followed `docs/REGION-ANALYSIS-FLORIDA.md`.)
 
 ---
 
 ## 6. Pitfalls specific to region analysis
 
 - **Pseudo-replication is worse inside a compact region, not better.** Tile-level
-  bootstrap (`transfer.tile_bootstrap_r`) is weak with 5 tiles; treat *components* as
+  bootstrap (`tile_bootstrap_r` in the pilot-era `aotil/transfer.py`, removed 2026-10-21)
+  is weak with 5 tiles; treat *components* as
   the replication unit, report per component, and pool only with the null.
 - **Multiple testing.** Six questions × several break types × three region sets. Two
   statistics are pre-registered as primary — R1 excess(M) − excess(L) and R2 reach
