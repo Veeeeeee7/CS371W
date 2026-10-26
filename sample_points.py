@@ -8,15 +8,24 @@ every SFHA, inside a FIRM panel) or `shadedX` (inside Zone X 0.2%-chance polygon
 `meta_*` record how the map was made and are never features; every downstream split is made on
 `block_id`. Protocol v2 settings and their citations: docs/PROJECT-PLAN.md section 2a.
 
+With --land-mask (off by default), no point lies on open water: positives and shadedX negatives
+are drawn over the land inside their polygons, band negatives over the land in the band and
+outside NFHL OPEN WATER polygons. The mask is NLCD land cover from pull_land_mask.py.
+
 Inputs:  data/interim/nfhl_states/{haz,pan,s_bfe}_FL.parquet
+         data/interim/gis/nlcd2021_FL.tif (--land-mask only)
 Outputs: data/interim/prep/{idx_FL,haz_FL_5070}.parquet (--prep, run once)
          data/interim/points/points_FL.parquet
 
     python sample_points.py --prep FL
     python sample_points.py FL --protocols band --exact --ring-oversample 6
+    python sample_points.py FL --protocols band --exact --ring-oversample 6 \\
+        --state-polygons data/interim/gis/counties_FL.parquet \\
+        --land-mask data/interim/gis/nlcd2021_FL.tif
     python sample_points.py --audit FL
 """
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -29,7 +38,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shapely
-from pyproj import Transformer
+from pyproj import CRS, Transformer
 from shapely import STRtree
 
 IN_DIR = Path("data/interim/nfhl_states")
@@ -65,6 +74,12 @@ DEFAULTS = dict(
 )
 PROTOCOLS = ("band", "shadedX")
 UNASSESSED_ZONES = ("D", "AREA NOT INCLUDED")   # inside FIRM panels but never studied
+OPEN_WATER_ZONE = "OPEN WATER"    # NFHL's mapped open water; --land-mask keeps band negatives out
+
+# --land-mask raster codes (NLCD classes, pull_land_mask.py). A point is on land if its pixel
+# holds a class other than these two; a point off the raster is not on land.
+MASK_NODATA = 0       # no data: offshore, or outside NLCD
+MASK_OPEN_WATER = 11  # NLCD open water
 
 # Prefix of every column that records how the map was made. Never a model feature: STUDY_TYP
 # alone predicts Zone A vs AE well above the base rate, and meta_dist_to_sfha_m is the distance
@@ -139,6 +154,81 @@ def _no_points():
 
 def _indented(text: str) -> str:
     return "    " + text.replace("\n", "\n    ")
+
+
+def file_sha256(path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+# =========================================================================
+# land mask (--land-mask)
+# =========================================================================
+class LandMask:
+    """A land-cover raster with NLCD class codes, read whole (Florida: about 0.7 GB of uint8).
+
+    Pixels are looked up from EPSG:5070 x, y directly when pyproj says the raster's CRS equals
+    EPSG:5070; otherwise each point is transformed into the raster's CRS first.
+    """
+
+    def __init__(self, path):
+        import rasterio     # only a build or audit with --land-mask reads a raster
+        self.path = str(path)
+        with rasterio.open(path) as src:
+            self.classes = src.read(1)
+            transform = src.transform
+            self.crs = CRS.from_user_input(src.crs.to_wkt())
+        if transform.b != 0 or transform.d != 0:
+            raise ValueError(f"{path}: a rotated pixel grid is not supported")
+        self.x0, self.dx = transform.c, transform.a
+        self.y0, self.dy = transform.f, transform.e
+        self.to_raster = None
+        if self.crs != CRS.from_epsg(CRS_WORK):
+            self.to_raster = Transformer.from_crs(CRS_WORK, self.crs, always_xy=True)
+        self.sha256 = file_sha256(path)
+
+    def describe(self) -> str:
+        height, width = self.classes.shape
+        if self.to_raster is None:
+            lookup = f"EPSG:{CRS_WORK} x, y read directly"
+        else:
+            lookup = f"points transformed by '{self.to_raster.description}'"
+        return f"{self.path} ({width:,} x {height:,} pixels; {lookup})"
+
+    def classes_at(self, x, y) -> np.ndarray:
+        """The class of the pixel holding each point (EPSG:5070 metres); MASK_NODATA off it."""
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if self.to_raster is not None and x.size:
+            x, y = self.to_raster.transform(x, y)
+        col = np.floor((x - self.x0) / self.dx)
+        row = np.floor((y - self.y0) / self.dy)
+        height, width = self.classes.shape
+        inside = (col >= 0) & (col < width) & (row >= 0) & (row < height)
+        out = np.full(x.shape, MASK_NODATA, dtype=np.uint8)
+        out[inside] = self.classes[row[inside].astype(np.int64), col[inside].astype(np.int64)]
+        return out
+
+    @staticmethod
+    def is_land(classes) -> np.ndarray:
+        classes = np.asarray(classes)
+        return (classes != MASK_NODATA) & (classes != MASK_OPEN_WATER)
+
+
+def on_land(land: LandMask, x, y, owner):
+    """The candidates that lie on land per the mask: (x, y, owner, the class each one reads).
+
+    It runs on place_points' output, before thinning. Dropping candidates from an area-uniform
+    draw leaves an area-uniform draw over the land; rejecting water inside place_points' loop
+    instead would keep each polygon's count proportional to its whole area, over-sampling the
+    land of mostly-water polygons.
+    """
+    classes = land.classes_at(x, y)
+    keep = LandMask.is_land(classes)
+    return x[keep], y[keep], owner[keep], classes[keep]
 
 
 # =========================================================================
@@ -502,6 +592,10 @@ def sample_band_negatives(state, src_idx, src_geoms, sfha_idx, pan_tree, n, cfg,
     floodplains. The ring only bounds the candidates (the exact distance filter decides), so it
     is built from simplified polygons and widened by the simplification tolerance; its 8-segment
     corners sit at most ~25 m inside the true buffer.
+
+    With --land-mask, build_state puts the mask (cfg["land"]) and the NFHL OPEN WATER polygons
+    (cfg["open_water_tree"]) into the cfg it passes, and candidates in OPEN WATER or not on land
+    are dropped too; each kept point records its mask class in meta_mask_lc.
     """
     if n <= 0 or len(src_geoms) == 0:
         return None
@@ -541,6 +635,21 @@ def sample_band_negatives(state, src_idx, src_geoms, sfha_idx, pan_tree, n, cfg,
         in_unassessed = _query_mask(unassessed_tree, pts, "intersects")
         unassessed = ok & in_unassessed
         ok &= ~in_unassessed
+    land = cfg.get("land")
+    mask_lc = None
+    water_note = ""
+    if land is not None:
+        open_water = np.zeros(len(pts), dtype=bool)
+        if cfg.get("open_water_tree") is not None:
+            in_open_water = _query_mask(cfg["open_water_tree"], pts, "intersects")
+            open_water = ok & in_open_water
+            ok &= ~in_open_water
+        mask_lc = land.classes_at(x, y)
+        land_ok = LandMask.is_land(mask_lc)
+        off_land = ok & ~land_ok
+        ok &= land_ok
+        water_note = (f", {int(open_water.sum()):,} in {OPEN_WATER_ZONE}, "
+                      f"{int(off_land.sum()):,} not on land per the mask")
     abroad = np.zeros(len(pts), dtype=bool)
     if state_tree is not None:
         home = _query_mask(state_tree, pts, "within")
@@ -557,7 +666,7 @@ def sample_band_negatives(state, src_idx, src_geoms, sfha_idx, pan_tree, n, cfg,
     print(f"    band candidates {len(pts):,}: {int(too_near.sum()):,} < {band_min:.0f} m, "
           f"{int(too_far.sum()):,} > {band_max:.0f} m, {int(outside_panel.sum()):,} outside a "
           f"panel, {int(unassessed.sum()):,} in {' or '.join(UNASSESSED_ZONES)}"
-          f"{mask_note}; {len(x):,} valid, {len(thinned):,} after thinning",
+          f"{water_note}{mask_note}; {len(x):,} valid, {len(thinned):,} after thinning",
           flush=True)
     if len(thinned) < n:
         suggested = cfg["ring_oversample"] * n / max(len(thinned), 1) * 1.1
@@ -566,8 +675,11 @@ def sample_band_negatives(state, src_idx, src_geoms, sfha_idx, pan_tree, n, cfg,
     keep = thinned[:n]
     x, y, dist, ring_i = x[keep], y[keep], dist[keep], ring_i[keep]
     src = ring_src[ring_i]
-    return _blank_frame(src_idx["DFIRM_ID"].to_numpy()[src], x, y, dist,
-                        src_idx["row_id"].to_numpy()[src])
+    frame = _blank_frame(src_idx["DFIRM_ID"].to_numpy()[src], x, y, dist,
+                         src_idx["row_id"].to_numpy()[src])
+    if mask_lc is not None:
+        frame["meta_mask_lc"] = mask_lc[ok][keep]
+    return frame
 
 
 def sample_shaded_x(state, domain, shaded_idx, src, sfha_idx, n_neg, cfg, rng):
@@ -592,10 +704,20 @@ def sample_shaded_x(state, domain, shaded_idx, src, sfha_idx, n_neg, cfg, rng):
     x, y, pidx = place_points(geoms, quota, rng)
     if len(x) == 0:
         return None
+    mask_lc = None
+    if cfg.get("land") is not None:
+        n_placed = len(x)
+        x, y, pidx, mask_lc = on_land(cfg["land"], x, y, pidx)
+        print(f"  [{domain}] shadedX: {n_placed - len(x):,} of {n_placed:,} candidates not on "
+              f"land per the mask", flush=True)
+        if len(x) == 0:
+            return None
     keep = grid_thin(x, y, cfg["min_sep_m"], rng)[:n_neg]
     x, y, pidx = x[keep], y[keep], pidx[keep]
     dist = distances_to_sfha(state, shapely.points(x, y), sfha_idx, cfg["band_max_m"])
     frame = _tag(_attr_frame(polys.iloc[pidx], x, y, dist), domain, 0, "shadedX")
+    if mask_lc is not None:
+        frame["meta_mask_lc"] = mask_lc[keep]
     print(f"  [{domain}] negatives shadedX {len(x):,}/{n_neg:,}", flush=True)
     return frame
 
@@ -861,12 +983,20 @@ def read_unassessed(state: str, idx: pd.DataFrame) -> np.ndarray:
     return geoms[_is_present(geoms)]
 
 
+def read_open_water(state: str, idx: pd.DataFrame) -> np.ndarray:
+    """Geometry of the state's NFHL OPEN WATER polygons."""
+    rows = idx[idx.FLD_ZONE == OPEN_WATER_ZONE]
+    geoms = read_geoms(state, rows["row_id"].to_numpy())
+    return geoms[_is_present(geoms)]
+
+
 def sample_positives(state, domain, zone_idx, cfg, rng):
     """A domain's positives, thinned to min_sep_m, kept up to per_domain plus the surplus.
 
     Quotas are drawn over every polygon of the zone, and geometry is read only for the polygons
-    that drew a point (about 9,000 per zone in Florida). Returns (frame, src, geoms, pidx), where
-    src and geoms are those polygons and pidx maps each kept point to them, or None.
+    that drew a point (about 9,000 per zone in Florida). With cfg["land"] (--land-mask), placed
+    candidates not on land are dropped before thinning (on_land). Returns (frame, src, geoms,
+    pidx), where src and geoms are those polygons and pidx maps each kept point to them, or None.
     """
     if len(zone_idx) == 0:
         print(f"  [{domain}] no polygons")
@@ -890,12 +1020,22 @@ def sample_positives(state, domain, zone_idx, cfg, rng):
     if len(x) == 0:
         print(f"  [{domain}] sampling produced nothing")
         return None
+    mask_lc = None
+    if cfg.get("land") is not None:
+        n_placed = len(x)
+        x, y, pidx, mask_lc = on_land(cfg["land"], x, y, pidx)
+        print(f"  [{domain}] positives: {n_placed - len(x):,} of {n_placed:,} candidates not on "
+              f"land per the mask", flush=True)
+        if len(x) == 0:
+            return None
     drawn = len(x)
     thinned = grid_thin(x, y, cfg["min_sep_m"], rng)
     keep = thinned[:_with_surplus(n_target, cfg["surplus"])]
     x, y, pidx = x[keep], y[keep], pidx[keep]
 
     frame = _tag(_attr_frame(src.iloc[pidx], x, y, np.zeros(len(x))), domain, 1, pd.NA)
+    if mask_lc is not None:
+        frame["meta_mask_lc"] = mask_lc[keep]
     supply_flag = "" if len(x) >= n_target else "   <-- SUPPLY-LIMITED"
     print(f"  [{domain}] positives {len(x):,} kept for {n_target:,} from "
           f"{len(src):,} polygons, {src.iloc[pidx].DFIRM_ID.nunique()} DFIRMs "
@@ -1013,6 +1153,17 @@ def build_state(state: str, cfg: dict):
             unassessed_tree = STRtree(unassessed)
         print(f"  band negatives must also lie outside {len(unassessed):,} "
               f"{' / '.join(UNASSESSED_ZONES)} polygons")
+    # The samplers read the mask and the OPEN WATER polygons from their cfg, next to the
+    # settings; cfg itself keeps only what the points file stores (the path and its SHA-256).
+    sample_cfg = cfg
+    if cfg.get("land_mask"):
+        land = LandMask(cfg["land_mask"])
+        cfg = dict(cfg, land_mask_sha256=land.sha256)
+        open_water = read_open_water(state, idx)
+        open_water_tree = STRtree(open_water) if len(open_water) else None
+        sample_cfg = dict(cfg, land=land, open_water_tree=open_water_tree)
+        print(f"  every point must lie on land per {land.describe()}; band negatives also "
+              f"outside {len(open_water):,} {OPEN_WATER_ZONE} polygons")
 
     n_panels = 0 if pan is None else len(pan)
     print(f"\n[{state}] A={int((pos_idx.FLD_ZONE == 'A').sum()):,}  "
@@ -1025,7 +1176,7 @@ def build_state(state: str, cfg: dict):
     frames = []
     for domain in ("A", "AE"):
         positives = sample_positives(state, domain, pos_idx[pos_idx.FLD_ZONE == domain],
-                                     cfg, rng)
+                                     sample_cfg, rng)
         if positives is None:
             continue
         pos, src, geoms, pidx = positives
@@ -1040,14 +1191,15 @@ def build_state(state: str, cfg: dict):
         if "band" in protocols:
             used = np.unique(pidx[:n_pos])
             band = sample_band_negatives(state, src.iloc[used].reset_index(drop=True),
-                                         geoms[used], sfha_idx, pan_tree, n_neg, cfg, rng,
-                                         state_tree, unassessed_tree)
+                                         geoms[used], sfha_idx, pan_tree, n_neg, sample_cfg,
+                                         rng, state_tree, unassessed_tree)
             if band is not None and len(band):
                 frames.append(_tag(band, domain, 0, "band"))
                 print(f"  [{domain}] negatives band    {len(band):,}/{n_neg:,}", flush=True)
 
         if "shadedX" in protocols:
-            shaded = sample_shaded_x(state, domain, shaded_idx, src, sfha_idx, n_neg, cfg, rng)
+            shaded = sample_shaded_x(state, domain, shaded_idx, src, sfha_idx, n_neg,
+                                     sample_cfg, rng)
             if shaded is not None:
                 frames.append(shaded)
 
@@ -1121,6 +1273,10 @@ def audit_points(state: str, path: Path, cfg: dict) -> None:
     band = points[points.neg_protocol == "band"]
     if len(band):
         _audit_band(state, band, settings)
+    # The mask the build used; --land-mask tests a build made without one.
+    mask_path = settings.get("land_mask") or cfg.get("land_mask")
+    if mask_path:
+        _audit_land(state, points, mask_path, settings.get("land_mask_sha256"))
 
     # Builds from before meta_src_row_id identify a polygon by DFIRM and FLD_AR_ID.
     if "meta_src_row_id" in points.columns:
@@ -1210,6 +1366,24 @@ def _audit_band(state: str, band: gpd.GeoDataFrame, settings: dict) -> None:
               f"{n_in:,} (must be 0)")
 
 
+def _audit_land(state: str, points: gpd.GeoDataFrame, mask_path: str, built_sha256) -> None:
+    """Every point on land per the mask, and no band negative in an NFHL OPEN WATER polygon."""
+    land = LandMask(mask_path)
+    if built_sha256 and built_sha256 != land.sha256:
+        print(f"  WARNING: {mask_path} is not the mask the build used (SHA-256 differs)")
+    classes = land.classes_at(points.geometry.x.values, points.geometry.y.values)
+    off_land = int((~LandMask.is_land(classes)).sum())
+    print(f"  points not on land per the mask: {off_land:,} (must be 0)")
+    band = points[points.neg_protocol == "band"]
+    if len(band) and (PREP_DIR / f"idx_{state}.parquet").exists():
+        open_water = read_open_water(state, load_index(state))
+        n_in = 0
+        if len(open_water):
+            band_pts = np.asarray(band.geometry.values)
+            n_in = int(_query_mask(STRtree(open_water), band_pts, "intersects").sum())
+        print(f"  band negatives in NFHL {OPEN_WATER_ZONE}: {n_in:,} (must be 0)")
+
+
 def report() -> None:
     """Points per state, domain, label and protocol over every points file written."""
     files = sorted(OUT_DIR.glob("points_*.parquet"))
@@ -1230,9 +1404,22 @@ def report() -> None:
     print(f"\ntotal points: {counts.n.sum():,}")
 
 
+LAND_MASK_HELP = ("--land-mask PATH: keep every point on land per a land-cover raster from "
+                  "pull_land_mask.py (0 no data, 11 open water); band negatives also stay out of "
+                  "NFHL OPEN WATER polygons. Off by default. With --audit, tests a build against "
+                  "PATH when the build stored no mask.")
+
+
 def main(argv: list[str]) -> int:
+    # --land-mask is parsed apart from the main options, which stay one per DEFAULTS key plus
+    # the commands; it enters cfg only when given.
+    mask_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    mask_parser.add_argument("--land-mask", default="")
+    mask_args, argv = mask_parser.parse_known_args(argv)
+
     parser = argparse.ArgumentParser(
-        description="Sample a point-level flood-label dataset from NFHL flood-zone polygons.")
+        description="Sample a point-level flood-label dataset from NFHL flood-zone polygons.",
+        epilog=LAND_MASK_HELP)
     parser.add_argument("states", nargs="*", help="state codes (default: FL)")
     parser.add_argument("--prep", action="store_true", help="one-time repack + index")
     parser.add_argument("--report", action="store_true")
@@ -1248,6 +1435,8 @@ def main(argv: list[str]) -> int:
     options = vars(args)
     cfg = {key: options[key] for key in DEFAULTS}
     cfg["exact"] = args.exact
+    if mask_args.land_mask:
+        cfg["land_mask"] = mask_args.land_mask
     parse_protocols(cfg["protocols"])
     states = args.states or STATES
     unknown = [state for state in states if state not in STATES]

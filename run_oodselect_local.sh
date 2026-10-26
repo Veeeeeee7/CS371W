@@ -22,6 +22,14 @@
 #   BUDGETS="250 500 1000"   only these budgets (default: the paper grid)
 # e.g. NULL_SEEDS="1 2 3" BUDGETS="250 500 1000" ./run_oodselect_local.sh --date ...
 #
+# BUDGET_PENALTY (default squared) is passed as --budget-penalty: squared is the published
+# paper's Eq. 5, which the paper's Approach states, so every run for the paper uses it.
+# BUDGET_PENALTY=softplus reproduces the runs made before 2026-10-24 (the released code's term).
+#
+# REG (default laplacian) is passed as --reg to the spatial variant: REG=gtv runs graph total
+# variation instead of the Laplacian, into the folders spatial_gtv_mu<mu>_knn<k>[...]. The classic
+# variant has no spatial loss and always runs with the default.
+#
 # Resumable: a budget whose _result.csv exists is skipped, so re-running the
 # same command after an interruption only does what is missing.
 #
@@ -66,6 +74,8 @@ SEED="${SEED:-0}"
 NULL_SEEDS="${NULL_SEEDS:-}"
 SPLITS="${SPLITS:-random}"
 BUDGETS="${BUDGETS:-}"
+BUDGET_PENALTY="${BUDGET_PENALTY:-squared}"
+REG="${REG:-laplacian}"
 # Default: the performance cores (Apple silicon), leaving the efficiency cores
 # for the rest of the machine.
 if [ -z "${JOBS:-}" ]; then
@@ -98,11 +108,14 @@ if ! "$PY" -c "import xgboost" 2>/dev/null; then
     fi
 fi
 
-# variant_dir <mu> [<split> [<null seed>|none]]: the folder name oodselect_paper.variant_name gives.
+# variant_dir <mu> [<split> [<null seed>|none [<reg>]]]: the folder name
+# oodselect_paper.variant_name gives.
 variant_dir() {
     local name suffix=""
     if [ "$(printf '%g' "$1")" = "0" ]; then
         name=classic
+    elif [ "${4:-laplacian}" = "gtv" ]; then
+        name="spatial_gtv_mu$(printf '%g' "$1")_knn${KNN}"
     else
         name="spatial_mu$(printf '%g' "$1")_knn${KNN}"
     fi
@@ -120,7 +133,7 @@ variant_dir() {
 
 echo "[local] date=$DATE cells=[$CELLS] variants=[$VARIANTS] jobs=$JOBS"
 echo "[local] splits=[$SPLITS] null_seeds=[${NULL_SEEDS:-off}] budgets=[${BUDGETS:-paper grid}]"
-echo "[local] models=$N_MODELS trials=$TRIALS max_epochs=$MAX_EPOCHS patience=$PATIENCE"
+echo "[local] models=$N_MODELS trials=$TRIALS max_epochs=$MAX_EPOCHS patience=$PATIENCE budget_penalty=$BUDGET_PENALTY reg=$REG"
 T0=$(date +%s)
 
 # ---------------------------------------------------------------- 1. zoo
@@ -145,18 +158,18 @@ TASKS="${LOG_DIR}/local_tasks.txt"
 : > "$TASKS"
 for variant in $VARIANTS; do
     case "$variant" in
-        classic) mu=0 ;;
-        spatial) mu="$MU_SPATIAL" ;;
+        classic) mu=0; reg=laplacian ;;
+        spatial) mu="$MU_SPATIAL"; reg="$REG" ;;
         *) echo "unknown variant '$variant' (classic|spatial)" >&2; exit 1 ;;
     esac
     for split in $SPLITS; do
         for null_seed in ${NULL_SEEDS:-none}; do
-            folder=$(variant_dir "$mu" "$split" "$null_seed")
+            folder=$(variant_dir "$mu" "$split" "$null_seed" "$reg")
             mkdir -p "$ROOT/$folder"
             for tag in $TAGS; do
                 for budget in ${BUDGETS:-$("$PY" aotil/oodselect_paper.py --cells "$CELLS_DIR" \
                                                --tag "$tag" --list-budgets)}; do
-                    echo "$budget $mu $folder $tag $split $null_seed" >> "$TASKS"
+                    echo "$budget $mu $folder $tag $split $null_seed $reg" >> "$TASKS"
                 done
             done
         done
@@ -166,8 +179,8 @@ sort -k1,1nr -o "$TASKS" "$TASKS"
 N_TASKS=$(wc -l < "$TASKS" | tr -d ' ')
 echo "[select] $N_TASKS tasks, $JOBS at a time (progress: ls $ROOT/*/*_result.csv | wc -l)"
 
-export PY CELLS_DIR ROOT LOG_DIR KNN TRIALS MAX_EPOCHS PATIENCE SEED
-# Each task line arrives as the words $0..$5 of the inner script.
+export PY CELLS_DIR ROOT LOG_DIR KNN TRIALS MAX_EPOCHS PATIENCE SEED BUDGET_PENALTY
+# Each task line arrives as the words $0..$6 of the inner script.
 # shellcheck disable=SC2016
 xargs -P "$JOBS" -L 1 bash -c '
     budget=$0
@@ -176,6 +189,7 @@ xargs -P "$JOBS" -L 1 bash -c '
     tag=$3
     split=$4
     null_seed=$5
+    reg=$6
     log="${LOG_DIR}/${folder}_${tag}_S${budget}_local"
     null_arg=""
     if [ "$null_seed" != "none" ]; then
@@ -185,7 +199,8 @@ xargs -P "$JOBS" -L 1 bash -c '
     "$PY" -u aotil/oodselect_paper.py --cells "$CELLS_DIR" --tag "$tag" \
         --out "$ROOT/$folder" --budget "$budget" --mu "$mu" --knn "$KNN" \
         --trials "$TRIALS" --max-epochs "$MAX_EPOCHS" --patience "$PATIENCE" \
-        --seed "$SEED" --split "$split" $null_arg --threads 1 >>"$log.out" 2>>"$log.err" \
+        --seed "$SEED" --split "$split" $null_arg --budget-penalty "$BUDGET_PENALTY" \
+        --reg "$reg" --threads 1 >>"$log.out" 2>>"$log.err" \
       && echo "  done  $folder $tag S=$budget  $(grep -o "TEST r = [^|]*" "$log.out" | tail -1)" \
       || echo "  FAIL  $folder $tag S=$budget  (see $log.err)"
 ' < "$TASKS"

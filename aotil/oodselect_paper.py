@@ -6,6 +6,10 @@ Generalization Failures from Spurious Correlations" (NeurIPS 2025, arXiv:2510.24
 github.com/olawalesalaudeen/OODSELECT; each function names the part of that code it mirrors.
 --mu > 0 adds mu * z'Lz / (S k) to the training loss, where L is the Laplacian of the kNN graph
 on the OOD points (graph.py). One run is one (cell, budget S, variant).
+--reg gtv replaces z'Lz by the graph total variation sum |z_j - z_j'| over the same edges (the
+paper's Eq. gtv); see _TotalVariation. The default, laplacian, is the run before --reg existed.
+--budget-penalty picks the budget term: softplus (default, the released code) or squared (the
+published paper's Eq. 5, which the paper's Approach states); see budget_term and PENALTY_RANGE.
 
 TWO CONTROLS (O3, docs/PROJECT-PLAN.md section 3), both off by default:
   --null-seed N  permute the selection + validation models' ID accuracies before the search
@@ -41,6 +45,16 @@ NUM_EPOCHS = 50_000       # maximum epochs per trial
 PATIENCE = 500            # early-stopping patience, epochs
 EPS = 1e-6                # probit clamp and variance regulariser
 AOTIL_THRESHOLD = -0.3    # the paper's cut: r_test at or below it is accuracy-on-the-inverse-line
+
+BUDGET_PENALTIES = ("softplus", "squared")
+# Optuna's range (low, high, log) for the budget weight lambda under each budget term. softplus:
+# the released code's uniform [0.1, 100]. squared: Eq. 5's term is in points squared (6.25e6 at
+# S = 500 and a soft total of 3,000) while the correlation lies in [-1, 1], so lambda is searched
+# log-uniform over a wider range (option b of docs/TODO-CLAUDE-CODE.md item 1). The range is
+# ours, not the paper's.
+PENALTY_RANGE = {"softplus": (1e-1, 1e2, False), "squared": (1e-6, 1e2, True)}
+
+REGS = ("laplacian", "gtv")   # the spatial loss R under mu > 0 (paper Eq. laplacian, Eq. gtv)
 
 SPLITS = ("random", "trees->others", "others->trees")
 SPLIT_SUFFIX = {"random": "", "trees->others": "_trees2others", "others->trees": "_others2trees"}
@@ -133,10 +147,16 @@ def null_accuracies(acc: np.ndarray, split, null_seed: int | None) -> np.ndarray
     return out
 
 
-def variant_name(mu: float, knn: int, split: str = "random", null_seed: int | None = None) -> str:
-    """classic or spatial_mu<mu>_knn<k>, then the split suffix, then _null<N>."""
+def variant_name(mu: float, knn: int, split: str = "random", null_seed: int | None = None,
+                 reg: str = "laplacian") -> str:
+    """classic, spatial_mu<mu>_knn<k> (Laplacian) or spatial_gtv_mu<mu>_knn<k>, then the split
+    suffix, then _null<N>. At mu = 0 the loss has no spatial term, so reg does not enter."""
+    if reg not in REGS:
+        raise ValueError(f"unknown reg {reg!r}; one of {REGS}")
     if mu == 0:
         name = "classic"
+    elif reg == "gtv":
+        name = f"spatial_gtv_mu{mu:g}_knn{knn}"
     else:
         name = f"spatial_mu{mu:g}_knn{knn}"
     name += SPLIT_SUFFIX[split]
@@ -186,6 +206,21 @@ def pearson_r_loss(X, y, z, eps: float = EPS):
     x_var = torch.mean(x_c ** 2) + eps
     y_var = torch.mean(y_c ** 2) + eps
     return cov / torch.sqrt(x_var * y_var)
+
+
+def budget_term(total, S: int, kind: str = "softplus"):
+    """B_S of the soft total sum(z), before the weight lambda * warm-up.
+
+    softplus: the released code's one-sided log(1 + exp(S - total)), ~0 once total > S.
+    squared: the published paper's (S - total)^2 (Salaudeen et al. 2025, Eq. 5), which pulls the
+    total toward S from either side.
+    """
+    torch = _torch()
+    if kind == "softplus":
+        return torch.nn.functional.softplus(S - total)
+    if kind == "squared":
+        return (S - total) ** 2
+    raise ValueError(f"unknown budget penalty {kind!r}; one of {BUDGET_PENALTIES}")
 
 
 def binary_selection(theta, k: int):
@@ -242,6 +277,47 @@ class _Quadratic:
         return self._fn.apply(z)
 
 
+class _TotalVariation:
+    """The graph total variation sum |z_j - z_j'| over the edges of L's graph, each undirected
+    edge once, as z'Lz counts it (the paper's Eq. gtv before the division by S k).
+
+    The edges are the strict upper triangle of L, whose off-diagonal entries are -1 on an edge
+    (L = D - A with 0/1 A). On a 0/1 z both this and z'Lz count the cut edges. The gradient is
+    autograd's through torch.abs, whose subgradient at a tie z_j = z_j' is 0 (paper 3.5).
+    """
+
+    def __init__(self, L):
+        import scipy.sparse as sp
+        torch = _torch()
+        L = sp.csr_matrix(L)
+        if abs(L - L.T).max() > 0:
+            raise ValueError("L must be symmetric")
+        upper = sp.triu(L, k=1).tocoo()
+        upper.eliminate_zeros()
+        if upper.nnz and not np.all(upper.data == -1):
+            raise ValueError("L must be the Laplacian of a 0/1 adjacency (off-diagonals -1 or 0)")
+        self.j = torch.as_tensor(upper.row, dtype=torch.int64)
+        self.j_prime = torch.as_tensor(upper.col, dtype=torch.int64)
+        self.n_edges = int(upper.nnz)
+
+    def __call__(self, z):
+        torch = _torch()
+        z64 = z.double()
+        return torch.abs(z64[self.j] - z64[self.j_prime]).sum().to(z.dtype)
+
+
+def spatial_term(L, reg: str = "laplacian"):
+    """The callable z -> numerator of R (before the division by S k) that train_one adds:
+    z'Lz for reg = laplacian, the total variation for reg = gtv; None without a graph."""
+    if reg not in REGS:
+        raise ValueError(f"unknown reg {reg!r}; one of {REGS}")
+    if L is None:
+        return None
+    if reg == "gtv":
+        return _TotalVariation(L)
+    return _Quadratic(L)
+
+
 def laplacian_torch(L):
     """scipy CSR -> torch sparse CSR (float32), the reference _Quadratic is checked against."""
     torch = _torch()
@@ -258,15 +334,18 @@ class TrialFailed(RuntimeError):
 
 
 def train_one(X_tr, y_tr, X_va, y_va, S: int, hp: dict, *, max_epochs: int,
-              patience: int, seed: int, L_t=None, mu: float = 0.0, knn: int = 10):
+              patience: int, seed: int, L_t=None, mu: float = 0.0, knn: int = 10,
+              budget_penalty: str = "softplus"):
     """One fit of the authors' TestSetFinder, written as the loop PyTorch Lightning runs
     (Lightning's per-step overhead costs ~10x in wall clock and changes no arithmetic).
+    budget_penalty picks the budget term (budget_term); softplus is the authors' code exactly.
 
     theta ~ N(0, 1) from a generator seeded by `seed` (the released code does not seed it).
     Returns theta at the epoch training stopped, as the released code keeps it (its best-epoch
     checkpoint is never read back), and the last validation r, which tune_hparams returns.
-    L_t is a callable z -> z'Lz (a _Quadratic) or a torch sparse matrix; the smoothness penalty
-    enters the training loss only, and only when mu > 0.
+    L_t is a callable z -> the numerator of R (spatial_term: z'Lz, or the total variation under
+    --reg gtv) or a torch sparse matrix L; the spatial penalty enters the training loss only, and
+    only when mu > 0. P_soft is that R on the final soft weights.
     """
     torch = _torch()
     if L_t is None:
@@ -295,12 +374,12 @@ def train_one(X_tr, y_tr, X_va, y_va, S: int, hp: dict, *, max_epochs: int,
         corr = pearson_r_loss(X_tr, y_tr, z)
         if torch.isnan(corr):
             raise TrialFailed(f"correlation NaN at epoch {epoch}")
-        # The authors' budget term: one-sided and cosine-warmed (epoch is Lightning's
-        # global_step here), not the (S - ||s||_1)^2 of the paper's Eq. 5. The code produced the
-        # paper's numbers, so the code is followed.
+        # The budget term, cosine-warmed as in the authors' code (epoch is Lightning's
+        # global_step here): their one-sided softplus by default, or with
+        # budget_penalty="squared" the (S - ||s||_1)^2 of the paper's Eq. 5.
         progress = min(max(epoch / float(hp["penalty_anneal_iters"]), 0.0), 1.0)
         warm = 0.5 * (1.0 - math.cos(math.pi * progress))
-        loss = corr + hp["penalty"] * warm * torch.nn.functional.softplus(S - z.sum())
+        loss = corr + hp["penalty"] * warm * budget_term(z.sum(), S, budget_penalty)
         if mu > 0 and quad is not None:
             loss = loss + mu * quad(z) / cut_norm
         opt.zero_grad(set_to_none=True)
@@ -333,12 +412,17 @@ def train_one(X_tr, y_tr, X_va, y_va, S: int, hp: dict, *, max_epochs: int,
 # ------------------------------------------------------------------ search
 def run_search(Z, acc, split, S: int, *, n_trials: int, max_epochs: int,
                patience: int, seed: int, L=None, mu: float = 0.0, knn: int = 10,
-               log_every: int = 10):
+               log_every: int = 10, budget_penalty: str = "softplus", reg: str = "laplacian"):
     """The authors' Optuna search (tune_hparams, run_optuna): minimise the last validation r over
     their five hyperparameters. Returns (best trial, its theta, a DataFrame with one record per
-    trial). Trial t trains from seed * 100_003 + t, and the TPE sampler is seeded with `seed`."""
+    trial). Trial t trains from seed * 100_003 + t, and the TPE sampler is seeded with `seed`.
+    The budget weight lambda ("penalty") is drawn from PENALTY_RANGE[budget_penalty]; reg picks
+    the spatial loss on L's graph (spatial_term)."""
     import optuna
     torch = _torch()
+    if budget_penalty not in PENALTY_RANGE:
+        raise ValueError(f"unknown budget penalty {budget_penalty!r}; one of {BUDGET_PENALTIES}")
+    penalty_low, penalty_high, penalty_log = PENALTY_RANGE[budget_penalty]
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     selection, validation, _ = split
     X_tr = torch.as_tensor(Z[selection])
@@ -346,9 +430,7 @@ def run_search(Z, acc, split, S: int, *, n_trials: int, max_epochs: int,
     X_va = torch.as_tensor(Z[validation])
     y_va = torch.as_tensor(acc[validation].astype(np.float32))
     # Passed for both variants, so that P_soft is logged for the classic run too.
-    quadratic = None
-    if L is not None:
-        quadratic = _Quadratic(L)
+    quadratic = spatial_term(L, reg)
 
     records = []
     thetas = {}
@@ -359,14 +441,14 @@ def run_search(Z, acc, split, S: int, *, n_trials: int, max_epochs: int,
             lr=trial.suggest_float("lr", 1e-2, 1e2, log=True),
             eta_min=trial.suggest_float("eta_min", 1e-3, 1e0, log=True),
             T_max=trial.suggest_int("T_max", 10, 200),
-            penalty=trial.suggest_float("penalty", 1e-1, 1e2),
+            penalty=trial.suggest_float("penalty", penalty_low, penalty_high, log=penalty_log),
             penalty_anneal_iters=trial.suggest_int("penalty_anneal_iters", 10, 1000),
         )
         t0 = time.time()
         try:
             out = train_one(X_tr, y_tr, X_va, y_va, S, hp, max_epochs=max_epochs,
                             patience=patience, seed=seed * 100_003 + trial.number,
-                            L_t=quadratic, mu=mu, knn=knn)
+                            L_t=quadratic, mu=mu, knn=knn, budget_penalty=budget_penalty)
         except TrialFailed as e:
             records.append(dict(trial=trial.number, state="failed", note=str(e),
                                 secs=time.time() - t0, **hp))
@@ -379,6 +461,7 @@ def run_search(Z, acc, split, S: int, *, n_trials: int, max_epochs: int,
             best_val = min(completed) if completed else math.nan
             print(f"    trial {trial.number:3d}  val {out['val_last']:+.3f}  "
                   f"(best {best_val:+.3f})  epochs {out['epochs']:6d}  "
+                  f"soft total {out['soft_mass']:8.1f}  "
                   f"{time.time() - t0:5.1f}s  elapsed {time.time() - t_start:6.0f}s",
                   flush=True)
         return out["val_last"]
@@ -434,6 +517,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--mu", type=float, default=0.0,
                     help="spatial smoothness weight; 0 = the paper exactly")
     ap.add_argument("--knn", type=int, default=10)
+    ap.add_argument("--reg", choices=REGS, default="laplacian",
+                    help="spatial loss under mu > 0: the graph Laplacian (default) or graph "
+                         "total variation (folder spatial_gtv_mu<mu>_knn<k>)")
     ap.add_argument("--trials", type=int, default=N_TRIALS)
     ap.add_argument("--max-epochs", type=int, default=NUM_EPOCHS)
     ap.add_argument("--patience", type=int, default=PATIENCE)
@@ -443,6 +529,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "accuracies with this seed; default off")
     ap.add_argument("--split", choices=SPLITS, default="random",
                     help="model split: the paper's 60/20/20 (random) or family-disjoint")
+    ap.add_argument("--budget-penalty", choices=BUDGET_PENALTIES, default="softplus",
+                    help="budget term: softplus (the released code, default) or squared (the "
+                         "published paper's Eq. 5, with lambda searched log-uniform over a "
+                         "wider range)")
     ap.add_argument("--threads", type=int, default=1, help="torch threads")
     ap.add_argument("--overwrite", action="store_true",
                     help="redo a budget whose result.csv exists")
@@ -470,12 +560,16 @@ def main() -> int:
         return 0
 
     out = Path(args.out)
-    variant = variant_name(args.mu, args.knn, args.split, args.null_seed)
+    variant = variant_name(args.mu, args.knn, args.split, args.null_seed, args.reg)
     is_control = args.split != "random" or args.null_seed is not None
     if is_control and out.name != variant:
         # A control run in the folder of the real run would be read as the real run.
         ap.error(f"--split {args.split} / --null-seed {args.null_seed} is variant {variant}; "
                  f"--out must be a folder of that name, not {out.name}")
+    if args.mu > 0 and args.reg != "laplacian" and out.name != variant:
+        # Likewise a GTV run in the Laplacian folder would be read as the Laplacian run.
+        ap.error(f"--reg {args.reg} is variant {variant}; --out must be a folder of that name, "
+                 f"not {out.name}")
     out.mkdir(parents=True, exist_ok=True)
     stem = out / f"{args.tag}_S{S}"
     if Path(f"{stem}_result.csv").exists() and not args.overwrite:
@@ -500,6 +594,11 @@ def main() -> int:
           f"{ood_acc.min():.3f}-{ood_acc.max():.3f}")
     print(f"  trials {args.trials}  max epochs {args.max_epochs}  patience {args.patience}  "
           f"threads {args.threads}  torch {torch.__version__}  device cpu")
+    low, high, log = PENALTY_RANGE[args.budget_penalty]
+    print(f"  budget penalty {args.budget_penalty}: lambda in [{low:g}, {high:g}] "
+          f"{'log-uniform' if log else 'uniform'}")
+    if args.reg != "laplacian":
+        print(f"  spatial loss {args.reg} (mu {args.mu:g})")
     if not info["y_id_stored"]:
         print(f"  note: cell predates y_id; ID ties at p=0.5 counted incorrect "
               f"({info['id_ties_unresolved']} such entries)")
@@ -516,7 +615,7 @@ def main() -> int:
 
     # One seed per (seed, budget): the paper selects each S independently and reads the overlap
     # across budgets (Eq. 6) as consistency. With one shared seed every budget would get the
-    # same Optuna draws and theta init, and since the one-sided budget term is ~0 once
+    # same Optuna draws and theta init, and since the one-sided (softplus) budget term is ~0 once
     # sum(z) > S, the selections would come out nested by construction. The two variants share
     # the seed at a given S, which pairs them; so does null-select, so its theta inits and
     # Optuna's first 10 (random startup) draws are the real run's.
@@ -524,7 +623,8 @@ def main() -> int:
     t0 = time.time()
     best, theta, trials = run_search(Z, acc_search, split, S, n_trials=args.trials,
                                      max_epochs=args.max_epochs, patience=args.patience,
-                                     seed=seed_eff, L=L, mu=args.mu, knn=args.knn)
+                                     seed=seed_eff, L=L, mu=args.mu, knn=args.knn,
+                                     budget_penalty=args.budget_penalty, reg=args.reg)
     secs = time.time() - t0
 
     # r_train and r_val use the accuracies the search saw (shuffled under null-select); every
@@ -540,7 +640,8 @@ def main() -> int:
     best_record = trials[trials.trial == best.number].iloc[0].to_dict()
 
     row = dict(cell=args.tag, variant=variant, split=args.split, null_seed=args.null_seed,
-               mu=args.mu, knn=args.knn, budget=S, d=d,
+               mu=args.mu, knn=args.knn, budget_penalty=args.budget_penalty, reg=args.reg,
+               budget=S, d=d,
                frac=S / d, n_sel=len(selection), n_val=len(validation), n_test=len(test),
                r_train=r_train, r_val=r_val, r_test=r_test,
                r_test_ci_lo=lo, r_test_ci_hi=hi,
@@ -567,6 +668,7 @@ def main() -> int:
     # split_rule and null_seed (also in result.csv) let audit_selection.py and report_paper.py
     # rebuild the same split with make_split.
     meta = dict(info, variant=variant, budget=S, split_rule=args.split, null_seed=args.null_seed,
+                budget_penalty=args.budget_penalty, reg=args.reg,
                 split=dict(selection=selection.tolist(), validation=validation.tolist(),
                            test=test.tolist()))
     with open(f"{stem}_meta.json", "w") as f:
@@ -575,6 +677,8 @@ def main() -> int:
     print(f"  best trial {best.number}: val {r_val:+.3f} | TEST r = {r_test:+.3f} "
           f"[{lo:+.2f}, {hi:+.2f}]  rho {stats['spearman']:+.3f} | full OOD set "
           f"{r_full_test:+.3f} | {secs / 60:.1f} min")
+    print(f"  soft total {row['soft_mass']:.1f} (S = {S}), stopped at epoch {row['epochs']}, "
+          f"lambda {row['hp_penalty']:.3g}")
     if A is not None:
         print(f"  coherence: purity {row['coh_purity']:.2f}  components {row['coh_n_cc']}  "
               f"largest {row['coh_largest_cc_frac']:.2f}  tiles {row['coh_tiles']}")

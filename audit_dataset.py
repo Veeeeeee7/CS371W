@@ -53,7 +53,7 @@ ID_COLS = {"point_id", "state", "county_fips", "dfirm_id", "block_id", "domain",
            "label", "neg_protocol", "lon", "lat", "x", "y", "geometry"}
 EXPECTED_NEW = {"meta_src_row_id", "meta_neg_rank"}   # v2 adds these to v1's columns
 
-BASE_RATE_GAP = 0.05    # |positive share ID - positive share OOD| above this -> DECIDE
+BASE_RATE_GAP = 0.05    # |positive share ID - positive share OOD| above this is reported
 LABEL_MISS_GAP = 5.0    # missingness gap between negatives and positives, percentage points
 WATER_GAP = 5.0         # open-water share gap between negatives and positives, percentage points
 NEAR_CONST = 0.99       # top-value share above this -> near-constant
@@ -340,8 +340,10 @@ def check_counts(au, df, a):
 
 
 def check_split(au, df, a):
-    """B2: the seed's 50 km tile split. Accuracy compares the ID and OOD halves only if their
-    positive shares match; above BASE_RATE_GAP, O1 has to be reported as AUC."""
+    """B2: the seed's 50 km tile split and the gap between the ID and OOD positive shares. The
+    gap is reported, flagged above BASE_RATE_GAP, and does not decide O1's metric: O1 reports
+    accuracy, AUROC and F1, and its prevalence check (o1_shift.py, adjacc_*) shows what the gap
+    does to accuracy by reweighting Zone A to the Zone AE share."""
     train, id_test, ood_test, tr_tiles, te_tiles = split_frames(df, a.protocol, a.train_dom,
                                                                 a.seed)
     halves = [("train", train, a.train_dom, len(tr_tiles)),
@@ -360,11 +362,13 @@ def check_split(au, df, a):
     gap = abs(id_share - ood_share)
     usable = len(train) >= zoo.MIN_TRAIN and len(id_test) > 0 and len(ood_test) > 0
 
-    verdict = pick_verdict(wrong=not usable, decide=gap > BASE_RATE_GAP)
+    verdict = pick_verdict(wrong=not usable, decide=False)
+    above = "above" if gap > BASE_RATE_GAP else "within"
     result = (f"train {len(train):,} | ID test {len(id_test):,} | OOD test {len(ood_test):,} | "
               f"tiles train {len(tr_tiles)} test {len(te_tiles)}; positive share ID "
               f"{id_share:.2f} vs OOD {ood_share:.2f} "
-              f"(gap {gap:.3f}, threshold {BASE_RATE_GAP})")
+              f"(gap {gap:.3f}, {above} the {BASE_RATE_GAP} threshold; reported, not a "
+              f"decision: see the O1 prevalence check, o1_shift.py adjacc_*)")
     if not usable:
         result += ("; zoo.run_cell would return None (too few training rows or an empty "
                    "test half)")

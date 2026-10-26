@@ -12,16 +12,27 @@
 3. Budgets are seeded independently (why: the seeding comment in oodselect_paper.main).
 4. Correctness from the true-class probability matches argmax, ties included.
 5. The two controls: make_split, null_accuracies, variant_name, run_controls.
-Check 1, the slowest, runs last. Uses a real cell when --cells/--tag point at one; otherwise
+6. The budget penalty (--budget-penalty): budget_term's value and its gradient against central
+   differences; the wider log-uniform lambda range applies only under squared; squared pulls the
+   soft total to S in train_one; main writes the choice into result.csv and meta.json.
+7. Graph total variation (--reg gtv): on a 0/1 s it equals the Laplacian term and the cut-edge
+   count; its gradient matches central differences where no two neighbours tie; a tied edge
+   adds 0 to the gradient; mu = 0 gives the classic run exactly whatever --reg says; the default
+   is the Laplacian run; main writes the choice and the spatial_gtv_ folder name.
+Check 1, the slowest, runs last. Check 1 covers softplus only, the authors' term. Uses a real cell when --cells/--tag point at one; otherwise
 builds a synthetic cell so the checks still run anywhere. Exit code 0 = every check passed.
 """
 import argparse
+import contextlib
+import io
+import json
 import logging
 import math
 import sys
 import tempfile
 import warnings
 from pathlib import Path
+from unittest import mock
 
 # Silenced before torch and Lightning are imported, since both warn on import.
 warnings.filterwarnings("ignore")
@@ -30,6 +41,7 @@ for logger_name in ("pytorch_lightning", "lightning.pytorch", "lightning"):
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
+import scipy.sparse as sp  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 
@@ -257,6 +269,195 @@ def check_controls(cell, acc, n_models):
           "run_controls reads old and new result.csv rows")
 
 
+def check_budget_penalty(Z, acc, split, X_tr, y_tr, X_va, y_va, cells_dir, tag):
+    print("6. the budget penalty")
+    S = 500
+    for total, want in ((510.0, {"softplus": math.log1p(math.exp(-10.0)), "squared": 100.0}),
+                        (490.0, {"softplus": 10.0 + math.log1p(math.exp(-10.0)),
+                                 "squared": 100.0})):
+        got = {kind: op.budget_term(torch.tensor(total, dtype=torch.float64), S, kind).item()
+               for kind in op.BUDGET_PENALTIES}
+        check(all(abs(got[k] - want[k]) < 1e-9 for k in want),
+              f"value at a soft total of {total:g} (S = {S}): {got}")
+    try:
+        op.budget_term(torch.tensor(1.0), S, "cubic")
+        raised = False
+    except ValueError:
+        raised = True
+    check(raised, "an unknown budget penalty raises ValueError")
+
+    # The gradient by central differences, on a total away from S (the squared term's gradient
+    # is -2 (S - total) on every weight).
+    z0 = np.random.default_rng(3).uniform(0, 1, 40)
+    S_small, h = 15, 1e-6
+    for kind in op.BUDGET_PENALTIES:
+        z = torch.tensor(z0, dtype=torch.float64, requires_grad=True)
+        op.budget_term(z.sum(), S_small, kind).backward()
+
+        def value(v):
+            return op.budget_term(torch.tensor(v, dtype=torch.float64).sum(), S_small, kind).item()
+
+        fd = np.array([(value(z0 + h * e) - value(z0 - h * e)) / (2 * h) for e in np.eye(len(z0))])
+        check(np.allclose(z.grad.numpy(), fd, rtol=1e-5, atol=1e-6),
+              f"{kind}: gradient matches central differences (first {z.grad[0].item():+.4f})")
+    z = torch.tensor(z0, dtype=torch.float64, requires_grad=True)
+    op.budget_term(z.sum(), S_small, "squared").backward()
+    check(np.allclose(z.grad.numpy(), -2 * (S_small - z0.sum())),
+          "squared: gradient is -2 (S - total) on every weight")
+
+    # The lambda range Optuna draws from.
+    check(op.PENALTY_RANGE == {"softplus": (0.1, 100.0, False), "squared": (1e-6, 100.0, True)},
+          "PENALTY_RANGE: softplus keeps the released code's uniform [0.1, 100]; squared is "
+          "log-uniform over [1e-6, 100]")
+    for kind in op.BUDGET_PENALTIES:
+        best, _, records = op.run_search(Z, acc, split, 50, n_trials=3, max_epochs=20,
+                                         patience=5, seed=11, log_every=0, budget_penalty=kind)
+        dist = best.distributions["penalty"]
+        low, high, log = op.PENALTY_RANGE[kind]
+        drawn = records.penalty.to_numpy()
+        check((dist.low, dist.high, dist.log) == (low, high, log)
+              and bool(np.all((drawn >= low) & (drawn <= high))),
+              f"{kind}: lambda drawn from [{dist.low:g}, {dist.high:g}] log={dist.log}, "
+              f"draws {np.round(drawn, 6).tolist()}")
+
+    # train_one: squared pulls the soft total to S (here S = 100 of 1,500 synthetic points).
+    hp = dict(lr=0.5, eta_min=0.01, T_max=50, penalty=0.01, penalty_anneal_iters=50)
+    out = op.train_one(X_tr, y_tr, X_va, y_va, 100, hp, max_epochs=400, patience=400, seed=7,
+                       budget_penalty="squared")
+    check(abs(out["soft_mass"] - 100) <= 2,
+          f"squared: soft total {out['soft_mass']:.1f} ends within 2 of S = 100")
+
+    # main writes the choice; without the flag it is softplus.
+    with tempfile.TemporaryDirectory() as tmp:
+        for kind, extra in (("softplus", []), ("squared", ["--budget-penalty", "squared"])):
+            out_dir = Path(tmp) / kind / "classic"
+            argv = ["oodselect_paper.py", "--cells", cells_dir, "--tag", tag, "--out",
+                    str(out_dir), "--budget", "50", "--trials", "2", "--max-epochs", "20",
+                    "--patience", "5"] + extra
+            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                status = op.main()
+            result = pd.read_csv(out_dir / f"{tag}_S50_result.csv").iloc[0]
+            with open(out_dir / f"{tag}_S50_meta.json") as f:
+                meta = json.load(f)
+            check(status == 0 and result.budget_penalty == kind and meta["budget_penalty"] == kind,
+                  f"main {' '.join(extra) or '(no flag)'}: result.csv and meta.json say {kind}")
+
+
+def check_gtv(Z, acc, split, L, cell, cells_dir, tag):
+    print("7. graph total variation (--reg gtv)")
+    d = L.shape[0]
+    gtv = op.spatial_term(L, "gtv")
+    quad = op.spatial_term(L, "laplacian")
+    check(isinstance(gtv, op._TotalVariation) and isinstance(quad, op._Quadratic)
+          and op.spatial_term(None, "gtv") is None, "spatial_term picks the loss by reg")
+    check(gtv.n_edges * 2 == int((L != 0).sum() - (L.diagonal() != 0).sum()),
+          f"each undirected edge counted once ({gtv.n_edges} edges)")
+
+    # On a 0/1 s, GTV = Laplacian = the cut edges (graph.coherence_metrics' P_hard * S k).
+    A = graph.build_adjacency(cell.lon, cell.lat, k=10)
+    rng = np.random.default_rng(5)
+    for S in (min(50, d // 4), min(200, d // 2)):
+        mask = np.zeros(d, bool)
+        mask[rng.choice(d, S, replace=False)] = True
+        s = torch.tensor(mask.astype(np.float32))
+        cut = graph.coherence_metrics(mask, A, 10)["P_hard"] * S * 10
+        v_gtv, v_quad = gtv(s).item(), quad(s).item()
+        check(v_gtv == v_quad and abs(v_gtv - cut) < 1e-6,
+              f"0/1 s with S = {S}: GTV {v_gtv:g} = Laplacian {v_quad:g} = cut edges {cut:g}")
+
+    # The gradient by central differences where no two neighbours tie.
+    sub = np.arange(min(60, d))
+    L_small = graph.laplacian(graph.build_adjacency(cell.lon[sub], cell.lat[sub], k=4))
+    gtv_small = op._TotalVariation(L_small)
+    z0 = np.random.default_rng(6).uniform(0, 1, len(sub))
+    gap = np.abs(z0[gtv_small.j.numpy()] - z0[gtv_small.j_prime.numpy()]).min()
+    h = min(1e-6, gap / 10)
+    z = torch.tensor(z0, dtype=torch.float64, requires_grad=True)
+    gtv_small(z).backward()
+
+    def value(v):
+        return gtv_small(torch.tensor(v, dtype=torch.float64)).item()
+
+    fd = np.array([(value(z0 + h * e) - value(z0 - h * e)) / (2 * h) for e in np.eye(len(z0))])
+    check(gap > 0 and np.allclose(z.grad.numpy(), fd, rtol=1e-6, atol=1e-6),
+          f"gradient matches central differences (smallest neighbour gap {gap:.1e})")
+
+    # A tied edge adds 0: the path 0 - 1 - 2 with s = (0.5, 0.5, 0.2) has gradient (0, 1, -1).
+    path = sp.csr_matrix(np.array([[1, -1, 0], [-1, 2, -1], [0, -1, 1]], float))
+    z = torch.tensor([0.5, 0.5, 0.2], dtype=torch.float64, requires_grad=True)
+    op._TotalVariation(path)(z).backward()
+    check(z.grad.tolist() == [0.0, 1.0, -1.0],
+          f"a tied edge adds 0 to the gradient: {z.grad.tolist()}")
+    try:
+        op._TotalVariation(sp.csr_matrix(np.array([[2.0, -2.0], [-2.0, 2.0]])))
+        raised = False
+    except ValueError:
+        raised = True
+    check(raised, "a weighted graph raises ValueError (the paper's edges weigh 1)")
+
+    # mu = 0: the classic run exactly, whatever --reg says; the default is the Laplacian.
+    S_run = min(60, d // 2)
+    common = dict(n_trials=2, max_epochs=30, patience=8, seed=13, log_every=0,
+                  budget_penalty="squared")
+    runs = {}
+    for name, kw in (("classic", dict(mu=0.0)), ("classic gtv", dict(mu=0.0, reg="gtv")),
+                     ("spatial", dict(mu=3.0)), ("spatial laplacian", dict(mu=3.0, reg="laplacian")),
+                     ("spatial gtv", dict(mu=3.0, reg="gtv"))):
+        runs[name] = op.run_search(Z, acc, split, S_run, L=L, **common, **kw)
+    same = (np.array_equal(runs["classic"][1], runs["classic gtv"][1])
+            and runs["classic"][2].drop(columns=["secs", "P_soft"]).equals(
+                runs["classic gtv"][2].drop(columns=["secs", "P_soft"])))
+    check(same, "mu = 0 with --reg gtv: theta and every trial record equal the classic run's")
+    check(np.array_equal(runs["spatial"][1], runs["spatial laplacian"][1]),
+          "reg defaults to the Laplacian (theta bit-identical)")
+    check(not np.array_equal(runs["spatial"][1], runs["spatial gtv"][1]),
+          "mu = 3 with --reg gtv changes the run")
+    out = op.train_one(torch.tensor(Z[split[0]]), torch.tensor(acc[split[0]], dtype=torch.float32),
+                       torch.tensor(Z[split[1]]), torch.tensor(acc[split[1]], dtype=torch.float32),
+                       S_run, dict(lr=0.5, eta_min=0.01, T_max=50, penalty=0.01,
+                                penalty_anneal_iters=50),
+                       max_epochs=40, patience=40, seed=3, L_t=gtv, mu=3.0, knn=10,
+                       budget_penalty="squared")
+    s_end = torch.sigmoid(torch.tensor(out["theta"]))
+    check(abs(out["P_soft"] - gtv(s_end).item() / (S_run * 10)) < 1e-6,
+          f"P_soft is R_GTV of the final soft weights ({out['P_soft']:.4f})")
+    try:
+        op.variant_name(3, 10, reg="tv")
+        raised = False
+    except ValueError:
+        raised = True
+    check(op.variant_name(3, 10, reg="gtv") == "spatial_gtv_mu3_knn10"
+          and op.variant_name(3, 10, "random", 2, "gtv") == "spatial_gtv_mu3_knn10_null2"
+          and op.variant_name(0, 10, reg="gtv") == "classic" and raised,
+          "variant names under --reg gtv")
+
+    # main writes the choice, and a GTV run must sit in its own folder.
+    with tempfile.TemporaryDirectory() as tmp:
+        base = ["oodselect_paper.py", "--cells", cells_dir, "--tag", tag, "--budget", "50",
+                "--trials", "2", "--max-epochs", "20", "--patience", "5", "--mu", "3"]
+        written = {}
+        for reg, folder in (("laplacian", "spatial_mu3_knn10"), ("gtv", "spatial_gtv_mu3_knn10")):
+            out_dir = Path(tmp) / folder
+            argv = base + ["--out", str(out_dir)] + ([] if reg == "laplacian" else ["--reg", reg])
+            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                status = op.main()
+            result = pd.read_csv(out_dir / f"{tag}_S50_result.csv").iloc[0]
+            with open(out_dir / f"{tag}_S50_meta.json") as f:
+                meta = json.load(f)
+            written[reg] = (status, result.reg, meta["reg"], result.variant)
+        check(written == {"laplacian": (0, "laplacian", "laplacian", "spatial_mu3_knn10"),
+                          "gtv": (0, "gtv", "gtv", "spatial_gtv_mu3_knn10")},
+              f"main writes reg and the variant: {written}")
+        argv = base + ["--out", str(Path(tmp) / "spatial_mu3_knn10"), "--reg", "gtv"]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                op.main()
+                refused = False
+            except SystemExit:
+                refused = True
+        check(refused, "a GTV run into the Laplacian folder is refused")
+
+
 def check_lightning(X_tr, y_tr, X_va, y_va, L, d):
     print("1. equivalence with the authors' TestSetFinder under Lightning")
     if not _HAS_PL:
@@ -328,6 +529,8 @@ def main():
     check_quadratic(L, d)
     check_budget_seeding(Z, acc, split)
     check_controls(cell, acc, info["n_models"])
+    check_budget_penalty(Z, acc, split, X_tr, y_tr, X_va, y_va, cells_dir, tag)
+    check_gtv(Z, acc, split, L, cell, cells_dir, tag)
     check_lightning(X_tr, y_tr, X_va, y_va, L, d)
 
     if FAILS:

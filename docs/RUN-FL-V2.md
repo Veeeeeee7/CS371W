@@ -116,14 +116,26 @@ Check: the perimeter check line reports a gap near 0 m for counties and panels. 
 .venv/bin/python -u sample_points.py FL --protocols band --exact --ring-oversample 6 2>&1 | tee logs/$D/A2_sample_points_FL.log
 ```
 
-(b) Recommended: also keep band negatives inside Florida. This is a sampling change, which is
-why it is opt-in:
+(b) Recommended: also keep band negatives inside Florida, and every point on land. These are
+sampling changes, which is why they are opt-in:
 ```bash
-.venv/bin/python -u sample_points.py FL --protocols band --exact --ring-oversample 6 --state-polygons data/interim/gis/counties_FL.parquet 2>&1 | tee logs/$D/A2_sample_points_FL.log
+.venv/bin/python -u sample_points.py FL --protocols band --exact --ring-oversample 6 --state-polygons data/interim/gis/counties_FL.parquet --land-mask data/interim/gis/nlcd2021_FL.tif 2>&1 | tee logs/$D/A2_sample_points_FL.log
 ```
 
-(b) also fills `meta_point_county`, the TIGER county each point lies in; with (a) it stays null.
-`points_FL.parquet` exists, so a rebuild needs `--force` (without it the script skips).
+`--land-mask` (decided 2026-10-23, `docs/TASK-REBUILD-V3.md` §0) keeps every point off open water:
+height above drainage and topographic wetness are missing on most open-water points, and in v2
+35% of Zone AE band negatives sat on open water against 16% of AE positives, so "missing" was a
+cue for the label. Positives are drawn over the land inside their polygons, band negatives over
+the land in the band and outside NFHL OPEN WATER polygons. The mask is NLCD 2021 land cover on
+its native 30 m grid; make it once, with the Earth Engine login of step 4 (about 1 min, 35 MB),
+then compare it with Earth Engine at 2,000 points (it must say `grids match`):
+```bash
+.venv/bin/python pull_land_mask.py --project $EE_PROJECT && .venv/bin/python pull_land_mask.py --check --project $EE_PROJECT
+```
+
+(b) also fills `meta_point_county`, the TIGER county each point lies in (null with (a)), and adds
+`meta_mask_lc`, the mask's land-cover class at each point. `points_FL.parquet` exists, so a
+rebuild needs `--force` (without it the script skips).
 
 **Stop** if it prints `FAILED` (exit code 1, nothing written). The message names the setting to
 raise.
@@ -161,6 +173,8 @@ Check:
 - `band negatives in D or AREA NOT INCLUDED: 0 (must be 0)`. Zone D (flood hazard undetermined)
   and AREA NOT INCLUDED are unassessed land, so a point there is no evidence of dry ground. The
   points on disk have 2,129 there.
+- with `--land-mask`: `points not on land per the mask: 0 (must be 0)` and `band negatives in
+  NFHL OPEN WATER: 0 (must be 0)`.
 
 Expected values with the current sampler (scratch build): band 500–4,993 m, largest polygon
 2.12% (A) and 2.02% (AE). Before the fixes: (a) minimum nearest-neighbour 100.009 m, largest
