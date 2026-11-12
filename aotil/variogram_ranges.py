@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 How far each model feature stays spatially correlated: the effective range of its semivariogram,
-for the Split paragraph's "at most XX km" (docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md Part C4).
+for the Split paragraph (the median range, 27 km, and the three features correlated over 73 to 107 km).
 
 In CS terms: the semivariogram gamma(h) is half the mean squared difference of a feature between
 two points h apart. Nearby points have similar values, so gamma starts low and rises with h until
@@ -22,15 +22,12 @@ structure (a pure nugget: neighbours are no more alike than any two points) and 
 fit whose range parameter sits at its upper bound is still rising at 200 km, and its range is
 marked as beyond the lags. A categorical feature's range is the largest over its columns.
 
-    .venv/bin/python aotil/variogram_ranges.py --data data/processed_v4 \\
-        --out results/$D/variogram
-Writes ranges.csv (one row per column, with both fits), features.csv (one row per feature, its
-range and the maximum), empirical.csv (gamma and the pair count per lag and column).
+run_experiments.py --stage data calls run() and writes <run>/data/variogram/: ranges.csv (one row per column,
+with both fits), features.csv (one row per feature, its range and the maximum), empirical.csv (gamma and the
+pair count per lag and column) and summary.json.
 """
 from __future__ import annotations
 
-import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -195,32 +192,3 @@ def run(data_dir: Path, n_sample: int = N_SAMPLE, seed: int = 0, state: str = "F
                              max_lag_km=MAX_LAG_M / 1000, min_prevalence=MIN_PREVALENCE,
                              sill_share=SILL_SHARE, max_range_km=float(features.range_km.max()),
                              max_feature=str(features.feature[features.range_km.idxmax()])))
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--data", type=Path, required=True, help="folder with FEATURES.txt")
-    ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--n-sample", type=int, default=N_SAMPLE)
-    ap.add_argument("--seed", type=int, default=0)
-    a = ap.parse_args()
-    out = run(a.data, a.n_sample, a.seed)
-    a.out.mkdir(parents=True, exist_ok=True)
-    out["ranges"].to_csv(a.out / "ranges.csv", index=False)
-    out["features"].to_csv(a.out / "features.csv", index=False)
-    out["empirical"].to_csv(a.out / "empirical.csv", index=False)
-    (a.out / "summary.json").write_text(json.dumps(out["summary"], indent=2))
-    with pd.option_context("display.width", 200, "display.max_columns", 30):
-        print(out["ranges"][["column", "feature", "n_points", "prevalence", "best", "range_km",
-                             "spherical_effective_range_m", "exponential_effective_range_m",
-                             "note"]].round(3).to_string(index=False))
-        print()
-        print(out["features"].round(2).to_string(index=False))
-    s = out["summary"]
-    print(f"\nlargest range: {s['max_range_km']:.1f} km ({s['max_feature']}); "
-          f"{'ABOVE' if s['max_range_km'] > 50 else 'within'} the 50 km tiles")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -15,7 +15,7 @@ degenerate (is_degenerate): its accuracy on any subset only reflects the subset'
 positives, which the subset search could exploit. A model whose 0/1 predictions on every ID test
 point and every OOD point equal those of a model earlier in grid order is a duplicate: the first
 in grid order is kept. Each setting draws its estimator seed from the cell seed in grid order, so
-any one model can be refitted alone (audit_cell.py does this through cell_data and fit_one).
+any one model can be refitted alone (through cell_data and fit_one).
 
 The model inputs (model_inputs, D5): each numeric feature as is, and each categorical feature of
 CATEGORICAL one-hot encoded, one 0/1 column per class present in the full dataset (a fixed list,
@@ -24,20 +24,17 @@ feature's columns; families with an imputer fill each column with its training m
 xgb take the NaN as is.
 
 Inputs:  <data>/FEATURES.txt and <data>/dataset_<state>.parquet
-Outputs: <out>/<tag>.npz (scores of the kept models and per-point keys, see main),
-         <out>/<tag>_models.csv (one row per kept model, in grid order, see model_row) and
-         <out>/<tag>_dropped.csv (one row per dropped setting, with why: its share of ID test
-         points predicted flood, and for a duplicate the grid_idx of the model it repeats), with
-         tag = <state>_<protocol>_<train-dom>_s<seed>
+Outputs (write_cell): <out>/<tag>.npz (scores of the kept models and per-point keys), <out>/<tag>_models.csv (one
+         row per kept model, in grid order, see model_row) and <out>/<tag>_dropped.csv (one row per dropped
+         setting, with why: its share of ID test points predicted flood, and for a duplicate the grid_idx of the
+         model it repeats), with tag = <state>_<protocol>_<train-dom>_s<seed> (the paper's is FL_band_AE_s0).
 
-Run with one BLAS/OpenMP thread, as below, so a --n-jobs 1 run matches a parallel one (run_cell):
-    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \\
-    .venv/bin/python -u aotil/zoo.py --state FL --protocol band --train-dom AE --seed 0 \\
-        --data data/processed_v4 --out data/interim/aotil/cells_v4_<date> --n-jobs -1
+run_experiments.py --stage zoo fits the paper's cell with one BLAS/OpenMP thread per process (it sets
+OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS and VECLIB_MAXIMUM_THREADS to 1 before numpy loads), so a
+parallel fit matches a serial one.
 """
 from __future__ import annotations
 
-import argparse
 import itertools
 import time
 import warnings
@@ -286,12 +283,12 @@ def score_rows(model, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, float, 
     The score is the probability of the observed class (p if y = 1, else 1 - p), not 0/1
     correctness: AUC has no per-example form, and a 0.5 threshold would mean different things in
     cells with different class ratios. Accuracy is argmax correctness, as in predict() and
-    oodselect_paper.correctness: a negative at exactly p = 0.5 is correct.
+    search.correctness: a negative at exactly p = 0.5 is correct.
 
     The AUC is ranked on p itself. p rebuilt from the scores (1 - (1 - p) for a negative) can be
     an ulp off and split the ties that trees, with few distinct p, make in most pairs; that AUC
     can be off by ~0.1. The clip to [0, 1] is for sklearn's trapezoid sum, which can land an ulp
-    above 1 on a perfect separation and would fail audit_cell's range check.
+    above 1 on a perfect separation.
     """
     p = model.predict_proba(X)[:, 1]
     scores = np.where(y == 1, p, 1.0 - p)
@@ -331,29 +328,9 @@ def hp_value(v):
 
 
 # ----------------------------------------------------------------- run
-def extra_training_rows(df: pd.DataFrame, feats: list[str], extra_ids,
-                        extra_repeat: int) -> tuple[np.ndarray, np.ndarray]:
-    """(X, y) of the --extra-train points, each row repeated extra_repeat times (at least once)."""
-    by_id = df.set_index("point_id")
-    missing = [p for p in extra_ids if p not in by_id.index]
-    if missing:
-        raise SystemExit(f"--extra-train: {len(missing)} point_ids not in the dataset, "
-                         f"first {missing[:3]}")
-    extra = by_id.loc[list(extra_ids)]
-    reps = max(1, int(extra_repeat))
-    X = np.repeat(extra[feats].to_numpy(float), reps, axis=0)
-    y = np.repeat(extra.label.to_numpy(), reps)
-    return X, y
-
-
-def cell_data(df, feats, protocol, train_dom, seed, extra_ids=None, extra_repeat: int = 1) -> dict:
-    """The cell's training rows and its ID and OOD test halves, as frames and float arrays.
-
-    Shared by run_cell and audit_cell.py, so a refit sees the same rows in the same order and the
-    same feature order. extra_ids (point_ids from any zone or tile) become arrays Xextra / yextra;
-    those points also stay in whichever test half holds them, so readers must leave them out of
-    any evaluation.
-    """
+def cell_data(df, feats, protocol, train_dom, seed) -> dict:
+    """The cell's training rows and its ID and OOD test halves, as frames and float arrays (the rows in dataset
+    order, the columns in input order), so a refit sees the same rows in the same order."""
     eval_dom = "AE" if train_dom == "A" else "A"
     tr_tiles, te_tiles = split_tiles(df, seed)
 
@@ -365,9 +342,6 @@ def cell_data(df, feats, protocol, train_dom, seed, extra_ids=None, extra_repeat
     arrays = dict(Xtr=tr[feats].to_numpy(float), ytr=tr.label.to_numpy(),
                   Xid=id_te[feats].to_numpy(float), yid=id_te.label.to_numpy(),
                   Xod=ood_te[feats].to_numpy(float), yod=ood_te.label.to_numpy())
-    if extra_ids is not None and len(extra_ids) > 0:
-        arrays["Xextra"], arrays["yextra"] = extra_training_rows(df, feats, extra_ids,
-                                                                 extra_repeat)
     return dict(eval_dom=eval_dom, tr_tiles=tr_tiles, te_tiles=te_tiles,
                 tr=tr, id_te=id_te, ood_te=ood_te, arrays=arrays)
 
@@ -385,14 +359,11 @@ def varying_columns(X: np.ndarray) -> list[int]:
 def fit_one(sp: dict, A: dict, device: str = "cpu") -> dict | None:
     """Fit and score one model of the population; None when it cannot be fitted.
 
-    A is cell_data's arrays. The model trains on every training row (with the extra rows, if
-    any, appended) and every feature that has at least two distinct finite values in those rows.
+    A is cell_data's arrays. The model trains on every training row and every input column that has at least
+    two distinct finite values in those rows.
     n_flood_id counts the ID test points it predicts flood (predicts_flood), for the drop rule.
     """
     Xs, ys = A["Xtr"], A["ytr"]
-    if "Xextra" in A:
-        Xs = np.vstack([Xs, A["Xextra"]])
-        ys = np.concatenate([ys, A["yextra"]])
     if len(np.unique(ys)) < 2:
         return None
     cols = np.asarray(varying_columns(Xs), dtype=int)
@@ -430,9 +401,8 @@ def model_row(got: dict, feats: list[str], idx: int) -> dict:
     model used, after fit_one's constant-column drop. flood_share_id is the share of ID test
     points it predicts flood (the drop rule's statistic). The training metrics show whether a
     model interpolates its labels, which an inverse ID-OOD line from label noise requires (Sanyal
-    et al. 2025): _train_sub is on the rows it was fitted on (extra rows included), _train_all on
-    every training-tile row of the training zone (no extra rows); without extra rows the two are
-    the same rows. hp_<name> holds each setting of the spec's kw; an empty cell means the family
+    et al. 2025): _train_sub is on the rows it was fitted on, _train_all on every training-tile row of
+    the training zone; they are the same rows. hp_<name> holds each setting of the spec's kw; an empty cell means the family
     does not have that hyperparameter.
     """
     sp, cols = got["sp"], got["cols"]
@@ -538,21 +508,16 @@ def family_counts(specs: list[dict], kept: list[dict], dropped: list[dict]) -> p
     return table.fillna(0).astype(int)
 
 
-def run_cell(df, feats, protocol, train_dom, seed,
-             n_jobs: int = 1, device: str = "cpu", extra_ids=None, extra_repeat: int = 1):
+def run_cell(df, feats, protocol, train_dom, seed, n_jobs: int = 1, device: str = "cpu"):
     """Fit and score the population of one cell and apply the drop rule; None when the cell is
     unusable."""
-    data = cell_data(df, feats, protocol, train_dom, seed, extra_ids, extra_repeat)
+    data = cell_data(df, feats, protocol, train_dom, seed)
     tr, id_te, ood_te, A = data["tr"], data["id_te"], data["ood_te"], data["arrays"]
     if len(tr) < MIN_TRAIN or id_te.empty or ood_te.empty:
         return None
 
     print(f"  train {len(tr):,} | ID test {len(id_te):,} | OOD test {len(ood_te):,} "
           f"| tiles train {len(data['tr_tiles'])} test {len(data['te_tiles'])}", flush=True)
-    if "Xextra" in A:
-        print(f"  extra training rows: {len(extra_ids):,} point_ids x {extra_repeat} = "
-              f"{len(A['yextra']):,} rows (positives {int(A['yextra'].sum()):,}) "
-              f"added to every model", flush=True)
     # A protocol with no negatives in the dataset (shadedX on a band-only sample) leaves every
     # set with one label. No model can be fitted on it, and a 0-model cell would break every
     # reader, so it is refused here rather than after the fits.
@@ -611,64 +576,14 @@ def run_cell(df, feats, protocol, train_dom, seed,
                 protocol=protocol, train_dom=train_dom, eval_dom=data["eval_dom"])
 
 
-def read_point_ids(path: Path) -> list[str]:
-    """One point_id per line; blank lines and "point_id" header lines skipped."""
-    ids = []
-    for line in path.read_text().splitlines():
-        value = line.strip()
-        if value and value != "point_id":
-            ids.append(value)
-    return ids
+def write_cell(cell: dict, out: Path, tag: str) -> list[Path]:
+    """Write run_cell's result: <tag>.npz, <tag>_models.csv and <tag>_dropped.csv. Returns the paths.
 
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--state", default="FL")
-    ap.add_argument("--protocol", default="shadedX", choices=["band", "shadedX"])
-    ap.add_argument("--train-dom", default="AE", choices=["A", "AE"])
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--data", default="data/processed")
-    ap.add_argument("--out", default="data/interim/aotil/cells")
-    ap.add_argument("--n-jobs", type=int, default=-1,
-                    help="parallel model fits; -1 uses every core")
-    ap.add_argument("--device", default="cpu",
-                    help="cpu, or cuda to put the XGBoost family on the GPU")
-    ap.add_argument("--overwrite", action="store_true",
-                    help="refit a cell whose .npz already exists")
-    ap.add_argument("--extra-train", type=Path, default=None,
-                    help="file of point_ids (one per line, optional 'point_id' header) "
-                         "appended to every model's training rows; default none")
-    ap.add_argument("--extra-train-repeat", type=int, default=1,
-                    help="repeat each --extra-train row this many times (default 1)")
-    args = ap.parse_args()
-
-    tag = f"{args.state}_{args.protocol}_{args.train_dom}_s{args.seed}"
-    out = Path(args.out)
-    # Cells are expensive: an existing one is kept unless --overwrite, so an interrupted sweep
-    # resumes by re-running the same command.
-    if (out / f"{tag}.npz").exists() and not args.overwrite:
-        print(f"{tag}: cell exists, skipping (--overwrite to refit)")
-        return 0
-
-    df, feats = load(args.state, Path(args.data))
-    print(f"[{args.state}] {len(df):,} rows | {len(feats)} input columns: {', '.join(feats)}")
-    print(f"cell: protocol={args.protocol} train={args.train_dom} seed={args.seed} "
-          f"settings={len(zoo_specs(args.seed))} device={args.device}")
-    extra_ids = None
-    if args.extra_train is not None:
-        extra_ids = read_point_ids(args.extra_train)
-    cell = run_cell(df, feats, args.protocol, args.train_dom, args.seed,
-                    n_jobs=args.n_jobs, device=args.device, extra_ids=extra_ids,
-                    extra_repeat=args.extra_train_repeat)
-    if cell is None:
-        print("cell unusable: nothing written")
-        return 1
-
+    S_ood / S_id: (models x points) true-class scores of the kept models, rows in model-table order. y_id lets
+    readers recover exact argmax correctness on the ID half (ties at p = 0.5). String columns are stored as
+    fixed-width str, not objects."""
+    out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    # S_ood / S_id: (models x points) true-class scores of the kept models, rows in model-table
-    # order. y_id lets readers recover exact argmax correctness on the ID half (ties at
-    # p = 0.5). tiles_ood is kept for older readers. String columns are stored as fixed-width
-    # str, not objects.
     payload = dict(S_ood=cell["S_ood"], S_id=cell["S_id"], y_ood=cell["y_ood"],
                    y_id=cell["y_id"], tiles_ood=cell["tiles_ood"].astype(str))
     per_point = dict(cell["spatial"])
@@ -677,19 +592,8 @@ def main() -> int:
         if values.dtype.kind in "OU":
             values = values.astype(str)
         payload[name] = values
-    if extra_ids is not None:
-        payload["extra_train_point_id"] = np.asarray(extra_ids, dtype=str)
-        payload["extra_train_repeat"] = np.int64(args.extra_train_repeat)
-    np.savez_compressed(out / f"{tag}.npz", **payload)
-    cell["models"].to_csv(out / f"{tag}_models.csv", index=False)
-    cell["dropped"].to_csv(out / f"{tag}_dropped.csv", index=False)
-    print(f"saved {out}/{tag}.npz  (S_ood {cell['S_ood'].shape}, S_id {cell['S_id'].shape}; "
-          f"keys: {', '.join(payload)})")
-    print(f"saved {out}/{tag}_models.csv  ({len(cell['models'])} rows x "
-          f"{cell['models'].shape[1]} columns)")
-    print(f"saved {out}/{tag}_dropped.csv  ({len(cell['dropped'])} rows)")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    paths = [out / f"{tag}.npz", out / f"{tag}_models.csv", out / f"{tag}_dropped.csv"]
+    np.savez_compressed(paths[0], **payload)
+    cell["models"].to_csv(paths[1], index=False)
+    cell["dropped"].to_csv(paths[2], index=False)
+    return paths

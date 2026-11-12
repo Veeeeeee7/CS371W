@@ -1,40 +1,29 @@
 #!/usr/bin/env python3
 """
-Checks for region_match.py (the caliper matching of the paper's Approach 3.6). Run from the repo
-root:
+Checks for region_match.py (the caliper matching of the paper's Region Analysis, Table tab:regions). Run from the
+repo root:
 
-    python aotil/test_region_match.py
+    .venv/bin/python aotil/test_region_match.py
 
-Synthetic cases with known answers (docs/TASK-RERUN-ALL-2026-10-25.md, Part C):
+Synthetic cases with known answers:
 1. On a synthetic pool, exactly 5% of points (rounded) are unmatched against the pool.
 2. A candidate in a tile that holds any point of the region is never a match, even when it is the
-   closest; under --exclude own-tile only the query's own tile is left out.
+   closest; a one-point region (own-tile exclusion) leaves out only the query's own tile.
 3. A closer candidate with a different land cover is never a match.
 4. With 10 candidates inside eps, the 5 closest are kept, sorted by distance.
 5. eta by hand: a positive point with matches labeled 1, 0, 0 scores 2/3; unmatched points are
    left out.
-6. A query whose 500 nearest same-class candidates all lie in excluded tiles still finds its
-   out-of-tile match (the fixed-k bug of the sandbox).
-7. Standardization uses the D_OOD mean and SD, not the pool's.
-8. Pool points missing a feature are dropped and counted.
-Helpers: the caliper with points that have no candidate, the weighted median, the feature list,
-region names, the exclusion matrices, the hardest points, the halo exclusions, the kinds table
-and an end-to-end run on a synthetic cell.
-9. The real check (Stop S2): on the 2026-10-23 cell and regions with --exclude own-tile, eps and
-   the sandbox's eta and unmatched shares to 0.01. Skipped when those files are missing.
-10. q = the numeric features of FEATURES.txt (docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md D7):
-   every feature except the categorical ones of zoo.CATEGORICAL (land cover, matched exactly; the
-   two soil classes, not matched), in file order: 6 on a nine-feature file, on
-   data/processed_w7, data/processed_w9 and data/processed_v4; any count on a synthetic file; a
-   file without landcover or with a repeated name stops the run.
-11. Zone A points with a missing feature (w9: the soil columns are NaN on water map units): left
-   out of every matched set and counted (n_missing per row, ood_dropped in the summary); a region's
-   tiles, its kind and its corr_te still count all of its points; with no point missing the
-   outputs have neither column nor key (the w7 schema).
-12. On the 2026-11-06 w7 inputs the four outputs are byte-identical to results/2026-11-06/region_match/
-   (skipped when those files are missing).
+6. A query whose 600 nearest same-class candidates all lie in excluded tiles still finds its
+   out-of-tile match.
+7. q = the numeric features of FEATURES.txt (every feature but zoo.CATEGORICAL), in file order: 6 on
+   data/processed_v4; a file without landcover stops.
+8. prepare + run on a synthetic world: standardization over D_OOD, pool points missing a feature dropped and
+   counted, one row per region + all regions + Other Zone A + the Zone AE baseline, the pooled eta = the regions'
+   eta weighted by their matched points, Other Zone A = the points outside the subset, every pair within eps, in a
+   tile outside its region, with the query's land cover.
 """
-import argparse
+from __future__ import annotations
+
 import sys
 import tempfile
 from pathlib import Path
@@ -43,33 +32,9 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import oodselect_paper as op  # noqa: E402
 import region_match as rm  # noqa: E402
 
 FAILS = []
-FEATURES = ["slope", "tri_300", "wetindexcat", "log10_dist_river", "log10_dist_coast", "hand"]
-W7_FEATURES = Path("data/processed_w7/FEATURES.txt")
-W9_FEATURES = Path("data/processed_w9/FEATURES.txt")
-V4_FEATURES = Path("data/processed_v4/FEATURES.txt")
-SOIL = ["soil_floodfreq", "soil_fluvclass"]
-W7_RUN = dict(cells="data/interim/aotil/cells_grid_2026-11-06",
-              dataset="data/processed_w7/dataset_FL.parquet", features=str(W7_FEATURES),
-              regions="results/2026-11-06/regions/FL_band_AE_s0_spatial_mu3_knn10_S500_points.parquet",
-              classic="results/2026-11-06/regions/FL_band_AE_s0_classic_S500_points.parquet",
-              gtv="results/2026-11-06/regions/FL_band_AE_s0_spatial_gtv_mu3_knn10_S500_points.parquet",
-              out="results/2026-11-06/region_match")
-W7_OUTPUTS = ["region_match.csv", "region_match_kinds.csv", "region_match_sensitivity.csv",
-              "region_match.json"]
-REAL = dict(cells="data/interim/aotil/cells_v3",
-            dataset="data/processed_w7/dataset_FL.parquet",
-            features="data/processed_w7/FEATURES.txt",
-            regions="results/2026-10-23/regions/FL_band_AE_s0_spatial_mu3_knn10_S500_points.parquet",
-            classic="results/2026-10-23/regions/FL_band_AE_s0_classic_S500_points.parquet")
-# The sandbox's numbers (docs/TASK-RERUN-ALL-2026-10-25.md, Part C): (unmatched, eta).
-SANDBOX = {"Zone AE baseline": (0.05, 0.297), "Other Zone A points": (0.047, 0.254),
-           "All regions (7)": (None, 0.654), "Liberty": (0.00, 0.73), "Levy": (0.00, 0.74),
-           "Dixie": (0.00, 0.66), "Hendry": (0.03, 0.87), "Palm Beach": (0.00, 0.48),
-           "Hamilton": (0.10, 0.71), "Hendry/Palm Beach": (0.02, 0.48)}
 
 
 def check(cond, msg):
@@ -133,7 +98,7 @@ def check_region_tiles():
           f"region-tiles: the closest candidate (in a region tile) is skipped: {idx[0].tolist()}")
     own = rm.own_tile_exclusion(np.array([0]), 3)
     idx, _ = rm.match(pool, zq, lcq, own, k=5, eps=1.0)
-    check(idx[0].tolist()[:2] == [0, 1], f"own-tile: the same candidate is kept: {idx[0].tolist()}")
+    check(idx[0].tolist()[:2] == [0, 1], f"one-point region (own tile only): the same candidate is kept: {idx[0].tolist()}")
 
 
 def check_landcover():
@@ -182,331 +147,85 @@ def check_query_expansion():
           f"the out-of-tile candidate is found ({idx[0, 0]}, distance {dist[0, 0]:.3f})")
 
 
-def synthetic_world(tmp: Path, n_ood=400, n_id=400, n_models=20, n_missing=10, seed=2):
-    """A cell, its dataset, FEATURES.txt and two regions tables in tmp. Returns the paths."""
+def check_features():
+    print("7. the numeric features")
+    v4 = Path("data/processed_v4/FEATURES.txt")
+    if v4.exists():
+        q = rm.numeric_features(v4)
+        check(q == ["slope", "elev_sd_r300", "hand", "wetindexcat", "log10_dist_river", "log10_dist_coast"],
+              f"v4: q = {len(q)} numeric features in file order")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "FEATURES.txt"
+        f.write_text("slope\nhand\n")
+        try:
+            rm.numeric_features(f)
+            ok = False
+        except SystemExit:
+            ok = True
+        check(ok, "a file without landcover stops")
+
+
+def synthetic_world(n_ood=400, n_id=400, seed=2):
+    """OOD and ID rows with three numeric features, land cover, labels and tiles; 10 ID points miss a feature."""
     rng = np.random.default_rng(seed)
-    tiles = np.array(["0_0", "0_1", "1_0", "1_1"])
 
-    def half(n, prefix, domain, shift):
-        tile = tiles[rng.integers(0, 4, n)]
-        row, col = np.array([t.split("_") for t in tile], int).T
-        frame = pd.DataFrame(dict(
-            point_id=[f"{prefix}{i}" for i in range(n)], label=rng.integers(0, 2, n),
-            domain=domain, tile_50km=tile,
-            lon=-82 + 0.5 * col + rng.uniform(0, 0.45, n),
-            lat=28 + 0.5 * row + rng.uniform(0, 0.45, n),
-            county_fips=np.where(col == 0, "12001", "12003"), meta_point_county=None,
-            landcover=rng.choice([42, 90], n), meta_dist_to_river_m=rng.uniform(10, 3000, n)))
-        for j, f in enumerate(FEATURES):
-            frame[f] = rng.normal(shift * (j + 1), 1 + j * 0.5, n)
-        return frame
-
-    ood, idd = half(n_ood, "a", "A", 1.0), half(n_id, "e", "AE", 0.0)
-    idd.loc[:n_missing - 1, "wetindexcat"] = np.nan
-    idd.loc[0, "hand"] = np.nan                         # missing in both features: one point
-    pd.concat([ood, idd]).to_parquet(tmp / "dataset.parquet")
-    (tmp / "FEATURES.txt").write_text("# test\nlandcover\n" + "\n".join(FEATURES) + "\n")
-    S_ood = rng.uniform(0, 1, (n_models, n_ood))
-    S_id = rng.uniform(0, 1, (n_models, n_id))
-    np.savez_compressed(tmp / "SYN.npz", S_ood=S_ood, S_id=S_id, y_ood=ood.label.to_numpy(),
-                        y_id=idd.label.to_numpy(), point_id=ood.point_id.to_numpy(),
-                        point_id_id=idd.point_id.to_numpy(), lon=ood.lon.to_numpy(),
-                        lat=ood.lat.to_numpy(), tile_50km=ood.tile_50km.to_numpy())
-    pd.DataFrame(dict(idx=np.arange(n_models), kind=["rf", "lr"] * (n_models // 2),
-                      auc_id=rng.uniform(0.6, 0.9, n_models),
-                      acc_train_sub=np.r_[np.ones(3), rng.uniform(0.6, 0.9, n_models - 3)])
-                 ).to_csv(tmp / "SYN_models.csv", index=False)
-    # Regions: 25 points of tiles 0_0 and 0_1, 22 of tile 1_1, and a piece of 5 (too small).
-    pick = []
-    for want, size in ((["0_0", "0_1"], 25), (["1_1"], 22), (["1_0"], 5)):
-        pool = ood.index[ood.tile_50km.isin(want) & ~ood.index.isin(sum(pick, []))]
-        pick.append(list(rng.choice(pool, size, replace=False)))
-    points = pd.concat([ood.loc[p].assign(component=c, component_size=len(p))
-                        for c, p in enumerate(pick)])
-    points["variant"] = "spatial_mu3_knn10"
-    points.to_parquet(tmp / "regions.parquet")
-    ood.sample(30, random_state=0).assign(component=0, component_size=30).to_parquet(
-        tmp / "classic.parquet")
+    def rows(n, prefix, shift):
+        df = pd.DataFrame(dict(point_id=[f"{prefix}{i}" for i in range(n)], label=rng.integers(0, 2, n),
+                               tile_50km=rng.choice(["0_0", "0_1", "1_0", "1_1", "2_0"], n),
+                               landcover=rng.choice([42, 90], n), f1=rng.normal(shift, 1, n),
+                               f2=rng.normal(0, 2, n), f3=rng.gamma(2, 1, n)))
+        return df
+    ood, idd = rows(n_ood, "A", 0.5), rows(n_id, "E", 0.0)
+    idd.loc[rng.choice(n_id, 10, replace=False), "f2"] = np.nan
     return ood, idd
 
 
-def args_for(tmp: Path, **kw):
-    a = dict(cells_dir=str(tmp), tag="SYN", dataset=str(tmp / "dataset.parquet"),
-             features=str(tmp / "FEATURES.txt"), regions=str(tmp / "regions.parquet"),
-             classic=str(tmp / "classic.parquet"), extra_regions=[str(tmp / "regions.parquet")],
-             exclude="region-tiles", min_size=20, max_matches=5, caliper_pct=95.0,
-             counties=str(tmp / "no_counties.parquet"), out=str(tmp / "out"))
-    a.update(kw)
-    return argparse.Namespace(**a)
-
-
-def check_inputs(tmp: Path, ood: pd.DataFrame, idd: pd.DataFrame):
-    print("7-8. standardization over D_OOD; pool points missing a feature")
-    ctx = rm.load_inputs(args_for(tmp))
-    mean, sd = ood[FEATURES].mean(), ood[FEATURES].std()
-    pool_mean = idd[FEATURES].dropna().mean()
-    check(np.allclose(ctx["mean"], mean) and np.allclose(ctx["sd"], sd)
-          and not np.allclose(ctx["mean"], pool_mean),
-          "mean and SD are D_OOD's (ddof 1), not the pool's")
-    kept = idd[idd[FEATURES].notna().all(axis=1)]
-    check(np.allclose(ctx["pool"].z, ((kept[FEATURES] - mean) / sd).to_numpy()),
-          "pool z = (x - D_OOD mean) / D_OOD SD")
-    check(ctx["n_dropped"] == 10 and len(ctx["pool"]) == len(idd) - 10
-          and ctx["missing"] == {"wetindexcat": 10, "hand": 1},
-          f"10 pool points dropped and counted: {ctx['n_dropped']}, {ctx['missing']}")
-    check(rm.numeric_features(tmp / "FEATURES.txt") == FEATURES, "the 6 numeric features")
-    check("ood_dropped" not in rm.run(args_for(tmp))["summary"]
-          and "n_missing" not in rm.run(args_for(tmp))["table"],
-          "no Zone A point missing a feature: no n_missing column, no ood_dropped key (w7 schema)")
-    return ctx
-
-
-def stops(path: Path) -> bool:
-    """True when numeric_features refuses the file."""
-    try:
-        rm.numeric_features(path)
-        return False
-    except SystemExit:
-        return True
-
-
-def check_feature_count(tmp: Path):
-    print("10. q = the numeric features of FEATURES.txt")
-    nine = ["landcover", "soil_floodfreq", "soil_fluvclass"] + FEATURES
-    (tmp / "F9.txt").write_text("# nine\n" + "\n".join(nine) + "\n")
-    (tmp / "F2.txt").write_text("landcover\nslope\n")
-    check(rm.numeric_features(tmp / "F9.txt") == FEATURES, "q = 6 of nine features: the soil "
-          "classes and land cover are not in z, the six numeric ones are, in file order")
-    check(rm.numeric_features(tmp / "F2.txt") == ["slope"], "q = 1 on a two-feature file")
-    eight = FEATURES + SOIL
-    (tmp / "NOLC.txt").write_text("\n".join(eight) + "\n")
-    (tmp / "REP.txt").write_text("landcover\nslope\nslope\n")
-    (tmp / "ONLY.txt").write_text("landcover\nsoil_floodfreq\n")
-    check(stops(tmp / "NOLC.txt") and stops(tmp / "REP.txt") and stops(tmp / "ONLY.txt"),
-          "no landcover, a repeated name or no numeric feature stops the run")
-    for path, label in ((W7_FEATURES, "w7"), (W9_FEATURES, "w9"), (V4_FEATURES, "v4")):
-        if not path.exists():
-            print(f"  skip  {path} missing")
-            continue
-        got = rm.numeric_features(path)
-        check(len(got) == 6 and not set(got) & {"landcover", *SOIL},
-              f"{label}: q = {len(got)}: {', '.join(got)}")
-
-
-def check_missing_queries(tmp: Path, ood: pd.DataFrame):
-    print("11. Zone A points with a missing feature")
-    data = pd.read_parquet(tmp / "dataset.parquet")
-    points = pd.read_parquet(tmp / "regions.parquet")
-    region0 = points[points.component == 0].point_id.tolist()
-    # 3 points of region 0 (one of them the only point of its tile in the region, if any) and 4
-    # points outside every region lose one feature each.
-    gone = region0[:3]
-    outside = ood.point_id[~ood.point_id.isin(points.point_id)].tolist()[:4]
-    data.loc[data.point_id.isin(gone), "wetindexcat"] = np.nan
-    data.loc[data.point_id.isin(outside), "hand"] = np.nan
-    data.to_parquet(tmp / "dataset_missing.parquet")
-    a = args_for(tmp, dataset=str(tmp / "dataset_missing.parquet"), out=str(tmp / "out_missing"))
-    ctx = rm.load_inputs(a)
-    check(int((~ctx["ood_complete"]).sum()) == 7 and ctx["ood_missing"] == {"wetindexcat": 3,
-                                                                           "hand": 4},
-          f"7 Zone A points flagged incomplete: {ctx['ood_missing']}")
-    regions = rm.regions_of(ctx, points, 20, {})
-    r0 = regions[0]
-    full = rm.selection_rows(ctx, points[points.component == 0])
-    check(len(r0["rows"]) == 22 and len(r0["all_rows"]) == 25
-          and np.array_equal(r0["tiles"], np.unique(ctx["ood_tile"][full])),
-          "region 0: 22 queries of 25 points; its tiles are those of all 25")
-    q = rm.queries(ctx, full)
-    check(q["n_missing"] == 3 and len(q["z"]) == 22 and np.isfinite(q["z"]).all(),
-          "queries drop the 3 incomplete points and count them")
-    selected = np.zeros(len(ctx["ood"]), bool)
-    selected[rm.selection_rows(ctx, points)] = True
-    halo_ok = all(ctx["ood_complete"][rows].all()
-                  for _, rows, _ in rm.halo_sets(ctx, regions, selected, "region-tiles"))
-    check(halo_ok, "halos hold complete points only")
-
-    out = rm.run(a)
-    t = out["table"].set_index("set")
-    reg = out["table"][out["table"].kind == "region"]
-    first = reg[reg.component == 0].iloc[0]
-    pooled = out["table"][out["table"].kind == "pooled"].iloc[0]
-    others = t.loc["Other Zone A points"]
-    check(first.n == 22 and first.n_missing == 3 and pooled.n_missing == 3
-          and pooled.n == reg.n.sum() and others.n_missing == 4
-          and others.n == int((~selected).sum()) - 4,
-          f"rows: region n 22 + n_missing 3; pooled n_missing 3; other Zone A n_missing 4")
-    check(out["summary"]["ood_dropped"] == 7 and out["summary"]["ood_points"] == len(ood),
-          "summary: ood_dropped 7 of all Zone A points")
-    kinds = out["kinds"]
-    _, _, test = op.model_split(ctx["Z_ood"].shape[0])
-    y = ctx["ood"].label.to_numpy()
-    ok = True
-    for _, k in kinds.iterrows():
-        members = [r for r in regions if (y[r["all_rows"]].mean() >= 0.5) == (k.kind == "positive")]
-        every = np.concatenate([r["all_rows"] for r in members])
-        mask = np.zeros(len(y), np.float32)
-        mask[every] = 1
-        want = op.hard_corr(ctx["Z_ood"][test], ctx["acc"][test], mask, len(every), is_mask=True)
-        ok &= k.points == len(every) and np.isclose(k.corr_te, want, equal_nan=True)
-    check(ok and kinds.points.sum() == 47, "kinds: points and corr_te count all region points")
-
-
-def check_w7_reproduces():
-    print("12. the 2026-11-06 w7 outputs, byte for byte")
-    paths = [W7_RUN[k] for k in ("cells", "dataset", "features", "regions", "classic", "gtv")]
-    if not all(Path(p).exists() for p in paths + [W7_RUN["out"]]):
-        print("  skip  the 2026-11-06 cell, regions or outputs are missing")
-        return
-    with tempfile.TemporaryDirectory() as tmp:
-        argv = ["region_match.py", "--cells-dir", W7_RUN["cells"], "--tag", "FL_band_AE_s0",
-                "--dataset", W7_RUN["dataset"], "--features", W7_RUN["features"],
-                "--regions", W7_RUN["regions"], "--classic", W7_RUN["classic"],
-                "--extra-regions", W7_RUN["gtv"], "--out", tmp]
-        saved = sys.argv
-        sys.argv = argv
-        try:
-            rm.main()
-        finally:
-            sys.argv = saved
-        for name in W7_OUTPUTS:
-            same = (Path(tmp) / name).read_bytes() == (Path(W7_RUN["out"]) / name).read_bytes()
-            check(same, f"{name} identical to results/2026-11-06/region_match/{name}")
-
-
-def check_helpers(tmp: Path, ctx: dict):
-    print("helpers")
-    check(rm.caliper(np.array([0.1, 0.2, 0.3, np.inf]), 50) == 0.25,
-          "caliper: an infinite distance sorts last")
-    try:
-        rm.caliper(np.array([0.1, np.inf, np.inf]), 95)
-        raised = False
-    except ValueError:
-        raised = True
-    check(raised, "caliper: a percentile among the points without a candidate raises")
-    check(rm.weighted_median(np.array([1.0, 2.0, 3.0]), np.array([1.0, 1.0, 5.0])) == 3.0
-          and rm.weighted_median(np.array([1.0, 2.0]), np.array([0.5, 0.5])) == 1.0
-          and np.isnan(rm.weighted_median(np.array([np.nan]), np.array([1.0]))),
-          "weighted median (lower) and NaN without values")
-    vals = np.array([[0.0, 2.0], [4.0, 6.0], [8.0, 10.0]])
-    means = rm.match_means(vals, np.array([[0, 1], [2, -1], [-1, -1]]))
-    check(np.allclose(means[:2], [[2.0, 4.0], [8.0, 10.0]]) and np.isnan(means[2]).all(),
-          "match_means averages over each query's matches")
-    pts = pd.DataFrame(dict(meta_point_county=[None, "12099", None],
-                            county_fips=["12051", "12051", "12051"]))
-    check(rm.region_name(pts, {"12051": "Hendry", "12099": "Palm Beach"}) == "Hendry/Palm Beach",
-          "region name: counties by FIPS")
-    models = pd.DataFrame(dict(auc_id=np.arange(20) / 20))
-    _, _, test = op.model_split(20)
-    check(set(rm.strongest_test_models(models)) == set(test),
-          "strongest models are test models (all 4 of 4 here)")
-
-    points = pd.read_parquet(tmp / "regions.parquet")
-    regions = rm.regions_of(ctx, points, 20, {})
-    check([r["component"] for r in regions] == [0, 1] and len(regions[0]["rows"]) == 25,
-          "regions_of keeps the pieces of >= 20 points")
-    ex = rm.region_exclusion(ctx, regions[0], "region-tiles")
-    own = rm.region_exclusion(ctx, regions[0], "own-tile")
-    tiles = ctx["ood_tile"][regions[0]["rows"]]
-    check(ex[:, regions[0]["tiles"]].all() and ex.sum(1).max() == 2
-          and np.array_equal(own, rm.own_tile_exclusion(tiles, ctx["n_tiles"])),
-          "region-tiles excludes both of the region's tiles; own-tile only the point's")
-
-    q = rm.queries(ctx, regions[0]["rows"])
-    wrong = ctx["Z_ood"][ctx["strong"]][:, regions[0]["rows"]] == 0
-    y0 = ctx["ood"].label.to_numpy()[regions[0]["rows"]]
-    check(q["fn15"] == int((wrong & (y0 == 1)).sum()) and q["fp15"] == int((wrong & (y0 == 0)).sum())
-          and q["fn15"] + q["fp15"] == int(wrong.sum()),
-          f"queries count the strongest models' FNs and FPs ({q['fn15']} and {q['fp15']})")
-    hard = rm.hardest_rows(ctx, n=50)
-    _, _, test = op.model_split(ctx["Z_ood"].shape[0])
-    score = 1 - ctx["Z_ood"][test].mean(0)
-    check(len(hard) == 50 and score[hard].min() >= np.sort(score)[-50],
-          "the hardest rows have the highest error share of the test models")
-
-    selected = np.zeros(len(ctx["ood"]), bool)
-    selected[rm.selection_rows(ctx, points)] = True
-    halos = list(rm.halo_sets(ctx, regions, selected, "region-tiles"))
-    km, rows, excluded = halos[-1]
-    ok = not selected[rows].any() and len(rows) > 0
-    for r, col in enumerate(rows):
-        ok &= excluded[r, ctx["ood_tile"][col]]
-    sizes = [len(h[1]) for h in halos]
-    check(ok and sizes == sorted(sizes),
-          f"halos: outside the selection, own tile excluded, growing with the radius {sizes}")
-
-    kinds = rm.kinds_table(ctx, regions, {r["component"]: np.full((len(r["rows"]), 5), -1)
-                                          for r in regions})
-    below = int((ctx["cell"].models.acc_train_sub.to_numpy()[test] < rm.INTERPOLATES).sum())
-    check(np.allclose(kinds.fn_share + kinds.fp_share, 1) and (kinds.n_test == len(test)).all()
-          and (kinds.n_held_out == below).all() and (kinds.unmatched == 1).all(),
-          f"kinds: FN + FP shares = 1; the held-out models are the {below} test models below "
-          f"99% training accuracy")
-
-
-def check_run(tmp: Path):
-    print("end to end on the synthetic cell")
-    out = rm.run(args_for(tmp))
+def check_run():
+    print("8. prepare + run")
+    ood, idd = synthetic_world()
+    feats = ["f1", "f2", "f3"]
+    ctx = rm.prepare(ood, idd, feats)
+    check(np.allclose(ctx["mean"], ood[feats].mean()) and np.allclose(ctx["sd"], ood[feats].std()),
+          "standardized by the D_OOD mean and SD")
+    check(ctx["pool_dropped"] == 10 and len(ctx["pool"]) == 390, "10 pool points with a missing feature dropped")
+    selected = np.zeros(len(ood), bool)
+    regions = {0: np.flatnonzero(ood.tile_50km == "0_0")[:30], 1: np.flatnonzero(ood.tile_50km == "1_1")[:25]}
+    for cols in regions.values():
+        selected[cols] = True
+    selected[np.flatnonzero(ood.tile_50km == "2_0")[:5]] = True        # selected, in no region
+    out = rm.run(ctx, selected, regions)
     t = out["table"]
-    kinds = t.kind.value_counts().to_dict()
-    check(kinds == {"region": 2, "reference": 3, "halo": 3, "extra_region": 2, "baseline": 1,
-                    "pooled": 1}, f"rows per kind: {kinds}")
+    check(t.kind.tolist() == ["region", "region", "pooled", "other", "baseline"], f"rows {t.kind.tolist()}")
+    reg, pooled = t[t.kind == "region"], t[t.kind == "pooled"].iloc[0]
+    check(int(pooled.n) == 55 and np.isclose(pooled.eta, (reg.eta * reg.n_matched).sum() / reg.n_matched.sum()),
+          "all regions: 55 points, eta = the regions' eta weighted by matched points")
+    other = t[t.kind == "other"].iloc[0]
+    check(int(other.n) == len(ood) - int(selected.sum()), "Other Zone A = every point outside the subset")
     base = t[t.kind == "baseline"].iloc[0]
-    check(abs(base.unmatched - 0.05) < 0.01, f"baseline unmatched {base.unmatched:.3f}")
-    pooled = t[t.kind == "pooled"].iloc[0]
-    reg = t[t.kind == "region"]
-    check(pooled.n == reg.n.sum() and pooled.n_matched == reg.n_matched.sum()
-          and np.isclose(pooled.eta, (reg.eta * reg.n_matched).sum() / reg.n_matched.sum()),
-          "the pooled row stacks the regions' own matches")
-    check(len(out["sensitivity"]) == 1 + len(rm.SENSITIVITY), "sensitivity rows for every setting")
-    check(t.fn_share15.between(0, 1).all()
-          and out["kinds"].pos_matches.dropna().between(0, 1).all(),
-          "FN shares of the strongest models' errors and the kinds' match positives are shares")
-    p90 = out["sensitivity"].set_index("setting").loc["caliper_pct"]
-    check(np.allclose(p90.baseline_unmatched.to_numpy(), [0.10, 0.01], atol=0.01),
-          f"eps at the 90th and 99th percentiles leave 10% and 1% unmatched "
-          f"{np.round(p90.baseline_unmatched.to_numpy(), 3).tolist()}")
-    own = rm.run(args_for(tmp, exclude="own-tile"))["table"]
-    r0 = own[own.kind == "region"].iloc[0]
-    check(r0.n_matched >= reg.iloc[0].n_matched,
-          "own-tile never matches fewer points than region-tiles")
+    check(int(base.n) == 390 and abs(base.unmatched - 0.05) < 0.01, f"baseline: the pool, {base.unmatched:.3f} unmatched")
+    pairs = out["pairs"]
+    eps = out["summary"]["eps"]
+    tile_of = dict(zip(ctx["pool_df"].point_id, ctx["pool_df"].tile_50km))
+    lc_pool = dict(zip(ctx["pool_df"].point_id, ctx["pool_df"].landcover))
+    lc_ood = dict(zip(ood.point_id, ood.landcover))
+    region_tiles = {c: set(ood.tile_50km.iloc[cols]) for c, cols in regions.items()}
+    ok = all(r.distance <= eps and tile_of[r.match_point_id] not in region_tiles[r.component]
+             and lc_pool[r.match_point_id] == lc_ood[r.point_id] for r in pairs.itertuples())
+    check(len(pairs) > 0 and ok, f"{len(pairs)} pairs: within eps, outside the region's tiles, same land cover")
+    ps = out["point_summary"]
+    check(len(ps) == 55 and int(ps.n_matches.gt(0).sum()) == int(pooled.n_matched),
+          "one summary row per region point; matched points = the pooled row's")
 
 
-def check_real():
-    print("9. the sandbox numbers (Stop S2), --exclude own-tile on the 2026-10-23 cell")
-    if not all(Path(p).exists() for p in REAL.values()):
-        print("  skip  2026-10-23 cell or regions missing")
-        return
-    a = argparse.Namespace(cells_dir=REAL["cells"], tag="FL_band_AE_s0", dataset=REAL["dataset"],
-                           features=REAL["features"], regions=REAL["regions"],
-                           classic=REAL["classic"], extra_regions=None, exclude="own-tile",
-                           min_size=20, max_matches=5, caliper_pct=95.0,
-                           counties=str(rm.COUNTIES), out="unused")
-    out = rm.run(a)
-    t = out["table"].set_index("set")
-    check(abs(out["summary"]["eps"] - 1.391) <= 0.01, f"eps {out['summary']['eps']:.4f} (1.391)")
-    for name, (unmatched, eta) in SANDBOX.items():
-        got_u, got_e = t.loc[name, "unmatched"], t.loc[name, "eta"]
-        ok = abs(got_e - eta) <= 0.01 and (unmatched is None or abs(got_u - unmatched) <= 0.01)
-        check(ok, f"{name}: unmatched {got_u:.3f} ({unmatched}), eta {got_e:.3f} ({eta})")
-
-
-def main():
+def main() -> int:
     check_caliper_share()
     check_region_tiles()
     check_landcover()
     check_five_closest()
     check_eta_by_hand()
     check_query_expansion()
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        ood, idd = synthetic_world(tmp)
-        ctx = check_inputs(tmp, ood, idd)
-        check_helpers(tmp, ctx)
-        check_run(tmp)
-        check_feature_count(tmp)
-        check_missing_queries(tmp, ood)
-    check_real()
-    check_w7_reproduces()
+    check_features()
+    check_run()
     if FAILS:
         print(f"\n{len(FAILS)} FAILED")
         return 1

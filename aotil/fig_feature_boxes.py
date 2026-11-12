@@ -13,19 +13,17 @@ zoo.subset, terrain variability is elev_sd_r300, the water-unit recoding is gone
 already leaves water units missing), and land cover's classes are the seven most common of the data.
 Layout, colours and whiskers are the design's.
 
-    .venv/bin/python aotil/fig_feature_boxes.py --data data/processed_v4 \\
-        --out CS371_Cho_Li/figures/fig_feature_boxes.pdf --preview results/$D/paper_figures/fig_feature_boxes.png
+run_experiments.py --stage data writes the sets (figure_sets) and the land-cover classes (top_classes) to the run
+folder; make_paper.py draws the figure from them (draw).
 """
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -165,31 +163,8 @@ def draw(groups: dict, landcover: list[int], out: Path, preview: Path | None = N
     ax.set_yticklabels([])
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out)
+    fig.savefig(out, metadata={"CreationDate": None})   # same bytes for the same data
     if preview is not None:
         preview.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(preview, dpi=220)
     plt.close(fig)
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--data", type=Path, default=Path("data/processed_v4"))
-    ap.add_argument("--out", type=Path, default=Path("CS371_Cho_Li/figures/fig_feature_boxes.pdf"))
-    ap.add_argument("--preview", type=Path, default=None, help="optional PNG copy")
-    ap.add_argument("--seed", type=int, default=0)
-    a = ap.parse_args()
-    df = pd.read_parquet(a.data / "dataset_FL.parquet")
-    df["wetness"] = df.wetindexcat / 100         # StreamCat serves the index times 100
-    groups = figure_sets(df, a.seed)
-    landcover = top_classes(df.landcover)
-    draw(groups, landcover, a.out, a.preview)
-    names = ", ".join(f"{c} {NLCD_NAMES.get(c, '?')}" for c in landcover)
-    print(f"sets: {', '.join(f'{k} {len(v):,}' for k, v in groups.items())}")
-    print(f"land cover, the {len(landcover)} most common classes of all {len(df):,} points: {names}")
-    print(f"wrote {a.out}" + (f" and {a.preview}" if a.preview else ""))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

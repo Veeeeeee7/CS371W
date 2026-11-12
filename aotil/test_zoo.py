@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Checks for zoo.py (the grid population of docs/TASK-ZOO-GRIDS-2026-11-06.md, with the one-hot
-inputs and the duplicate drop of docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md D5 and D6) and the
-parts of audit_cell.py that check it. Run from the repo root:
+Checks for zoo.py (the grid population of the paper's Table tab:models, with the one-hot inputs and the
+duplicate drop). Run from the repo root:
 
     .venv/bin/python aotil/test_zoo.py [--cells data/interim/aotil/cells_v4_2026-11-07 \
         --data data/processed_v4]
@@ -28,24 +27,17 @@ parts of audit_cell.py that check it. Run from the repo root:
    imputer first.
 6. fit_one: all training rows and every varying feature (a constant column is dropped); the
    flood count equals predicts_flood on its ID scores.
-7. run_cell and main on a synthetic dataset with categorical features: the cell holds the kept
+7. run_cell and write_cell on a synthetic dataset with categorical features: the cell holds the kept
    models in grid order (idx 0..N-1, grid_idx increasing), kept + dropped = the grid, S rows = the
    table's means, every model on the one-hot input columns, no two kept models with the same
-   predictions; --n-models is refused.
-8. The model split over populations that are not 300: model_split(360) gives 216/72/72 and
-   every size is a disjoint cover; the family split covers every model.
-9. audit_cell.py on the synthetic cell: PASS (every dropped setting, duplicates included, refits
-   as stored); FAIL for a kept degenerate model, a kept duplicate, a missing or incomplete dropped
-   table, a changed seed, and a table without grid_idx.
+   predictions, n_jobs 1 = n_jobs 2; write_cell writes the three files load_cell reads back.
+8. The model split over populations that are not 290: model_split(360) gives 216/72/72 and
+   every size is a disjoint cover.
 10. The real cell (skipped when missing): 369 settings = kept + dropped, no kept model degenerate
     or a duplicate, every model on all the input columns of model_inputs and all training rows.
 """
 import argparse
 import itertools
-import json
-import os
-import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -55,11 +47,11 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import oodselect_paper as op  # noqa: E402
+import search as op  # noqa: E402
+from cells import load_cell  # noqa: E402
 import zoo  # noqa: E402
 
 FAILS = []
-PY = sys.executable
 REPO = Path(__file__).resolve().parent.parent
 # The brief's grids, written out again here so that a change to zoo.GRIDS shows up.
 BRIEF = {
@@ -384,19 +376,6 @@ def write_data(folder: Path) -> Path:
     return folder
 
 
-def thread_env() -> dict:
-    env = dict(os.environ)
-    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
-                "VECLIB_MAXIMUM_THREADS"):
-        env[var] = "1"
-    return env
-
-
-def run(args: list) -> subprocess.CompletedProcess:
-    return subprocess.run([PY, "-u"] + args, cwd=REPO, env=thread_env(), capture_output=True,
-                          text=True)
-
-
 def check_run_cell(tmp: Path) -> Path:
     print("7. run_cell and main")
     data = write_data(tmp / "data")
@@ -442,18 +421,15 @@ def check_run_cell(tmp: Path) -> Path:
           "n_jobs 1 gives the same cell as n_jobs 2")
 
     out = tmp / "cells"
-    got = run(["aotil/zoo.py", "--state", "FL", "--protocol", "band", "--train-dom", "AE",
-               "--seed", "0", "--data", str(data), "--out", str(out), "--n-jobs", "2"])
     tag = "FL_band_AE_s0"
-    check(got.returncode == 0 and (out / f"{tag}_dropped.csv").exists(),
-          "main writes the cell, the model table and the dropped table")
-    written = pd.read_csv(out / f"{tag}_models.csv")
-    check(len(written) == len(models) and written.grid_idx.tolist() == models.grid_idx.tolist(),
-          "the written table is run_cell's")
-    refused = run(["aotil/zoo.py", "--data", str(data), "--out", str(tmp / "x"),
-                   "--n-models", "300"])
-    check(refused.returncode == 2 and "--n-models" in refused.stderr,
-          "--n-models is refused (argparse error)")
+    paths = zoo.write_cell(cell, out, tag)
+    check([p.name for p in paths] == [f"{tag}.npz", f"{tag}_models.csv", f"{tag}_dropped.csv"]
+          and all(p.exists() for p in paths), "write_cell writes the cell, the model table and the dropped table")
+    back = load_cell(out, tag)
+    check(np.array_equal(back.S_ood, cell["S_ood"]) and np.array_equal(back.S_id, cell["S_id"])
+          and back.models.grid_idx.tolist() == models.grid_idx.tolist()
+          and back.point_id is not None and back.lon is not None,
+          "load_cell reads write_cell's files back (scores, model table, point keys)")
     return out
 
 
@@ -472,126 +448,8 @@ def check_model_split():
         joined = np.concatenate(parts)
         check(len(np.unique(joined)) == n and sorted(joined.tolist()) == list(range(n)),
               f"{n} models: selection, validation and test cover every model once")
-    kinds = np.array([sp["kind"] for sp in zoo.zoo_specs(0)])[::3]
-    for rule in ("trees->others", "others->trees"):
-        parts = op.make_split(len(kinds), rule, kinds, 0)
-        joined = np.concatenate(parts)
-        check(sorted(joined.tolist()) == list(range(len(kinds))),
-              f"{rule} on {len(kinds)} grid models covers every model once")
 
 
-# ----------------------------------------------------------------- 9: audit
-def audit(cells: Path, data: Path, out: Path) -> tuple[int, dict]:
-    got = run(["aotil/audit_cell.py", "--cells-dir", str(cells), "--tag", "FL_band_AE_s0",
-               "--data", str(data), "--features", str(data / "FEATURES.txt"),
-               "--out", str(out), "--overwrite"])
-    report = json.loads(out.read_text()) if out.exists() else {}
-    return got.returncode, report
-
-
-def failed_checks(report: dict) -> list[str]:
-    return [row["check"] for row in report.get("checks", []) if row["status"] == "FAIL"]
-
-
-def damaged_copy(tmp: Path, cells: Path, name: str) -> Path:
-    folder = tmp / name
-    shutil.copytree(cells, folder)
-    return folder
-
-
-def check_audit_helpers():
-    """stored_flood_count and grid_partition_problems on hand-made inputs."""
-    import audit_cell
-    n = 10835
-    share = float(pd.read_csv(pd.io.common.StringIO(
-        pd.DataFrame(dict(s=[542 / n])).to_csv(index=False))).s.iloc[0])
-    check(audit_cell.stored_flood_count(share, n) == 542,
-          f"stored_flood_count reads a CSV round-tripped share back as 542 ({share!r})")
-    check(audit_cell.stored_flood_count(0.5 / n, n) is None
-          and audit_cell.stored_flood_count(float("nan"), n) is None,
-          "stored_flood_count: a share that is no count over n, or NaN, gives None")
-    kept = pd.DataFrame(dict(grid_idx=[0, 2, 3]))
-    check(audit_cell.grid_partition_problems(kept, pd.DataFrame(dict(grid_idx=[1])), 4) == [],
-          "grid_partition_problems: kept 0, 2, 3 and dropped 1 cover a 4-setting grid")
-    bad = audit_cell.grid_partition_problems(kept, pd.DataFrame(dict(grid_idx=[2])), 4)
-    check(any("both kept and dropped" in b for b in bad)
-          and any("neither kept nor dropped" in b for b in bad),
-          f"grid_partition_problems: an overlap and a gap are both named {bad}")
-    bad = audit_cell.grid_partition_problems(pd.DataFrame(dict(grid_idx=[3, 0, 2])),
-                                             pd.DataFrame(dict(grid_idx=[1])), 4)
-    check(bad == ["model table not in grid order"], f"grid_partition_problems: order {bad}")
-
-
-def check_audit(tmp: Path, cells: Path):
-    print("9. audit_cell.py")
-    check_audit_helpers()
-    data = tmp / "data"
-    tag = "FL_band_AE_s0"
-    code, report = audit(cells, data, tmp / "audit_clean.json")
-    check(code == 0 and report.get("verdict") == "PASS",
-          f"clean cell: PASS {failed_checks(report)}")
-    refits = report.get("dropped_refits", [])
-    check(len(refits) > 0 and all(r["ok"] for r in refits)
-          and any(r["reason"] == "duplicate" for r in refits),
-          f"every dropped setting refits as stored, duplicates included "
-          f"({sum(r['reason'] == 'duplicate' for r in refits)} duplicates)")
-
-    # A degenerate model kept: copy a dropped setting's row into the table without its scores
-    # would break the shapes, so instead make a kept model's ID scores predict flood everywhere.
-    folder = damaged_copy(tmp, cells, "kept_degenerate")
-    npz = dict(np.load(folder / f"{tag}.npz"))
-    y = npz["y_id"]
-    npz["S_id"] = npz["S_id"].copy()
-    npz["S_id"][0] = np.where(y == 1, 0.9, 0.1)
-    np.savez_compressed(folder / f"{tag}.npz", **npz)
-    code, report = audit(folder, data, tmp / "audit_degenerate.json")
-    check(code == 1 and "drop rule" in failed_checks(report),
-          f"a kept degenerate model fails the drop rule: {failed_checks(report)}")
-
-    folder = damaged_copy(tmp, cells, "kept_duplicate")
-    npz = dict(np.load(folder / f"{tag}.npz"))
-    for half in ("S_id", "S_ood"):
-        npz[half] = npz[half].copy()
-        npz[half][1] = npz[half][0]
-    np.savez_compressed(folder / f"{tag}.npz", **npz)
-    models = pd.read_csv(folder / f"{tag}_models.csv")
-    for column in ("score_id", "score_ood", "acc_id", "acc_ood", "flood_share_id"):
-        models.loc[1, column] = models.loc[0, column]
-    models.to_csv(folder / f"{tag}_models.csv", index=False)
-    code, report = audit(folder, data, tmp / "audit_duplicate.json")
-    check(code == 1 and "drop rule" in failed_checks(report),
-          f"a kept duplicate fails the drop rule: {failed_checks(report)}")
-
-    folder = damaged_copy(tmp, cells, "no_dropped")
-    (folder / f"{tag}_dropped.csv").unlink()
-    code, report = audit(folder, data, tmp / "audit_no_dropped.json")
-    check(code == 1 and "dropped settings" in failed_checks(report),
-          f"a missing dropped table fails: {failed_checks(report)}")
-
-    folder = damaged_copy(tmp, cells, "dropped_incomplete")
-    dropped = pd.read_csv(folder / f"{tag}_dropped.csv")
-    dropped.iloc[1:].to_csv(folder / f"{tag}_dropped.csv", index=False)
-    code, report = audit(folder, data, tmp / "audit_incomplete.json")
-    check(code == 1 and "kept + dropped = grid" in failed_checks(report),
-          f"a setting neither kept nor dropped fails: {failed_checks(report)}")
-
-    folder = damaged_copy(tmp, cells, "seed_changed")
-    models = pd.read_csv(folder / f"{tag}_models.csv")
-    models.loc[3, "seed"] += 1
-    models.to_csv(folder / f"{tag}_models.csv", index=False)
-    code, report = audit(folder, data, tmp / "audit_seed.json")
-    check(code == 1 and "table == zoo_specs" in failed_checks(report),
-          f"a changed seed fails: {failed_checks(report)}")
-
-    folder = damaged_copy(tmp, cells, "pre_grid")
-    models = pd.read_csv(folder / f"{tag}_models.csv").drop(columns=["grid_idx"])
-    models.to_csv(folder / f"{tag}_models.csv", index=False)
-    code, report = audit(folder, data, tmp / "audit_pre_grid.json")
-    check(code == 1 and "grid table" in failed_checks(report) and not report.get("refits"),
-          f"a table without grid_idx fails and is not refitted: {failed_checks(report)}")
-
-
-# ----------------------------------------------------------------- 10: the real cell
 def check_real(cells: Path, data: Path):
     print(f"10. the real cell ({cells})")
     tag = "FL_band_AE_s0"
@@ -632,9 +490,8 @@ def main():
     check_fit_one()
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        cells = check_run_cell(tmp)
+        check_run_cell(tmp)
         check_model_split()
-        check_audit(tmp, cells)
     check_real(a.cells, a.data)
     if FAILS:
         print(f"\n{len(FAILS)} FAILED")

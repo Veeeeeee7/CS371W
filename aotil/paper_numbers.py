@@ -1,666 +1,784 @@
-"""Every number and table the paper's Results and Analysis report, recomputed from a finished run.
+#!/usr/bin/env python3
+"""Every table and number of the paper's Experiments, Analysis and Appendix, from one run folder of
+run_experiments.py (no torch, no new computation beyond arithmetic on the stored results). make_paper.py calls it.
 
-Usage, from the repo root (after a run; no new searches are made):
-
-    .venv/bin/python aotil/paper_numbers.py
-    .venv/bin/python aotil/paper_numbers.py --run results/2026-11-07 \
-        --cells data/interim/aotil/cells_v4_2026-11-07 --out results/2026-11-11/paper_numbers
-
-It reads the run's stored files and writes, under --out:
-  numbers.md      every number the prose states, keyed by paragraph, plus the self-checks
-  budgets.csv     corr_te [95% CI], components (>= c = 20 points), pieces and purity for every search, budget and smoothing setting
-  tab_shift.tex, tab_search.tex, tab_regions.tex, tab_mu.tex, tab_c.tex
-                  paste-ready tabular blocks for the paper's tables (\\textbf{XX} where the run lacks the input)
-
-What it computes, and from which inputs:
-  * The shift (Table tab:shift, paragraph "The aggregate shift is small"): read from the run's
-    o1_shift.csv (scope "all") and o1_tile_null.csv; per-tile accuracy and F1 are the unweighted
-    ("raw") versions the paper reports. Palm Beach numbers from the cell and the dataset.
-  * The searches (Tables tab:search, tab:mu, tab:ablation, Figure fig:budgets): for every stored
-    weight file oodselect_paper/<variant>/<tag>_S<S>_theta.npy, the top-S subset, corr_te on the
-    58 test models of the 60/20/20 split (probit Pearson, as aotil/audit_selection.probit_r_np),
-    its Fisher 95% interval, and pieces and purity from aotil/graph.py on the k = 10 graph.
-  * Smoothing (Equation eq:smooth): s_bar = (I + D)^-1 (I + A) s on the same graph A, applied to
-    the final weights of each search; the S largest s_bar form the subset. Computed on the
-    complement 1 - s = sigmoid(-theta) so that weights that round to 1.0 do not tie.
-  * The regions (Table tab:regions, paragraph "Covariate and concept shift"): region_match.csv
-    rows of the chosen variant; the pooled row is derived from the per-region rows (eta weighted by
-    matched points), which reproduces the stored Laplacian pooled row exactly.
-Self-checks (in numbers.md): the recomputed searches against <run>/gtv_vs_laplacian.csv, and the
-old directed-10-NN smoothing against the selection audit, so a mismatch shows before a number is used.
-Needs numpy, scipy, pandas, scikit-learn and pyproj (no torch).
+  load(run)        the stage outputs of a run folder (a missing stage reads as None)
+  tables(R)        Table tab:shift, tab:search, tab:regions and tab:models: the paper's tabular blocks, exactly in its
+                   format (leading zeros, $-$ signs, \\quad + smoothing rows, # Comps cells like 7 (383)), and the
+                   same rows as plain text for the terminal
+  numbers(R)       every number the prose states, by paragraph, as the paper prints it, each with the phrase the
+                   paper should contain (checked by paper_check)
+  mu_sweep(R)      the mu sweep table (loss x mu, alone and + smoothing) and the values of the "Regularization
+                   weight" paragraph, with the answers to its % CHECK
+  checks(R)        self-checks of the run (PASS / FAIL)
+  paper_check(...) the generated tables and phrases against CS371_Cho_Li/acl_latex.tex
 """
 from __future__ import annotations
 
-import argparse
-import datetime as dt
 import json
 import re
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
-from scipy.spatial import cKDTree
-from scipy.special import expit, ndtri
-from scipy.stats import norm, rankdata, wilcoxon
-from scipy.stats import t as t_dist
-from sklearn.model_selection import train_test_split
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import graph  # noqa: E402
-
-TAG = "FL_band_AE_s0"
-EPS = 1e-6                     # probit clip and variance floor (oodselect_paper.EPS)
-KNN = 10
-PALM_BEACH_TILE = "30_10"
-VARIANTS = {"classic": "OODSelect", "spatial_mu3_knn10": "Laplacian",
-            "spatial_gtv_mu3_knn10": "GTV"}
-MU_VARIANTS = {1: "spatial_gtv_mu1_knn10", 3: "spatial_gtv_mu3_knn10", 10: "spatial_gtv_mu10_knn10"}
-REPORTED_S = 500
-C_MIN = 20                     # minimum component size c (Algorithm alg:spatial)
-C_GRID = (10, 15, 20, 30)      # c values of Table tab:c
-SEARCH_ROWS = [("OODSelect", ("OODSelect", False)), (r"\quad + smoothing", ("OODSelect", True)),
-               ("Laplacian", ("Laplacian", False)), (r"\quad + smoothing", ("Laplacian", True)),
-               ("GTV", ("GTV", False)), (r"\quad + smoothing", ("GTV", True))]
-COUNTIES = Path("data/interim/gis/counties_FL.parquet")    # GEOID -> NAME, for region names
-ABLATION_BUDGETS = [250, 500, 1000]
-XX = r"\textbf{XX}"
-
-
-# ------------------------------------------------------------------ helpers
-def model_split(n_models: int):
-    """The 60/20/20 selection / validation / test models (oodselect_paper.model_split)."""
-    idx = np.arange(n_models)
-    rest, test = train_test_split(idx, test_size=0.2, random_state=42)
-    selection, validation = train_test_split(rest, test_size=0.25, random_state=42)
-    return selection, validation, test
-
-
-def correctness(S, y):
-    """1 where a model's argmax prediction is right (oodselect_paper.correctness)."""
-    y = np.asarray(y)
-    return ((S > 0.5) | ((S == 0.5) & (y[None, :] == 0))).astype(np.float64)
+REPORTED_S, MU, C_MIN = 500, 3, 20
+SEARCHES = ("OODSelect", "Laplacian", "GTV")
+SEARCH_ROWS = [("OODSelect", "OODSelect", False), (r"\quad + smoothing", "OODSelect", True),
+               ("Laplacian", "Laplacian", False), (r"\quad + smoothing", "Laplacian", True),
+               ("GTV", "GTV", False), (r"\quad + smoothing", "GTV", True)]
+PAPER_SETTINGS = dict(trials=100, max_steps=50_000, patience=500, knn=10, c=20, mu=3, search_seed=0,
+                      reported_S=500, budget_penalty="squared")
+# Appendix Table tab:models: each family's grid as the paper words it (zoo.GRIDS), in the paper's row order.
+MODEL_ROWS = [
+    ("dt", "Decision tree", r"maximum depth $\in\{1,2,3,4,5,6,8,10,12,\text{none}\}$ $\times$ minimum leaf size "
+                            r"$\in\{1,20,200,2000\}$"),
+    ("rf", "Random forest", r"trees $\in\{10,30,100\}$ $\times$ maximum depth $\in\{1,2,3,5,8,\text{none}\}$ "
+                            r"$\times$ features per split $\in\{1,5,28\}$"),
+    ("et", "Extra trees", r"trees $\in\{10,30,100\}$ $\times$ maximum depth $\in\{1,2,3,5,8,\text{none}\}$ "
+                          r"$\times$ features per split $\in\{1,5,28\}$"),
+    ("hgb", "Histogram gradient boosting", r"learning rate $\in\{0.01,0.03,0.1,0.5\}$ $\times$ iterations "
+                                           r"$\in\{3,10,50,300\}$ $\times$ maximum depth $\in\{1,3,\text{none}\}$, "
+                                           r"without early stopping"),
+    ("xgb", "XGBoost", r"learning rate $\in\{0.01,0.03,0.1,0.5\}$ $\times$ trees $\in\{3,10,50,300\}$ $\times$ "
+                       r"maximum depth $\in\{1,3,8\}$, histogram tree method"),
+    ("lr", "Logistic regression", r"inverse regularization strength $C\in\{0.001,0.01,0.1,1,100\}$ $\times$ "
+                                  r"iterations $\in\{1,2,3,5,100\}$ $\times$ class weights "
+                                  r"$\in\{\text{none},\text{balanced}\}$"),
+    ("mlp", "Multilayer perceptron", r"hidden layers $\in\{(2),(8),(16),(32),(64,32)\}$ $\times$ epochs "
+                                     r"$\in\{3,20,200\}$ $\times$ learning rate $\in\{10^{-4},10^{-3},10^{-2}\}$"),
+    ("nb", "Gaussian naive Bayes", r"variance smoothing $\in\{10^{-9},10^{-5},10^{-4},10^{-3},0.003,0.01,0.03,"
+                                   r"\allowbreak 0.1,0.2,0.3,0.5,1,2,3,10\}$ $\times$ class priors "
+                                   r"$\in\{\text{fitted},\text{equal}\}$"),
+]
+NLCD_NAMES = {11: "open water", 21: "developed open space", 22: "low-intensity developed",
+              23: "medium-intensity developed", 24: "high-intensity developed", 31: "barren land",
+              41: "deciduous forest", 42: "evergreen forest", 43: "mixed forest", 52: "shrub and scrub",
+              71: "grassland", 81: "pasture and hay", 82: "crops", 90: "woody wetland", 95: "herbaceous wetland"}
+NUMBER_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine",
+                10: "ten", 11: "eleven", 12: "twelve"}
 
 
-def probit_r(Z, acc, mask) -> float:
-    """Population Pearson r of probit(subset accuracy) on probit(ID accuracy) (probit_r_np)."""
-    w = np.asarray(mask, np.float64)
-    sub = (Z @ w) / (w.sum() + 1e-6)
-    x = ndtri(np.clip(sub, EPS, 1 - EPS))
-    y = ndtri(np.clip(acc, EPS, 1 - EPS))
-    xc, yc = x - x.mean(), y - y.mean()
-    return float(np.mean(xc * yc) / np.sqrt((np.mean(xc ** 2) + EPS) * (np.mean(yc ** 2) + EPS)))
+# ------------------------------------------------------------------ formats
+def sgn(x, nd=2, tex=True):
+    """'$-$0.97' / '$+$0.84' (signed cells; leading zero kept)."""
+    m, p = ("$-$", "$+$") if tex else ("-", "+")
+    return (m if x < 0 else p) + f"{abs(x):.{nd}f}"
 
 
-def fisher_ci(r: float, n: int, level: float = 0.95):
-    z, se, q = np.arctanh(r), 1 / np.sqrt(n - 3), norm.ppf(0.5 + level / 2)
-    return float(np.tanh(z - q * se)), float(np.tanh(z + q * se))
-
-
-def top_mask(score, k):
-    """The k highest scores; ties go to the lower index (report_paper.top_mask)."""
-    m = np.zeros(len(score), bool)
-    m[np.argsort(-score, kind="stable")[:k]] = True
-    return m
-
-
-def bottom_mask(score, k):
-    m = np.zeros(len(score), bool)
-    m[np.argsort(score, kind="stable")[:k]] = True
-    return m
-
-
-def smooth_graph(theta, A, S):
-    """Equation eq:smooth on graph A: keep the S largest (I + D)^-1 (I + A) sigmoid(theta),
-    computed as the S smallest smoothed sigmoid(-theta). Returns (mask, ties at the cut)."""
-    q = expit(-np.asarray(theta, np.float64))
-    deg = np.asarray(A.sum(axis=1)).ravel()
-    q_bar = (q + A @ q) / (1.0 + deg)
-    mask = bottom_mask(q_bar, S)
-    cut = np.sort(q_bar)[S - 1]
-    return mask, int((q_bar == cut).sum())
-
-
-def smooth_knn_legacy(theta, xy, S, k=KNN):
-    """The old smoothing (audit_selection.smoothed_classic): mean over each point's k nearest
-    points, itself included. Only used to check this script against the stored audit."""
-    q = expit(-np.asarray(theta, np.float64))
-    _, idx = cKDTree(xy).query(xy, k=k)
-    return bottom_mask(q[idx].mean(axis=1), S)
-
-
-def sgn(x, nd=2):
-    """'$-$0.97' / '$+$0.84' style for signed table cells (leading zero kept, Victor 2026-11-11)."""
-    return ("$-$" if x < 0 else "$+$") + f"{abs(x):.{nd}f}"
-
-
-def gap(x, nd=3):
-    """'$-$0.034' / '0.017' style (minus sign only), as the shift tables print gaps."""
-    return ("$-$" if x < 0 else "") + f"{abs(x):.{nd}f}"
+def gap(x, nd=3, tex=True):
+    """'$-$0.034' / '0.017' (minus sign only), as the shift table prints Delta."""
+    return (("$-$" if tex else "-") if x < 0 else "") + f"{abs(x):.{nd}f}"
 
 
 def share(x, nd=2):
     return f"{x:.{nd}f}"
 
 
-# ------------------------------------------------------------------ parts
-def load_cell(cells: Path):
-    z = np.load(cells / f"{TAG}.npz", allow_pickle=True)
-    Z_ood = correctness(z["S_ood"], z["y_ood"])
-    Z_id = correctness(z["S_id"], z["y_id"])
-    _, _, test = model_split(Z_ood.shape[0])
-    return z, Z_ood, Z_id.mean(1), test
+def signed_prose(x, nd=2):
+    """'$-0.97$' inside math, as the prose writes negative correlations."""
+    return f"${x:.{nd}f}$" if x < 0 else f"{x:.{nd}f}"
 
 
-def components(mask, A, c=C_MIN):
-    """Components of the subset: connected components of the subgraph the subset induces in A
-    with at least c points. Returns their number and the share of selected points they hold."""
-    from scipy.sparse.csgraph import connected_components
-    idx = np.where(np.asarray(mask, bool))[0]
-    if len(idx) == 0:
-        return 0, float("nan")
-    _, lab = connected_components(A[idx][:, idx], directed=False)
-    sizes = np.bincount(lab)
-    big = sizes >= c
-    return int(big.sum()), float(sizes[big].sum() / len(idx))
+def pct(x, nd=0):
+    return f"{100 * x:.{nd}f}\\%"
 
 
-def search_rows(run: Path, z, Z_ood, acc_id, test, A, budgets_only=None):
-    """corr_te, interval, pieces and purity of every stored search, plain and smoothed."""
-    rows = []
-    Zt, at = Z_ood[test], acc_id[test]
-    variants = dict(VARIANTS)
-    for mu, v in MU_VARIANTS.items():
-        variants.setdefault(v, f"GTV mu={mu}")
-    for v, name in variants.items():
-        vdir = run / "oodselect_paper" / v
-        if not vdir.exists():
-            continue
-        for f in sorted(vdir.glob(f"{TAG}_S*_theta.npy")):
-            S = int(re.search(r"_S(\d+)_theta", f.name).group(1))
-            if budgets_only and S not in budgets_only:
-                continue
-            theta = np.load(f)
-            for smoothed in (False, True):
-                if smoothed:
-                    mask, ties = smooth_graph(theta, A, S)
-                else:
-                    mask, ties = top_mask(theta, S), 0
-                r = probit_r(Zt, at, mask)
-                lo, hi = fisher_ci(r, len(test))
-                coh = graph.coherence_metrics(mask, A, KNN)
-                n_comp, in_comp = components(mask, A)
-                by_c = {}
-                for c in C_GRID:
-                    n_c, f_c = components(mask, A, c)
-                    by_c[f"comp_c{c}"], by_c[f"pts_c{c}"] = n_c, int(round(f_c * S)) if n_c else 0
-                rows.append(dict(variant=v, search=name, smoothing=smoothed, S=S, r_te=r,
-                                 ci_lo=lo, ci_hi=hi, components=n_comp, in_components=in_comp,
-                                 comp_points=int(round(in_comp * S)) if n_comp else 0, **by_c,
-                                 pieces=coh["n_cc"], purity=coh["purity"], ties_at_cut=ties))
-    return pd.DataFrame(rows)
+def word(n: int) -> str:
+    return NUMBER_WORDS.get(int(n), str(int(n)))
 
 
-def checks(run: Path, rows: pd.DataFrame, z, Z_ood, acc_id, test, xy):
-    """Recomputed numbers against the run's stored ones; returns markdown lines."""
-    out = ["## Self-checks", ""]
-    stored = run / "gtv_vs_laplacian.csv"
-    if stored.exists():
-        s = pd.read_csv(stored)
-        m = rows[~rows.smoothing].merge(s, on=["search", "S"], suffixes=("", "_stored"))
-        out.append(f"- Searches vs `{stored}` ({len(m)} rows): max |r_te diff| "
-                   f"{(m.r_te - m.r_test).abs().max():.2e}, max |purity diff| "
-                   f"{(m.purity - m.purity_stored).abs().max():.2e}, pieces equal: "
-                   f"{bool((m.pieces == m.pieces_stored).all())}")
-    audit = run / "oodselect_paper" / f"{TAG}_selection_audit.json"
-    theta_dir = run / "oodselect_paper" / "classic"
-    if audit.exists() and theta_dir.exists():
-        j = json.loads(audit.read_text())
-        found = []
-
-        def walk(o):
-            if isinstance(o, dict):
-                if o.get("variant") == "smoothed_classic_knn10" and "coh_purity" in o:
-                    found.append(o)
-                for v in o.values():
-                    walk(v)
-            elif isinstance(o, list):
-                for v in o:
-                    walk(v)
-        walk(j)
-        for o in found:
-            S = int(o["budget"])
-            theta = np.load(theta_dir / f"{TAG}_S{S}_theta.npy")
-            mask = smooth_knn_legacy(theta, xy, S)
-            r = probit_r(Z_ood[test], acc_id[test], mask)
-            A = checks.A
-            coh = graph.coherence_metrics(mask, A, KNN)
-            out.append(f"- Old smoothing (directed 10-NN) at S = {S}: r_te {r:.4f} vs stored "
-                       f"{o['r_test']:.4f}; purity {coh['purity']:.4f} vs {o['coh_purity']:.4f}; "
-                       f"pieces {coh['n_cc']} vs {o['coh_n_cc']}")
-    return out
+def thousands(n: int) -> str:
+    return f"{int(n):,}"
 
 
-def auc_rows(P, y):
-    """ROC AUC of every model (row of P) on the given points, from average ranks (sklearn's
-    roc_auc_score); NaN for every model when a class is missing."""
-    pos = np.asarray(y) == 1
-    n1, n0 = int(pos.sum()), int((~pos).sum())
-    if n1 == 0 or n0 == 0:
-        return np.full(P.shape[0], np.nan)
-    R = rankdata(P, axis=1)
-    return (R[:, pos].sum(1) - n1 * (n1 + 1) / 2) / (n1 * n0)
+def tex_thousands(n: int) -> str:
+    """10,000 -> 10{,}000 as the paper writes numbers in math mode."""
+    return f"{int(n):,}".replace(",", "{,}")
 
 
-def acc_f1_rows(Z, y):
-    """Accuracy and flood-class F1 (2TP / (2TP + FP + FN)) of every model on the given points."""
-    flood = np.asarray(y) == 1
-    tp = (Z[:, flood]).sum(1)
-    fn = (~Z[:, flood]).sum(1)
-    fp = (~Z[:, ~flood]).sum(1)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return Z.mean(1), 2 * tp / (2 * tp + fp + fn)
+# ------------------------------------------------------------------ loading
+def load(run: Path) -> dict:
+    """Every stage output of a run folder; a missing one is None."""
+    run = Path(run)
+
+    def js(p):
+        p = run / p
+        return json.loads(p.read_text()) if p.exists() else None
+
+    def csv(p):
+        p = run / p
+        return pd.read_csv(p) if p.exists() else None
+    R = dict(run=run, manifest=js("manifest.json"), zoo=js("zoo/zoo.json"), data=js("data/data.json"),
+             shift=js("shift/summary.json"), per_tile=csv("shift/per_tile.csv"), subsets=csv("smooth/subsets.csv"),
+             components=csv("regions/components.csv"), match=csv("match/table.csv"),
+             match_summary=js("match/summary.json"))
+    if R["subsets"] is not None:
+        R["subsets"]["smoothing"] = R["subsets"].smoothing.astype(bool)
+    return R
 
 
-def sign_flip_p(d, n_perm=100_000, seed=0):
-    """Two-sided sign-flip permutation p of mean(d) against 0: under H0 (no shift) each tile's
-    gap is as likely to be positive as negative, so its sign is flipped at random."""
-    d = np.asarray(d, float)
-    d = d[~np.isnan(d)]
-    rng = np.random.default_rng(seed)
-    obs = abs(d.mean())
-    hits = 0
-    for start in range(0, n_perm, 20_000):
-        signs = rng.choice([-1.0, 1.0], size=(min(20_000, n_perm - start), len(d)))
-        hits += int((np.abs((signs * d).mean(1)) >= obs - 1e-12).sum())
-    return (hits + 1) / (n_perm + 1)
+def missing_stages(R: dict) -> list[str]:
+    need = dict(zoo="zoo", data="data", shift="shift", subsets="smooth", components="regions", match="match")
+    return [stage for key, stage in need.items() if R.get(key) is None]
 
 
-def holm(pvals: dict) -> dict:
-    """Holm-Bonferroni adjusted p values."""
-    keys = sorted(pvals, key=pvals.get)
-    m, out, running = len(keys), {}, 0.0
-    for rank, k in enumerate(keys):
-        running = max(running, min(1.0, (m - rank) * pvals[k]))
-        out[k] = running
-    return out
+def pick(R, search, S=REPORTED_S, smoothing=False, mu=None):
+    """One subset row: the search at S (mu = 3 for the two losses unless given)."""
+    t = R["subsets"]
+    if t is None:
+        return None
+    if mu is None:
+        mu = 0 if search == "OODSelect" else MU
+    g = t[(t.search == search) & (t.S == S) & (t.smoothing == smoothing) & np.isclose(t.mu, mu)]
+    return None if g.empty else g.iloc[0]
 
 
-def tile_bootstrap(to, n_boot=2000, seed=0):
-    """o1_shift.tile_draws: n_boot resamples, with replacement, of the test tiles (those of the
-    Zone A half), with numpy's default_rng(seed); returns (tiles, draws x tiles count matrix)."""
-    test_tiles = np.unique(to)
-    rng = np.random.default_rng(seed)
-    draws = [rng.choice(test_tiles, len(test_tiles)) for _ in range(n_boot)]
-    index = {tile: j for j, tile in enumerate(test_tiles)}
-    K = np.zeros((n_boot, len(test_tiles)))
-    for b, draw in enumerate(draws):
-        for tile in draw:
-            K[b, index[tile]] += 1
-    return test_tiles, K
+def n_ood(R) -> int | None:
+    """m, the number of Zone A test points (from the zoo, else from the data stage)."""
+    if R.get("zoo"):
+        return int(R["zoo"]["n_ood"])
+    if R.get("data"):
+        return int(R["data"]["sets"]["OOD"]["n"])
+    return None
 
 
-def t_interval(x, level=0.95):
-    """mean +- t_{n-1} * sd / sqrt(n) over the tile values (NaN tiles left out)."""
-    x = np.asarray(x, float)
-    x = x[~np.isnan(x)]
-    n, m = len(x), float(x.mean())
-    h = float(t_dist.ppf(0.5 + level / 2, n - 1) * x.std(ddof=1) / np.sqrt(n))
-    return m - h, m + h
+def budget_grid(R) -> pd.DataFrame | None:
+    t = R["subsets"]
+    if t is None:
+        return None
+    return t[t.group == "budget grid"]
 
 
-def boot_interval(G, K):
-    """o1_shift.tile_summary's interval: per draw, each model's mean of G (tiles x models) over the
-    drawn tiles (a tile drawn twice counts twice), averaged over the models; 2.5th and 97.5th
-    percentiles over the draws that hold a usable tile."""
-    with np.errstate(divide="ignore", invalid="ignore"):
-        boot = ((K @ G) / K.sum(1, keepdims=True)).mean(1)
-    boot = boot[np.isfinite(boot)]
-    return float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
-
-
-def shift_part(run: Path, z, test, dataset: Path, cells: Path, tile_ci: str = "t"):
-    """Table tab:shift, the test of 'The aggregate shift is small', and its other numbers.
-
-    Every model of the zoo (290), as aotil/o1_shift.py computes the shift. Pooled: each model's
-    metric over all points of each half, averaged over the models. Per tile: each model's metric
-    within each test tile, averaged over the models and then over the tiles where the metric is
-    defined (accuracy: both halves present; F1: floods in both halves; AUROC: both classes in both
-    halves). Per-tile 95% intervals are t-intervals over the tiles (each tile's value averaged over
-    the models); --tile-ci bootstrap gives o1_shift.py's 2,000-draw tile bootstrap instead, and the
-    bootstrap shift interval is always checked against o1_shift.csv. Pooled values carry no interval. The test: the tile is the unit (points within a
-    tile are spatially correlated, so they are not independent), each tile's gap is averaged
-    over the models, and a two-sided Wilcoxon signed-rank test asks whether the tile gaps are
-    centred on 0, with Holm's correction across the three metrics. o1_shift.py computed the same
-    signed-rank test before these results existed. A sign-flip permutation test of the mean tile
-    gap is printed beside it: it is pulled toward 0 by a few tiles whose two zones have very
-    different flood shares, which the signed-rank test is less sensitive to."""
-    yo, yi = z["y_ood"], z["y_id"]
-    Zo = (z["S_ood"] > 0.5) | ((z["S_ood"] == 0.5) & (yo[None] == 0))
-    Zi = (z["S_id"] > 0.5) | ((z["S_id"] == 0.5) & (yi[None] == 0))
-    Po = np.where(yo[None] == 1, 1 - (1 - z["S_ood"]), 1 - z["S_ood"])
-    Pi = np.where(yi[None] == 1, 1 - (1 - z["S_id"]), 1 - z["S_id"])
-    ds = pd.read_parquet(dataset, columns=["point_id", "tile_50km"]).set_index("point_id")
-    to = np.asarray(z["tile_50km"])
-    ti = ds.loc[z["point_id_id"], "tile_50km"].values
-    models = pd.read_csv(cells / f"{TAG}_models.csv")
-
-    # pooled (no interval)
-    acc_i, f1_i = acc_f1_rows(Zi, yi)
-    acc_o, f1_o = acc_f1_rows(Zo, yo)
-    pooled = dict(acc=(acc_i.mean(), acc_o.mean()), f1=(f1_i.mean(), f1_o.mean()),
-                  auc=(models.auc_id.mean(), models.auc_ood.mean()))
-
-    # per tile
-    tiles = sorted(set(to) | set(ti))
-    per = {m: dict(ID=[], A=[]) for m in ("acc", "f1", "auc")}
-    for tile in tiles:
-        mo, mi = to == tile, ti == tile
-        both = mo.any() and mi.any()
-        ao, fo = acc_f1_rows(Zo[:, mo], yo[mo]) if mo.any() else (None, None)
-        ai, fi = acc_f1_rows(Zi[:, mi], yi[mi]) if mi.any() else (None, None)
-        floods = both and (yo[mo] == 1).any() and (yi[mi] == 1).any()
-        classes = both and len(set(yo[mo])) == 2 and len(set(yi[mi])) == 2
-        for m, ok, vi, vo in [("acc", both, ai, ao), ("f1", floods, fi, fo),
-                              ("auc", classes, auc_rows(Pi[:, mi], yi[mi]) if classes else None,
-                               auc_rows(Po[:, mo], yo[mo]) if classes else None)]:
-            per[m]["ID"].append(vi if ok else np.full(Zo.shape[0], np.nan))
-            per[m]["A"].append(vo if ok else np.full(Zo.shape[0], np.nan))
-    s = pd.read_csv(run / "o1_shift.csv")
-    stored = s[s.scope == "all"].iloc[0]
-    ci_cols = dict(acc=("tile_acc_raw_ci_lo", "tile_acc_raw_ci_hi", "tile_acc_raw_gap", "tile_acc_raw_wilcoxon_p"),
-                   auc=("tile_auc_ci_lo", "tile_auc_ci_hi", "tile_auc_gap", "tile_auc_wilcoxon_p"),
-                   f1=("tile_f1_raw_ci_lo", "tile_f1_raw_ci_hi", "tile_f1_raw_gap", "tile_f1_raw_wilcoxon_p"))
-    res, p_perm, checks_, d_tiles = {}, {}, [], {}
-    boot_tiles, K_all = tile_bootstrap(to)
-    col = {tile: j for j, tile in enumerate(boot_tiles)}
-    for m in ("acc", "auc", "f1"):
-        I = np.array(per[m]["ID"]).T                     # models x tiles
-        A = np.array(per[m]["A"]).T
-        keep = ~np.isnan(I).all(0)
-        d_tile = np.nanmean(I[:, keep] - A[:, keep], axis=0)  # each tile's gap, mean over models
-        K = K_all[:, [col[tile] for tile, k in zip(tiles, keep) if k]]
-        boot_id, boot_a = boot_interval(I[:, keep].T, K), boot_interval(A[:, keep].T, K)
-        boot_gap = boot_interval((I[:, keep] - A[:, keep]).T, K)
-        if tile_ci == "t":                               # the paper's intervals (2026-11-11)
-            ci_id = t_interval(np.nanmean(I[:, keep], axis=0))
-            ci_a = t_interval(np.nanmean(A[:, keep], axis=0))
-            ci_gap = t_interval(d_tile)
-        else:                                            # o1_shift.py's tile bootstrap
-            ci_id, ci_a, ci_gap = boot_id, boot_a, boot_gap
-        res[m] = dict(ID=float(np.nanmean(I[:, keep])), A=float(np.nanmean(A[:, keep])),
-                      gap=float(d_tile.mean()), n_tiles=int(keep.sum()),
-                      tiles_pos=int((d_tile > 0).sum()), ci=ci_gap, ci_ID=ci_id, ci_A=ci_a,
-                      wilcoxon_p=float(wilcoxon(d_tile).pvalue))
-        checks_.append(f"- Per-tile {m} shift, bootstrap interval: recomputed [{boot_gap[0]:.4f}, {boot_gap[1]:.4f}] vs "
-                       f"o1_shift.csv [{stored[ci_cols[m][0]]:.4f}, {stored[ci_cols[m][1]]:.4f}]")
-        p_perm[m] = sign_flip_p(d_tile)
-        d_tiles[m] = d_tile
-        checks_.append(f"- Per-tile {m} gap: recomputed {res[m]['gap']:.4f} vs o1_shift.csv "
-                       f"{stored[ci_cols[m][2]]:.4f}; Wilcoxon p {res[m]['wilcoxon_p']:.4f} vs "
-                       f"{stored[ci_cols[m][3]]:.4f}")
-    for m, (a, b) in [("acc", ("acc_ID", "acc_A")), ("f1", ("f1_ID", "f1_A")), ("auc", ("ID_AUC", "A_AUC"))]:
-        checks_.append(f"- Pooled {m}: recomputed {pooled[m][0]:.4f} / {pooled[m][1]:.4f} vs "
-                       f"o1_shift.csv {stored[a]:.4f} / {stored[b]:.4f}")
-    p_wil = {m: res[m]["wilcoxon_p"] for m in res}
-    p_holm = holm(p_wil)
-    p_perm_holm = holm(p_perm)
-
-    names = dict(acc="Accuracy", auc="AUROC", f1="F1")
-    body = []
-    for m in ("acc", "auc", "f1"):
-        r = res[m]
-        body.append(f"ID {names[m] if m != 'acc' else 'accuracy'} & {share(pooled[m][0], 3)} & {share(r['ID'], 3)} "
-                    f"[{share(r['ci_ID'][0], 3)}, {share(r['ci_ID'][1], 3)}] \\\\")
-        body.append(f"OOD {names[m] if m != 'acc' else 'accuracy'} & {share(pooled[m][1], 3)} & {share(r['A'], 3)} "
-                    f"[{share(r['ci_A'][0], 3)}, {share(r['ci_A'][1], 3)}] \\\\")
-        body.append(f"{names[m]} shift & {gap(pooled[m][0] - pooled[m][1])} & {gap(r['gap'])} "
-                    f"[{gap(r['ci'][0])}, {gap(r['ci'][1])}] \\\\")
-        if m != "f1":
-            body.append(r"\midrule")
+# ------------------------------------------------------------------ tables
+def table_shift(R):
+    s = R["shift"]["metrics"]
+    names = dict(acc="accuracy", auc="AUROC", f1="F1")
+    head = ["Metric", "Pooled", "Per tile"]
+    tex_rows, txt_rows = [], []
+    for k, m in enumerate(("acc", "auc", "f1")):
+        r = s[m]
+        nm = names[m]
+        cap = nm[0].upper() + nm[1:]
+        for label, pooled, tile, ci, is_gap in [
+                (f"ID {nm}", r["pooled_id"], r["tile_id"], r["ci_id"], False),
+                (f"OOD {nm}", r["pooled_ood"], r["tile_ood"], r["ci_ood"], False),
+                (f"$\\Delta$ {cap}", r["pooled_delta"], r["tile_delta"], r["ci_delta"], True)]:
+            f = (lambda x, t=True: gap(x, 3, t)) if is_gap else (lambda x, t=True: share(x, 3))
+            tex_rows.append(f"{label} & {f(pooled)} & {f(tile)} [{f(ci[0])}, {f(ci[1])}] \\\\")
+            txt_rows.append([label.replace("$\\Delta$", "Delta"), f(pooled, False),
+                             f"{f(tile, False)} [{f(ci[0], False)}, {f(ci[1], False)}]"])
+        if k < 2:
+            tex_rows.append(r"\midrule")
+            txt_rows.append(None)
     tex = "\n".join([r"\begin{tabular}{@{}lcc@{}}", r"\toprule",
-                     r"\textbf{Metric} & \textbf{Pooled} & \textbf{Per tile} \\", r"\midrule",
-                     *body, r"\bottomrule", r"\end{tabular}"])
-
-    pb_id, pb_ood = ti == PALM_BEACH_TILE, to == PALM_BEACH_TILE
-    nums = {}
-    for m in ("acc", "auc", "f1"):
-        r = res[m]
-        nums[f"{names[m]}: pooled ID / OOD / shift"] = (pooled[m][0], pooled[m][1], pooled[m][0] - pooled[m][1])
-        nums[f"{names[m]}: per-tile ID [95% CI]"] = (r["ID"], *r["ci_ID"])
-        nums[f"{names[m]}: per-tile OOD [95% CI]"] = (r["A"], *r["ci_A"])
-        nums[f"{names[m]}: per-tile shift [95% CI]"] = (r["gap"], *r["ci"])
-        nums[f"{names[m]}: tiles used, tiles with a positive gap"] = (r["n_tiles"], r["tiles_pos"])
-        nums[f"{names[m]}: Wilcoxon signed-rank p, Holm-adjusted p"] = (r["wilcoxon_p"], p_holm[m])
-        nums[f"{names[m]}: shift at 95% confidence (Wilcoxon, Holm)?"] = "yes" if p_holm[m] < 0.05 else "no"
-        nums[f"{names[m]}: check, sign-flip test of the mean tile gap: p, Holm-adjusted p"] = (p_perm[m], p_perm_holm[m])
-        nums[f"{names[m]}: median tile gap"] = float(np.median(d_tiles[m]))
-    nums["share of models worse on Zone A (per-tile accuracy)"] = float(stored["tile_acc_raw_worse"])
-    nums["top-15 test models, per-tile accuracy shift [CI]"] = (stored["tile_strong15_acc_raw_gap"], stored["tile_strong15_acc_raw_ci_lo"], stored["tile_strong15_acc_raw_ci_hi"])
-    nums["corr_te on all Zone A [CI] (58 test models)"] = (stored["r_full_test"], stored["r_full_test_ci_lo"], stored["r_full_test_ci_hi"])
-    nums["Palm Beach: share of Zone AE / Zone A test points"] = (pb_id.mean(), pb_ood.mean())
-    nums["Palm Beach: points Zone AE / Zone A"] = (int(pb_id.sum()), int(pb_ood.sum()))
-    nums["Palm Beach: accuracy on its Zone AE / Zone A points (all models)"] = (Zi[:, pb_id].mean(), Zo[:, pb_ood].mean())
-    return tex, nums, checks_
+                     r"\textbf{Metric} & \textbf{Pooled} & \textbf{Per tile} \\", r"\midrule", *tex_rows,
+                     r"\bottomrule", r"\end{tabular}"])
+    return dict(name="tab_shift", label="tab:shift",
+                title=f"Table 1 (tab:shift): shift from Zone AE (ID) to Zone A (OOD), mean over all "
+                      f"{R['shift']['n_models']} models; per tile: mean over {s['acc']['n_tiles']} test tiles "
+                      f"({s['auc']['n_tiles']} for AUROC) with 95% t-intervals",
+                head=head, rows=txt_rows, tex=tex)
 
 
-def regions_part(run: Path, variant: str, m_ood: int, match_csv: Path | None = None,
-                 points_path: Path | None = None):
-    """Table tab:regions and the numbers of 'Covariate and concept shift'.
+def table_search(R):
+    r_all, (lo_all, hi_all) = R["shift"]["corr_te_all"], R["shift"]["corr_te_all_ci"]
+    tex_rows = [f"All Zone A & {sgn(r_all)} [{sgn(lo_all)}, {sgn(hi_all)}] & -- & -- \\\\"]
+    txt_rows = [["All Zone A", f"{sgn(r_all, 2, False)} [{sgn(lo_all, 2, False)}, {sgn(hi_all, 2, False)}]", "--", "--"]]
+    for label, search, sm in SEARCH_ROWS:
+        x = pick(R, search, REPORTED_S, sm)
+        if x is None:
+            tex_rows.append(f"{label} & \\textbf{{XX}} & \\textbf{{XX}} & \\textbf{{XX}} \\\\")
+            txt_rows.append([label.replace(r"\quad ", "  "), "missing", "missing", "missing"])
+            continue
+        tex_rows.append(f"{label} & {sgn(x.r_te)} [{sgn(x.ci_lo)}, {sgn(x.ci_hi)}] & {int(x.components)} "
+                        f"({int(x.comp_points)}) & {share(x.purity)} \\\\")
+        txt_rows.append([label.replace(r"\quad ", "  "),
+                         f"{sgn(x.r_te, 2, False)} [{sgn(x.ci_lo, 2, False)}, {sgn(x.ci_hi, 2, False)}]",
+                         f"{int(x.components)} ({int(x.comp_points)})", share(x.purity)])
+    head = r"\textbf{Points} & $\boldsymbol{\text{corr}_\text{te}}$ \textbf{[95\% CI]} & \textbf{\# Comps} & \textbf{Purity} \\"
+    tex = "\n".join([r"\begin{tabular}{@{}lccc@{}}", r"\toprule", head, r"\midrule", *tex_rows,
+                     r"\bottomrule", r"\end{tabular}"])
+    return dict(name="tab_search", label="tab:search",
+                title=f"Table 2 (tab:search): subset search at S = {REPORTED_S}; corr_te on the "
+                      f"{R['shift']['n_test_models']} test models; # Comps = components of >= {C_MIN} points (points "
+                      f"they hold)", head=["Points", "corr_te [95% CI]", "# Comps", "Purity"], rows=txt_rows, tex=tex)
 
-    match_csv: a region_match.csv whose main variant (--regions) is `variant`; it has the variant's
-    "Other Zone A points" row. Without it, the run's region_match.csv is used, where a variant other
-    than the main one only has its regions (extra_region rows) and the Other Zone A row is XX."""
-    path = match_csv if match_csv is not None else run / "region_match" / "region_match.csv"
-    rm = pd.read_csv(path)
-    meta = json.loads(path.with_suffix(".json").read_text()) if path.with_suffix(".json").exists() else {}
-    main_variant = variant in str(meta.get("regions", ""))
-    pre = "" if main_variant else f"{variant}: "
-    reg = (rm[rm.kind == "region"] if main_variant
-           else rm[rm.set.str.startswith(pre) & (rm.kind == "extra_region")]).copy()
-    reg["name"] = reg.set.str.replace(pre, "", regex=False) if pre else reg.set
-    pts = pd.read_parquet(points_path or run / "regions" / f"{TAG}_{variant}_S{REPORTED_S}_points.parquet")
-    lon = pts.groupby("component").lon.mean()
-    # Name each region by the county that holds most of its points (region_match.py joins every
-    # county with at least one point, so one stray point added a county to the name).
-    county = dict(pd.read_parquet(COUNTIES, columns=["GEOID", "NAME"]).values)
-    majority = pts.groupby("component").meta_point_county.agg(lambda c: c.astype(str).value_counts().index[0])
-    reg["name_all_counties"] = reg["name"]
-    reg["name"] = reg.component.map(majority).map(lambda f: county.get(f, f))
-    for name, g in reg.groupby("name"):
-        if len(g) > 1:                      # same county name: east / west by mean longitude
-            order = g.component.map(lon).sort_values().index
-            for side, i in zip(["west", "east"] if len(g) == 2 else range(len(g)), order):
-                reg.loc[i, "name"] = f"{name} ({side})"
-    n, nm = reg.n.sum(), reg.n_matched.sum()
-    pooled = dict(n=int(n), unmatched=1 - nm / n, eta=float((reg.eta * reg.n_matched).sum() / nm),
-                  pos_points=float((reg.pos_points * reg.n).sum() / n),
-                  pos_matches=float((reg.pos_matches * reg.n_matched).sum() / nm))
-    base = rm[rm.set == "Zone AE baseline"].iloc[0]
-    other = rm[rm.set == f"{pre}Other Zone A points"]
 
-    def line(name, n_, pp, pm, un, eta):   # pp, pm (flood shares) kept in numbers.md, not in the table
-        return f"{name} & {n_:,} & {share(un)} & {share(eta)} \\\\"
-    body = [line(x["name"], int(x.n), x.pos_points, x.pos_matches, x.unmatched, x.eta)
-            for _, x in reg.sort_values("n", ascending=False).iterrows()]
-    body.append(r"\midrule")
-    body.append(line("All regions", pooled["n"], pooled["pos_points"], pooled["pos_matches"],
-                     pooled["unmatched"], pooled["eta"]))
-    if len(other):
-        o = other.iloc[0]
-        body.append(line("Other Zone A", int(o.n), o.pos_points, o.pos_matches, o.unmatched, o.eta))
-    else:
-        body.append(f"Other Zone A & {m_ood - REPORTED_S:,} & {XX} & {XX} \\\\")
-    body.append(line("Zone AE baseline", int(base.n), base.pos_points, base.pos_matches, base.unmatched, base.eta))
+def region_rows(R) -> pd.DataFrame:
+    m = R["match"].copy()
+    reg = m[m.kind == "region"].copy()
+    reg["n_sort"] = -reg.n
+    return reg.sort_values(["n_sort", "name"]).drop(columns="n_sort")
+
+
+def table_regions(R):
+    m = R["match"]
+    tex_rows, txt_rows = [], []
+
+    def line(name, n, un, eta):
+        tex_rows.append(f"{name} & {n:,} & {share(un)} & {share(eta)} \\\\")
+        txt_rows.append([name, f"{n:,}", share(un), share(eta)])
+    for _, x in region_rows(R).iterrows():
+        line(x["name"], int(x.n), x.unmatched, x.eta)
+    tex_rows.append(r"\midrule")
+    txt_rows.append(None)
+    for kind, label in (("pooled", "All regions"), ("other", "Other Zone A"), ("baseline", "Zone AE baseline")):
+        x = m[m.kind == kind].iloc[0]
+        line(label, int(x.n), x.unmatched, x.eta)
     tex = "\n".join([r"\begin{tabular}{@{}lccc@{}}", r"\toprule",
                      r"\textbf{Region} & \textbf{\# Points} & \textbf{Unmatched} & $\boldsymbol{\eta}$ \\",
-                     r"\midrule", *body, r"\bottomrule", r"\end{tabular}"])
-    nums = {"regions": len(reg), "points in regions": pooled["n"],
-            "pooled unmatched": pooled["unmatched"], "largest region unmatched": float(reg.unmatched.max()),
-            "pooled eta": pooled["eta"], "baseline eta": float(base.eta), "baseline unmatched": float(base.unmatched),
-            "region eta range": (float(reg.eta.min()), float(reg.eta.max())),
-            "regions above baseline eta": int((reg.eta > base.eta).sum()),
-            "Other Zone A row": "present" if len(other) else "missing (XX)",
-            "region names (majority county | every county)": dict(zip(reg.name, reg.name_all_counties)),
-            "flood share, points / matches": {r["name"]: (round(r.pos_points, 2), round(r.pos_matches, 2))
-                                              for _, r in reg.iterrows()},
-            "Other Zone A unmatched, eta": ((float(other.iloc[0].unmatched), float(other.iloc[0].eta))
-                                            if len(other) else "missing"),
-            "source": str(path)}
-    return tex, nums
+                     r"\midrule", *tex_rows, r"\bottomrule", r"\end{tabular}"])
+    s = R["match_summary"]
+    return dict(name="tab_regions", label="tab:regions",
+                title=f"Table 3 (tab:regions): matched inputs of the regions of GTV + smoothing at S = {REPORTED_S} "
+                      f"(caliper eps = {s['eps']:.2f} on q = {s['q']} features, at most {s['max_matches']} matches)",
+                head=["Region", "# Points", "Unmatched", "eta"], rows=txt_rows, tex=tex)
 
 
-def search_tables(rows: pd.DataFrame, full_zone_a):
-    def pick(search, S, smoothed):
-        g = rows[(rows.search == search) & (rows.S == S) & (rows.smoothing == smoothed)]
-        return None if g.empty else g.iloc[0]
-
-    def cells(x):
-        if x is None:
-            return f"{XX} & {XX} & {XX}"
-        return (f"{sgn(x.r_te)} [{sgn(x.ci_lo)}, {sgn(x.ci_hi)}] & {int(x.components)} ({int(x.comp_points)}) & "
-                f"{share(x.purity)}")
-    r_all, lo_all, hi_all = full_zone_a
-    # Row names as in the paper (Victor's style): the post-hoc baseline is "Smoothing".
-    search = [f"All Zone A & {sgn(r_all)} [{sgn(lo_all)}, {sgn(hi_all)}] & -- & -- \\\\"]
-    for label, (name, sm) in SEARCH_ROWS:
-        search.append(f"{label} & {cells(pick(name, REPORTED_S, sm))} \\\\")
-    head = r"\textbf{Points} & $\boldsymbol{\text{corr}_\text{te}}$ \textbf{[95\% CI]} & \textbf{\# Comps} & \textbf{Purity} \\"
-    tab_search = "\n".join([r"\begin{tabular}{@{}lccc@{}}", r"\toprule", head, r"\midrule", *search,
-                            r"\bottomrule", r"\end{tabular}"])
-    c_lines = []
-    for label, (search_name, sm) in SEARCH_ROWS:
-        x = pick(search_name, REPORTED_S, sm)
-        cs = [XX if x is None else f"{int(x[f'comp_c{c}'])} ({int(x[f'pts_c{c}'])})" for c in C_GRID]
-        c_lines.append(f"{label} & " + " & ".join(cs) + r" \\")
-    head_c = r"\textbf{Search} & " + " & ".join(rf"$\boldsymbol{{c={c}}}$" for c in C_GRID) + r" \\"
-    tab_c = "\n".join([r"\begin{tabular}{@{}l" + "c" * len(C_GRID) + "@{}}", r"\toprule", head_c,
-                       r"\midrule", *c_lines, r"\bottomrule", r"\end{tabular}"])
-    abl = [f"Laplacian & {cells(pick('Laplacian', REPORTED_S, False))} \\\\",
-           rf"\quad + smoothing & {cells(pick('Laplacian', REPORTED_S, True))} \\",
-           f"GTV & {cells(pick('GTV', REPORTED_S, False))} \\\\",
-           rf"\quad + smoothing & {cells(pick('GTV', REPORTED_S, True))} \\"]
-    head_s = head.replace(r"\textbf{Points}", r"\textbf{Search}")
-    tab_abl = "\n".join([r"\begin{tabular}{@{}lccc@{}}", r"\toprule", head_s, r"\midrule", *abl,
-                         r"\bottomrule", r"\end{tabular}"])
-    mu_lines = []
-    for mu in (1, 3, 10):
-        name = "GTV" if mu == 3 else f"GTV mu={mu}"
-        cs = []
-        for S in ABLATION_BUDGETS:
-            x = pick(name, S, False)
-            cs.append(f"{XX} / {XX}" if x is None else f"{sgn(x.r_te)} / {share(x.purity)}")
-        mu_lines.append(f"{mu} & " + " & ".join(cs) + r" \\")
-    tab_mu = "\n".join([r"\begin{tabular}{@{}lccc@{}}", r"\toprule",
-                        r"$\boldsymbol{\mu}$ & $\boldsymbol{S=250}$ & $\boldsymbol{S=500}$ & $\boldsymbol{S=1{,}000}$ \\",
-                        r"\midrule", *mu_lines, r"\bottomrule", r"\end{tabular}"])
-    return tab_search, tab_abl, tab_mu, tab_c
+def table_models(R):
+    fam = R["zoo"]["families"]
+    tex_rows, txt_rows = [], []
+    for code, name, grid in MODEL_ROWS:
+        f = fam.get(code, dict(settings=0, models=0))
+        tex_rows.append(f"{name} & {grid} & {f['settings']} & {f['models']} \\\\")
+        txt_rows.append([name, str(f["settings"]), str(f["models"])])
+    tex_rows += [r"\midrule", f"Total & & {R['zoo']['settings']} & {R['zoo']['kept']} \\\\"]
+    txt_rows += [None, ["Total", str(R["zoo"]["settings"]), str(R["zoo"]["kept"])]]
+    tex = "\n".join([r"\begin{tabular}{@{}lp{0.6\textwidth}rr@{}}", r"\toprule",
+                     r"\textbf{Family} & \textbf{Grid} & \textbf{Settings} & \textbf{Models} \\", r"\midrule",
+                     *tex_rows, r"\bottomrule", r"\end{tabular}"])
+    return dict(name="tab_models", label="tab:models",
+                title="Appendix Table tab:models: grid settings and models kept per family",
+                head=["Family", "Settings", "Models"], rows=txt_rows, tex=tex)
 
 
-def budget_numbers(rows: pd.DataFrame, m_ood: int):
-    p = rows[~rows.smoothing & rows.search.isin(["OODSelect", "Laplacian", "GTV"])]
-    r = p.pivot(index="S", columns="search", values="r_te")
-    pu = p.pivot(index="S", columns="search", values="purity")
-    pc = p.pivot(index="S", columns="search", values="pieces")
-    nc = p.pivot(index="S", columns="search", values="components")
-    ic = p.pivot(index="S", columns="search", values="in_components")
-    mid = [s for s in r.index if 20 <= s <= 10000]
-    s50 = [s for s in r.index if 50 <= s <= 10000]
-    s250 = [s for s in r.index if 250 <= s <= 10000]
-    big = max(r.index)
-    return {
-        "every search inverts (r_te < -0.3) up to 10,000": bool((r.loc[:10000] < -0.3).all().all()),
-        f"r_te at the largest budget {big} ({big / m_ood:.1%} of Zone A)": r.loc[big].round(2).to_dict(),
-        "GTV has the highest purity at every budget 20-10,000": all(pu.loc[s, "GTV"] >= pu.loc[s].max() for s in mid),
-        "GTV has the fewest pieces at every budget 20-10,000": all(pc.loc[s, "GTV"] <= pc.loc[s].min() for s in mid),
-        "components (>= 20 points) by budget": nc.astype(int).to_dict("index"),
-        "share of selected points in components by budget": ic.round(2).to_dict("index"),
-        "GTV purity range, 50-10,000": (float(pu.loc[s50, "GTV"].min()), float(pu.loc[s50, "GTV"].max())),
-        "GTV - Laplacian r_te gap range, 250-10,000": (float((r.loc[s250, "GTV"] - r.loc[s250, "Laplacian"]).min()),
-                                                       float((r.loc[s250, "GTV"] - r.loc[s250, "Laplacian"]).max())),
-        "Laplacian purity at 20 and 250": (float(pu.loc[20, "Laplacian"]), float(pu.loc[250, "Laplacian"])),
-        "random purity at S = 500 (S/m)": REPORTED_S / m_ood,
-    }
+def tables(R) -> list[dict]:
+    out = []
+    if R["shift"] is not None:
+        out.append(table_shift(R))
+        if R["subsets"] is not None:
+            out.append(table_search(R))
+    if R["match"] is not None and R["match_summary"] is not None:
+        out.append(table_regions(R))
+    if R["zoo"] is not None:
+        out.append(table_models(R))
+    return out
 
 
-def fmt(v):
-    if isinstance(v, (tuple, list)):
-        return "(" + ", ".join(fmt(x) for x in v) + ")"
-    if isinstance(v, (float, np.floating)):
-        return f"{v:.4f}"
-    return str(v)
+def render(table: dict) -> str:
+    """A table as aligned plain text with its title."""
+    rows = [r for r in table["rows"] if r is not None]
+    widths = [max(len(str(c)) for c in col) for col in zip(table["head"], *rows)]
+    sep = "  ".join("-" * w for w in widths)
+
+    def fmt(r):
+        return "  ".join(str(c).ljust(w) if i == 0 else str(c).rjust(w) for i, (c, w) in enumerate(zip(r, widths)))
+    lines = [table["title"], sep, fmt(table["head"]), sep]
+    for r in table["rows"]:
+        lines.append(sep if r is None else fmt(r))
+    lines.append(sep)
+    return "\n".join(lines)
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--run", type=Path, default=Path("results/2026-11-07"))
-    ap.add_argument("--cells", type=Path, default=Path("data/interim/aotil/cells_v4_2026-11-07"))
-    ap.add_argument("--dataset", type=Path, default=Path("data/processed_v4/dataset_FL.parquet"))
-    # The paper analyzes the regions of GTV followed by smoothing (since 2026-11-11). For GTV alone:
-    #   --regions-variant spatial_gtv_mu3_knn10 --region-match results/2026-11-11/region_match_gtv/region_match.csv
-    #   --regions-points results/2026-11-07/regions/FL_band_AE_s0_spatial_gtv_mu3_knn10_S500_points.parquet
-    ap.add_argument("--regions-variant", default="spatial_gtv_mu3_knn10_smoothed")
-    ap.add_argument("--region-match", type=Path,
-                    default=Path("results/2026-11-11/region_match_gtv_smoothed/region_match.csv"),
-                    help="region_match.csv run with --regions-variant as its main variant (gives Other Zone A)")
-    ap.add_argument("--regions-points", type=Path,
-                    default=Path("results/2026-11-11/regions_gtv_smoothed/FL_band_AE_s0_spatial_gtv_mu3_knn10_smoothed_S500_points.parquet"),
-                    help="regions.py points table of --regions-variant")
-    ap.add_argument("--tile-ci", choices=["t", "bootstrap"], default="t",
-                    help="per-tile intervals: t over the tiles (paper) or o1_shift's tile bootstrap")
-    ap.add_argument("--out", type=Path, default=Path(f"results/{dt.date.today():%Y-%m-%d}/paper_numbers"))
-    a = ap.parse_args()
-    a.out.mkdir(parents=True, exist_ok=True)
-
-    z, Z_ood, acc_id, test = load_cell(a.cells)
-    Z_id = correctness(z["S_id"], z["y_id"])
-    A = graph.build_adjacency(z["lon"], z["lat"], k=KNN)
-    checks.A = A
-    xy = graph.project(z["lon"], z["lat"])
-    rows = search_rows(a.run, z, Z_ood, acc_id, test, A)
-    rows.to_csv(a.out / "budgets.csv", index=False)
-
-    tab_shift, shift_nums, shift_checks = shift_part(a.run, z, test, a.dataset, a.cells, a.tile_ci)
-    tab_regions, region_nums = regions_part(a.run, a.regions_variant, Z_ood.shape[1],
-                                            a.region_match if a.region_match.exists() else None,
-                                            a.regions_points)
-    tab_search, tab_abl, tab_mu, tab_c = search_tables(rows, shift_nums["corr_te on all Zone A [CI] (58 test models)"])
-    for name, tex in [("tab_shift", tab_shift), ("tab_search", tab_search), ("tab_regions", tab_regions),
-                      ("tab_mu", tab_mu), ("tab_c", tab_c)]:  # tab_ablation merged into tab_search
-        (a.out / f"{name}.tex").write_text(tex + "\n")
-
-    def pick(search, S, sm):
-        g = rows[(rows.search == search) & (rows.S == S) & (rows.smoothing == sm)]
-        return None if g.empty else g.iloc[0]
-    search_nums = {}
-    for search in ["OODSelect", "Laplacian", "GTV"]:
-        for sm in (False, True):
-            x = pick(search, REPORTED_S, sm)
-            if x is not None:
-                search_nums[f"{search}{' + smoothing' if sm else ''} at S = 500: r_te [CI], components, share in components, all connected pieces, purity"] = (
-                    x.r_te, x.ci_lo, x.ci_hi, int(x.components), x.in_components, int(x.pieces), x.purity)
-    pts = pd.read_parquet(a.regions_points)
-    search_nums[f"{a.regions_variant} S = 500: regions of >= 20 points, points in them"] = (
-        int((pts.groupby('component').size() >= 20).sum()), int((pts.component_size >= 20).sum()))
-
-    md = [f"# Paper numbers from `{a.run}` (cell `{a.cells}`)", "",
-          f"Written {dt.datetime.now():%Y-%m-%d %H:%M} by aotil/paper_numbers.py. Tables: the .tex files here.", ""]
-    for title, nums in [("The shift (Table tab:shift; test: two-sided Wilcoxon signed-rank over tiles, Holm across the three metrics)", shift_nums),
-                        ("Searches at S = 500 (Tables tab:search, tab:ablation; paragraph Our loss)", search_nums),
-                        ("Covariate and concept shift (Table tab:regions)", region_nums),
-                        ("Sensitivity: budget (Figure fig:budgets)", budget_numbers(rows, Z_ood.shape[1]))]:
-        md += [f"## {title}", ""] + [f"- {k}: {fmt(v)}" for k, v in nums.items()] + [""]
-    missing = [f"GTV mu = {mu}" for mu, v in MU_VARIANTS.items() if not (a.run / "oodselect_paper" / v).exists()]
-    md += ["## Missing inputs (XX in the tables)", ""] + ([f"- {m}: no weight files" for m in missing] or ["- none"])
-    if region_nums["Other Zone A row"] != "present":
-        md.append(f"- Other Zone A for {a.regions_variant}: no row in region_match.csv")
-    md += [""] + checks(a.run, rows, z, Z_ood, acc_id, test, xy) + shift_checks
-    (a.out / "numbers.md").write_text("\n".join(md) + "\n")
-    print("\n".join(md))
-    print(f"\nwrote {a.out}/numbers.md, budgets.csv and 5 tables (tab_shift, tab_search, tab_regions, tab_mu, tab_c)")
+# ------------------------------------------------------------------ the mu sweep
+def mu_sweep(R) -> dict | None:
+    """The mu sweep at S = 500: one row per (loss, mu, smoothing), the OODSelect reference, the XX values of the
+    "Regularization weight" paragraph and the answers to its % CHECK."""
+    t = R["subsets"]
+    if t is None:
+        return None
+    sw = t[(t.S == REPORTED_S) & t.search.isin(["Laplacian", "GTV"])].sort_values(["search", "smoothing", "mu"])
+    if sw.empty:
+        return None
+    ref = t[(t.search == "OODSelect") & (t.S == REPORTED_S)].set_index("smoothing")
+    out = dict(table=sw, reference=ref)
+    plain = sw[~sw.smoothing]
+    grid = sorted(plain.mu.unique())
+    out["mus"] = grid
+    out["complete"] = all(len(plain[plain.search == s]) == 9 for s in ("Laplacian", "GTV"))
+    trend = {}
+    for s in ("GTV", "Laplacian"):
+        g = plain[plain.search == s].sort_values("mu")
+        if len(g) < 2:
+            continue
+        from scipy.stats import spearmanr
+        trend[s] = dict(mu_lo=float(g.mu.iloc[0]), mu_hi=float(g.mu.iloc[-1]),
+                        purity_lo=float(g.purity.iloc[0]), purity_hi=float(g.purity.iloc[-1]),
+                        r_lo=float(g.r_te.iloc[0]), r_hi=float(g.r_te.iloc[-1]),
+                        purity_rises=bool(np.all(np.diff(g.purity.to_numpy()) >= 0)),
+                        purity_spearman=float(spearmanr(g.mu, g.purity)[0]),
+                        purity_drops=[f"{a:g}->{b:g}" for a, b, d in zip(g.mu[:-1], g.mu[1:],
+                                                                         np.diff(g.purity.to_numpy())) if d < 0],
+                        r_weakens=bool(np.all(np.diff(g.r_te.to_numpy()) >= 0)),
+                        r_spearman=float(spearmanr(g.mu, g.r_te)[0]),
+                        r_strengthens=[f"{a:g}->{b:g}" for a, b, d in zip(g.mu[:-1], g.mu[1:],
+                                                                          np.diff(g.r_te.to_numpy())) if d < 0])
+    out["trend"] = trend
+    out["matched"] = matched_purity(plain)
+    return out
 
 
-if __name__ == "__main__":
-    main()
+def matched_purity(plain: pd.DataFrame) -> dict | None:
+    """corr_te of the two losses at the same purity: each loss's corr_te interpolated linearly in purity (points
+    sorted by purity) over the purities both reach; the mean and range of GTV minus Laplacian."""
+    curves = {}
+    for s in ("GTV", "Laplacian"):
+        g = plain[plain.search == s].sort_values("purity")
+        if len(g) < 2:
+            return None
+        curves[s] = (g.purity.to_numpy(), g.r_te.to_numpy())
+    lo = max(c[0].min() for c in curves.values())
+    hi = min(c[0].max() for c in curves.values())
+    if hi <= lo:
+        return dict(overlap=None)
+    grid = np.linspace(lo, hi, 101)
+    diff = np.interp(grid, *curves["GTV"]) - np.interp(grid, *curves["Laplacian"])
+    stronger = "GTV" if diff.mean() < 0 else "Laplacian"
+    at_points = []
+    for s, other in (("GTV", "Laplacian"), ("Laplacian", "GTV")):
+        p, r = curves[s]
+        for pi, ri in zip(p, r):
+            if lo <= pi <= hi:
+                at_points.append(dict(search=s, purity=float(pi), r_te=float(ri),
+                                      other_r_te=float(np.interp(pi, *curves[other]))))
+    return dict(overlap=(float(lo), float(hi)), mean_gtv_minus_lap=float(diff.mean()),
+                min_gtv_minus_lap=float(diff.min()), max_gtv_minus_lap=float(diff.max()),
+                share_gtv_stronger=float((diff < 0).mean()), stronger=stronger, at_points=at_points)
+
+
+# ------------------------------------------------------------------ numbers
+def numbers(R) -> list[tuple[str, list[dict]]]:
+    """(paragraph, items); item = dict(label, value, phrase): value as the paper prints it, phrase the text the
+    paper should contain with this value (None: nothing to check)."""
+    secs = []
+
+    def item(label, value, phrase=None, raw=None):
+        return dict(label=label, value=value, phrase=phrase, raw=raw)
+    z, d, s = R["zoo"], R["data"], R["shift"]
+    gtv_sm = pick(R, "GTV", REPORTED_S, True)
+    ood = pick(R, "OODSelect", REPORTED_S, False)
+    reg = region_rows(R) if R["match"] is not None else None
+    pooled = R["match"][R["match"].kind == "pooled"].iloc[0] if R["match"] is not None else None
+
+    if z and s and gtv_sm is not None and ood is not None and pooled is not None:
+        a = s["metrics"]["acc"]
+        secs.append(("Introduction", [
+            item("models", str(z["kept"]), f"We train {z['kept']} tabular models"),
+            item("per-tile accuracy loss on Zone A", gap(a["tile_delta"], 3, False),
+                 f"models lose {gap(a['tile_delta'], 3, False)} accuracy on Zone A"),
+            item("corr on all Zone A", share(s["corr_te_all"]), f"a correlation of {share(s['corr_te_all'])}"),
+            item("OODSelect corr_te", f"{ood.r_te:.2f}", f"inverts to ${ood.r_te:.2f}$"),
+            item("OODSelect components (>= 20 points)", str(int(ood.components)),
+                 "none of its points form a region of at least 20 points" if int(ood.components) == 0 else None),
+            item("GTV + smoothing: points in regions, regions", f"{int(gtv_sm.comp_points)} of {REPORTED_S}, "
+                 f"{int(gtv_sm.components)}",
+                 f"places {int(gtv_sm.comp_points)} of its {REPORTED_S} points in {word(gtv_sm.components)} such regions"),
+            item("GTV + smoothing corr_te", f"{gtv_sm.r_te:.2f}", f"the correlation still inverts to ${gtv_sm.r_te:.2f}$"),
+            item("regions' label disagreement", pct(pooled.eta), f"disagree with their matches {pct(pooled.eta)} of the time"),
+        ]))
+    if d and z:
+        sets = d["sets"]
+        v = d["variogram"]
+        above = v["above_50km"]
+        t50, t110 = d["tiles"]["50km"], d["tiles"]["110km"]
+        secs.append(("Data Construction: Sampling, Split, Data statistics, Figure 1", [
+            item("points", thousands(d["points"]), f"which leaves {thousands(d['points'])} points"),
+            item("points by zone and label", ", ".join(f"{k} {v_:,}" for k, v_ in d["points_by_zone_label"].items())),
+            item("median variogram range", f"{v['median_km']:.0f} km", f"({v['median_km']:.0f} km)"),
+            item("features correlated beyond 50 km", ", ".join(f"{k} {x:.1f} km" for k, x in above.items()),
+                 f"over {min(above.values()):.0f} to {max(above.values()):.0f} km" if above else None),
+            item("110 km tiles: test tiles", str(t110["test_tiles"]),
+                 f"110 km tiles would leave only {t110['test_tiles']} test tiles"),
+            item("50 km tiles: tiles, test tiles", f"{t50['tiles']}, {t50['test_tiles']}",
+                 f"This leaves {t50['test_tiles']} test tiles"),
+            item("training tiles holding Zone AE training points (all training tiles)",
+                 f"{z['train_tiles_with_points']} ({z['train_tiles']})",
+                 f"Zone AE points of {z['train_tiles_with_points']} training tiles"),
+            item("model inputs", str(z["n_inputs"]), f"which gives {z['n_inputs']} model inputs"),
+            item("training / ID test / OOD points", f"{z['n_train']:,} / {z['n_id']:,} / {z['n_ood']:,}",
+                 f"The training set holds {z['n_train']:,} Zone AE points, the ID test set {z['n_id']:,}, and the "
+                 f"OOD set holds {z['n_ood']:,} Zone A points"),
+            item("flood shares (train, ID, OOD)", ", ".join(share(sets[k]["flood_share"]) for k in ("Train", "ID test", "OOD")),
+                 "with flood shares of " + ", ".join(share(sets[k]["flood_share"]) for k in ("Train", "ID test")) +
+                 f", and {share(sets['OOD']['flood_share'])}"),
+            item("missing: soil flood frequency, fluvial class",
+                 f"{100 * d['missing_share']['soil_floodfreq']:.1f}%, {100 * d['missing_share']['soil_fluvclass']:.1f}%",
+                 f"Soil flood frequency is missing for {100 * d['missing_share']['soil_floodfreq']:.1f}\\% of points and "
+                 f"fluvial class for {100 * d['missing_share']['soil_fluvclass']:.1f}\\%"),
+            item("Figure 1: the seven most common land cover classes",
+                 ", ".join(f"{c} {NLCD_NAMES.get(c, '?')}" for c in d["landcover_top7"]),
+                 ", ".join(f"{c} {NLCD_NAMES.get(c, '?')}" for c in d["landcover_top7"][:6]) +
+                 f", and {d['landcover_top7'][6]} {NLCD_NAMES.get(d['landcover_top7'][6], '?')}"),
+            item("50 km grid reproduces the dataset's tile_50km", str(d["grid_50km_reproduces_tile_50km"])),
+        ]))
+    if s:
+        lo, hi = s["tile_flood_share_range"]
+        secs.append(("Metrics", [
+            item("flood share within a tile (min, max over test tiles and both sets)", f"{lo:.2f} to {hi:.2f}",
+                 f"ranges from {lo:.2f} to {hi:.2f}"),
+            item("AUROC tiles", f"{s['metrics']['auc']['n_tiles']} of {s['metrics']['acc']['n_tiles']}",
+                 f"covers {s['metrics']['auc']['n_tiles']} of the {s['metrics']['acc']['n_tiles']} tiles"),
+        ]))
+    if d and s and R["subsets"] is not None:
+        m = n_ood(R)
+        bn = budget_numbers(R)
+        it = [item("S = 500 as a share of the OOD points", f"{100 * REPORTED_S / m:.1f}%",
+                   f"which is {100 * REPORTED_S / m:.1f}\\% of the OOD points")]
+        if bn:
+            it.append(item("largest budget at which all three searches invert (r_te < -0.3)", bn["largest_all_invert"],
+                           f"holds up to $S={tex_thousands(bn['largest_all_invert'])}$" if bn["largest_all_invert"] else None))
+        secs.append(("Budget penalty", it))
+        secs.append(("Graph", [
+            item("median distance to the 10th nearest neighbour (Zone A test points)", f"{d['median_10nn_km']:.2f} km",
+                 f"is {d['median_10nn_km']:.2f} km"),
+            item("random-subset purity S/m at S = 500", share(REPORTED_S / m), f"which is {share(REPORTED_S / m)} at $S=500$"),
+        ]))
+    if z:
+        secs.append(("Models", [
+            item("N", str(z["kept"]), f"The $N={z['kept']}$ models"),
+            item("selection / validation / test models", f"{z['n_selection']} / {z['n_validation']} / {z['n_test']}",
+                 f"into {z['n_selection']} selection, {z['n_validation']} validation, and {z['n_test']} test models"),
+        ]))
+    if R["match_summary"]:
+        ms = R["match_summary"]
+        secs.append(("Matching", [
+            item("caliper eps, q", f"{ms['eps']:.2f}, {ms['q']}", f"$\\epsilon={ms['eps']:.2f}$ on $q={ms['q']}$ features"),
+            item("Zone AE test points without a feature (not matched)", str(ms["pool_dropped"]),
+                 f"The {ms['pool_dropped']} Zone AE test points that lack a feature are not matched"),
+        ]))
+    if s:
+        a, u, f = (s["metrics"][k] for k in ("acc", "auc", "f1"))
+        pb = s["palm_beach"]
+        worst = s["most_negative_acc_tiles"]
+        secs.append(("Results: Aggregation hides the shift", [
+            item("pooled Delta (accuracy, AUROC, F1)", ", ".join(gap(x["pooled_delta"], 3, False) for x in (a, u, f)),
+                 None),
+            item("all three pooled Delta negative", str(all(x["pooled_delta"] < 0 for x in (a, u, f))),
+                 "Pooled, all three shifts are negative" if all(x["pooled_delta"] < 0 for x in (a, u, f)) else None),
+            item("Palm Beach tile: share of Zone AE / Zone A test points", f"{pb['share_id']:.0%} / {pb['share_ood']:.0%}",
+                 f"holds {pb['share_id']:.0%}\\% of the Zone AE test points but only {pb['share_ood']:.0%}\\% of the "
+                 f"Zone A test points".replace("%\\%", "\\%")),
+            item("Palm Beach tile: models' accuracy on its Zone AE points (all models)", share(pb["acc_id"]),
+                 f"the models average {share(pb['acc_id'])} accuracy on its Zone AE points"),
+            item("Palm Beach tile: id, county, points ID / OOD, accuracy on its Zone A points",
+                 f"{pb['tile']}, {pb['county_fips']}, {pb['n_id']:,} / {pb['n_ood']:,}, {pb['acc_ood']:.3f}"),
+            item("tiles where models do worse on Zone A (accuracy, AUROC, F1)",
+                 f"{a['tiles_worse']}/{a['n_tiles']}, {u['tiles_worse']}/{u['n_tiles']}, {f['tiles_worse']}/{f['n_tiles']}",
+                 f"{a['tiles_worse']} of {a['n_tiles']} in accuracy, {u['tiles_worse']} of {u['n_tiles']} in AUROC, "
+                 f"and {f['tiles_worse']} of {f['n_tiles']} in F1"),
+            item("Wilcoxon p, Holm-adjusted (AUROC, F1, accuracy)",
+                 f"{u['holm_p']:.3f}, {f['holm_p']:.3f}, {a['holm_p']:.3f}",
+                 f"shift in AUROC ($p={u['holm_p']:.3f}$) and F1 ($p={f['holm_p']:.3f}$) at 95\\% confidence, but not "
+                 f"in accuracy ($p={a['holm_p']:.3f}$)"),
+            item("Wilcoxon p, raw (accuracy, AUROC, F1)", f"{a['wilcoxon_p']:.4f}, {u['wilcoxon_p']:.4f}, {f['wilcoxon_p']:.4f}"),
+            item("shift at 95% (Holm) in AUROC / F1 / accuracy",
+                 " / ".join("yes" if x["holm_p"] < 0.05 else "no" for x in (u, f, a))),
+            item("per-tile Delta intervals include zero (accuracy, AUROC, F1)",
+                 ", ".join(str(x["ci_delta"][0] < 0 < x["ci_delta"][1]) for x in (a, u, f))),
+            item("most negative per-tile accuracy Delta (tile, county, Delta, flood share ID / OOD)",
+                 "; ".join(f"{w['tile']} {w['county']} {w['acc_delta']:+.2f} ({w['flood_id']:.2f} / {w['flood_ood']:.2f})"
+                           for w in worst)),
+            item("corr_te on all Zone A", sgn(s["corr_te_all"], 2, False), f"$\\text{{corr}}_\\text{{te}}=+{s['corr_te_all']:.2f}$"),
+        ]))
+    if R["subsets"] is not None and s:
+        rows = []
+        o, lap, gtv = (pick(R, n) for n in SEARCHES)
+        osm = pick(R, "OODSelect", REPORTED_S, True)
+        if o is not None:
+            rows += [item("OODSelect corr_te", f"{o.r_te:.2f}", f"OODSelect finds an inversion of ${o.r_te:.2f}$"),
+                     item("OODSelect: test tiles touched", f"{int(o.tiles)} of {s['metrics']['acc']['n_tiles']}",
+                          f"spread across {int(o.tiles)} of the {s['metrics']['acc']['n_tiles']} test tiles"),
+                     item("OODSelect components", str(int(o.components)))]
+        if gtv_sm is not None and gtv is not None and lap is not None and osm is not None:
+            rows += [
+                item("GTV + smoothing corr_te [CI]", f"{gtv_sm.r_te:.2f} [{gtv_sm.ci_lo:.2f}, {gtv_sm.ci_hi:.2f}]",
+                     f"keeps an inversion of ${gtv_sm.r_te:.2f}$ [${gtv_sm.ci_lo:.2f}$, ${gtv_sm.ci_hi:.2f}$]"),
+                item("GTV + smoothing points in components, components, purity",
+                     f"{int(gtv_sm.comp_points)}, {int(gtv_sm.components)}, {share(gtv_sm.purity)}",
+                     f"places {int(gtv_sm.comp_points)} of the {REPORTED_S} points in {word(gtv_sm.components)} components, "
+                     f"with a purity of {share(gtv_sm.purity)}"),
+                item("GTV alone corr_te, points, components, purity",
+                     f"{gtv.r_te:.2f}, {int(gtv.comp_points)}, {int(gtv.components)}, {share(gtv.purity)}",
+                     f"GTV alone inverts more (${gtv.r_te:.2f}$) but holds {int(gtv.comp_points)} points in "
+                     f"{word(gtv.components)} components, with a purity of {share(gtv.purity)}"),
+                item("Laplacian corr_te, components, points, purity",
+                     f"{lap.r_te:.2f}, {int(lap.components)}, {int(lap.comp_points)}, {share(lap.purity)}",
+                     f"The Laplacian inverts more still (${lap.r_te:.2f}$), but its {word(lap.components)} components hold "
+                     f"only {int(lap.comp_points)} points, and its purity is {share(lap.purity)}"),
+                item("OODSelect + smoothing corr_te, points, purity",
+                     f"{osm.r_te:.2f}, {int(osm.comp_points)}, {share(osm.purity)}",
+                     f"with an inversion of ${osm.r_te:.2f}$, but its components hold only {int(osm.comp_points)} points, "
+                     f"and its purity is {share(osm.purity)}"),
+                item("GTV + smoothing: test tiles touched", str(int(gtv_sm.tiles))),
+                item("ties at the cut of GTV + smoothing (stable sort)", str(int(gtv_sm.ties_at_cut))),
+            ]
+        if rows:
+            secs.append(("Results: OODSelect inverts / Spatial regularization forces regions / Figure 2", rows))
+    if R["match"] is not None and reg is not None:
+        base = R["match"][R["match"].kind == "baseline"].iloc[0]
+        other = R["match"][R["match"].kind == "other"].iloc[0]
+        secs.append(("Results: Concept shift without covariate shift (Table 3)", [
+            item("regions", str(len(reg)), f"matching results for the {word(len(reg))} regions"),
+            item("pooled unmatched vs baseline", f"{100 * pooled.unmatched:.1f}% vs {100 * base.unmatched:.0f}%",
+                 f"Pooled, {100 * pooled.unmatched:.1f}\\% of the regions' points have no match, against "
+                 f"{100 * base.unmatched:.0f}\\% in the Zone AE baseline"),
+            item("largest region unmatched share", f"{reg.unmatched.max():.3f}",
+                 "no region exceeds 5\\%" if reg.unmatched.max() <= 0.05 else None),
+            item("pooled eta vs baseline", f"{pooled.eta:.2f} vs {base.eta:.2f}",
+                 f"$\\eta={pooled.eta:.2f}$, against {base.eta:.2f} in the Zone AE baseline"),
+            item("regions above the baseline eta", f"{int((reg.eta > base.eta).sum())} of {len(reg)}",
+                 "every region lies above this baseline" if (reg.eta > base.eta).all() else None),
+            item("region eta range", f"{reg.eta.min():.2f} to {reg.eta.max():.2f}",
+                 f"from {reg.eta.min():.2f} to {reg.eta.max():.2f}"),
+            item("Other Zone A unmatched, eta", f"{100 * other.unmatched:.0f}%, {other.eta:.2f}",
+                 f"with {100 * other.unmatched:.0f}\\% unmatched and $\\eta={other.eta:.2f}$"),
+            item("flood share of the points / of their matches",
+                 "; ".join(f"{x['name']} {x.pos_points:.2f} / {x.pos_matches:.2f}" for _, x in reg.iterrows())
+                 + f"; all regions {pooled.pos_points:.2f} / {pooled.pos_matches:.2f}; Other Zone A "
+                   f"{other.pos_points:.2f} / {other.pos_matches:.2f}; baseline {base.pos_points:.2f} / "
+                   f"{base.pos_matches:.2f}"),
+        ]))
+    mu = mu_sweep(R)
+    if mu:
+        tr = mu["trend"]
+        it = []
+        if "GTV" in tr and "Laplacian" in tr:
+            g, l = tr["GTV"], tr["Laplacian"]
+            it.append(item("XX 1-2: GTV purity at the smallest -> largest mu", f"{share(g['purity_lo'])} to {share(g['purity_hi'])}"))
+            it.append(item("XX 3-4: Laplacian purity at the smallest -> largest mu", f"{share(l['purity_lo'])} to {share(l['purity_hi'])}"))
+            it.append(item("XX 5-6: GTV corr_te at the smallest -> largest mu", f"{g['r_lo']:.2f} to {g['r_hi']:.2f}"))
+            it.append(item("XX 7-8: Laplacian corr_te at the smallest -> largest mu", f"{l['r_lo']:.2f} to {l['r_hi']:.2f}"))
+            mp = mu["matched"]
+            if mp and mp.get("overlap"):
+                it.append(item("XX 9 and 10: the loss that inverts more strongly at the same purity", mp["stronger"]))
+                it.append(item("matched purity: overlap, mean / min / max of GTV minus Laplacian corr_te, share of "
+                               "the overlap where GTV inverts more",
+                               f"[{mp['overlap'][0]:.2f}, {mp['overlap'][1]:.2f}], {mp['mean_gtv_minus_lap']:+.3f} / "
+                               f"{mp['min_gtv_minus_lap']:+.3f} / {mp['max_gtv_minus_lap']:+.3f}, "
+                               f"{mp['share_gtv_stronger']:.0%}"))
+            for name in ("GTV", "Laplacian"):
+                x = tr[name]
+                it.append(item(f"CHECK {name}: purity rises with mu (every step; Spearman)",
+                               f"{x['purity_rises']} ({x['purity_spearman']:+.2f}; drops at {', '.join(x['purity_drops']) or 'none'})"))
+                it.append(item(f"CHECK {name}: corr_te weakens with mu (every step; Spearman)",
+                               f"{x['r_weakens']} ({x['r_spearman']:+.2f}; strengthens at {', '.join(x['r_strengthens']) or 'none'})"))
+        it.append(item("grid complete (9 mu per loss)", str(mu["complete"])))
+        secs.append(("Analysis: Regularization weight (Figure fig:mu; the XX of its paragraph)", it))
+    bn = budget_numbers(R)
+    if bn:
+        secs.append(("Analysis: Budget (Figure fig:budgets)", [
+            item("budgets in the grid", ", ".join(str(x) for x in bn["budgets"])),
+            item("without smoothing, every search inverts (r_te < -0.3) at every budget up to 10,000",
+                 str(bn["plain_all_invert_to_10000"]),
+                 "all three searches invert at every budget up to 10,000 points" if bn["plain_all_invert_to_10000"] else None),
+            item("with smoothing, the smallest budget from which all three invert up to 10,000", str(bn["smoothed_from"]),
+                 f"with smoothing, they do from {bn['smoothed_from']} points up" if bn["smoothed_from"] else None),
+            item("r_te at the largest budget (share of Zone A), alone / + smoothing",
+                 f"S = {bn['largest']:,} ({bn['largest_share']:.0%}): " + "; ".join(
+                     f"{k} {v[0]:+.2f} / {v[1]:+.2f}" for k, v in bn["r_largest"].items()),
+                 f"At {bn['largest']:,} points, which is {bn['largest_share']:.0%}".replace("%", "\\%") + " of Zone A, none does"
+                 if bn["none_inverts_at_largest"] else None),
+            item("GTV has the highest purity at every budget 20-10,000 (alone, + smoothing)",
+                 f"{bn['gtv_most_coherent'][0]}, {bn['gtv_most_coherent'][1]}",
+                 "GTV is the most coherent search at every budget from 20 to 10,000 points" if all(bn["gtv_most_coherent"]) else None),
+            item("GTV + smoothing purity, 50-10,000", f"{bn['gtv_sm_purity'][0]:.2f} to {bn['gtv_sm_purity'][1]:.2f}",
+                 f"its purity stays between {bn['gtv_sm_purity'][0]:.2f} and {bn['gtv_sm_purity'][1]:.2f} from 50 points up"),
+            item("GTV + smoothing inverts less than Laplacian + smoothing, 250-10,000 (r_te gap)",
+                 f"{bn['gtv_vs_lap_sm'][0]:.2f} to {bn['gtv_vs_lap_sm'][1]:.2f}",
+                 f"it inverts {bn['gtv_vs_lap_sm'][0]:.2f} to {bn['gtv_vs_lap_sm'][1]:.2f} less than the Laplacian with "
+                 f"smoothing from 250 points up"),
+            item("Laplacian alone, purity at 20 and 250", f"{bn['lap_purity_20']:.2f}, {bn['lap_purity_250']:.2f}",
+                 f"its purity drops to {bn['lap_purity_20']:.2f} at 20 points and to {bn['lap_purity_250']:.2f} at 250 points"),
+            item("r_te by budget, alone", bn["r_plain"]),
+            item("r_te by budget, + smoothing", bn["r_smoothed"]),
+        ]))
+    if R["subsets"] is not None:
+        rows = []
+        trio = [(n, pick(R, n), pick(R, n, REPORTED_S, True)) for n in SEARCHES]
+        if all(p is not None and q is not None for _, p, q in trio):
+            rows.append(item("purity alone -> + smoothing (OODSelect, Laplacian, GTV)",
+                             ", ".join(f"{share(p.purity)} to {share(q.purity)}" for _, p, q in trio),
+                             f"from {share(trio[0][1].purity)} to {share(trio[0][2].purity)} for OODSelect, from "
+                             f"{share(trio[1][1].purity)} to {share(trio[1][2].purity)} for the Laplacian, and from "
+                             f"{share(trio[2][1].purity)} to {share(trio[2][2].purity)} for GTV"))
+            # Read from Table 2 (the paper's Ablation reads its rounded values): -0.85 -> -0.80 is 0.05.
+            w = [round(q.r_te, 2) - round(p.r_te, 2) for _, p, q in trio]
+            w_raw = [q.r_te - p.r_te for _, p, q in trio]
+            rows.append(item("corr_te weakens by (OODSelect, Laplacian, GTV), from Table 2's rounded values "
+                             "(unrounded in parentheses)",
+                             ", ".join(f"{x:.2f} ({y:.3f})" for x, y in zip(w, w_raw)),
+                             f"weakens by {min(w):.2f} to {max(w):.2f}"))
+            lap_sm, gtv_al = trio[1][2], trio[2][1]
+            rows.append(item("Laplacian + smoothing vs GTV alone: purity, points in components",
+                             f"{share(lap_sm.purity)} vs {share(gtv_al.purity)}, {int(lap_sm.comp_points)} vs "
+                             f"{int(gtv_al.comp_points)}",
+                             f"with a purity of {share(lap_sm.purity)} against {share(gtv_al.purity)}, but its components "
+                             f"hold fewer points, {int(lap_sm.comp_points)} against {int(gtv_al.comp_points)}"))
+            g = trio[2][2]
+            rows.append(item("GTV + smoothing: points in components, components", f"{int(g.comp_points)}, {int(g.components)}",
+                             f"with {int(g.comp_points)} points in {word(g.components)} components"))
+        if rows:
+            secs.append(("Analysis: Ablation (smoothing)", rows))
+    if z:
+        fam_secs = R["manifest"]["stages"].get("zoo", {}).get("fit_secs") if R.get("manifest") else None
+        searches = R["subsets"]
+        med = None
+        if searches is not None and R.get("manifest"):
+            secs_ = [u.get("secs") for k, u in R["manifest"].get("units", {}).items() if u.get("secs")]
+            med = float(np.median(secs_)) if secs_ else None
+        secs.append(("Appendix", [
+            item("settings, degenerate, duplicates, N", f"{z['settings']}, {z['degenerate']}, {z['duplicate']}, {z['kept']}",
+                 f"Of the {z['settings']} settings, {z['degenerate']} predicts one class for more than 95\\% of the ID test "
+                 f"points, and {z['duplicate']} repeat the predictions of an earlier setting, which leaves $N={z['kept']}$ models"),
+            item("training points", f"{z['n_train']:,}", f"all {z['n_train']:,} training points"),
+            item("time to fit the 369 settings (this run)", f"{fam_secs:.0f} s" if fam_secs else "n/a"),
+            item("median search wall time (this run, searches run in parallel)", f"{med / 60:.1f} min" if med else "n/a"),
+        ]))
+    return secs
+
+
+def budget_numbers(R) -> dict | None:
+    t = budget_grid(R)
+    if t is None or t.empty:
+        return None
+    full = all(len(t[(t.search == s) & (t.smoothing == sm)]) == 13 for s in SEARCHES for sm in (False, True))
+    if not full:
+        return None
+    m = n_ood(R)
+    r = {sm: t[t.smoothing == sm].pivot(index="S", columns="search", values="r_te") for sm in (False, True)}
+    pu = {sm: t[t.smoothing == sm].pivot(index="S", columns="search", values="purity") for sm in (False, True)}
+    budgets = sorted(r[False].index)
+    largest = budgets[-1]
+    upto = [b for b in budgets if b <= 10000]
+    inv = r[False] < -0.3
+    largest_all = max((b for b in budgets if inv.loc[:b].all().all()), default=None)
+    sm_inv = r[True] < -0.3
+    sm_from = None
+    for b in upto:
+        if sm_inv.loc[[x for x in upto if x >= b]].all().all():
+            sm_from = b
+            break
+    mid = [b for b in budgets if 20 <= b <= 10000]
+    s50 = [b for b in budgets if 50 <= b <= 10000]
+    s250 = [b for b in budgets if 250 <= b <= 10000]
+    gap_sm = (r[True].loc[s250, "GTV"] - r[True].loc[s250, "Laplacian"])
+    return dict(budgets=budgets, largest_all_invert=largest_all,
+                plain_all_invert_to_10000=bool(inv.loc[upto].all().all()), smoothed_from=sm_from,
+                largest=largest, largest_share=largest / m,
+                r_largest={s: (float(r[False].loc[largest, s]), float(r[True].loc[largest, s])) for s in SEARCHES},
+                none_inverts_at_largest=bool((r[False].loc[largest] >= -0.3).all() and (r[True].loc[largest] >= -0.3).all()),
+                gtv_most_coherent=tuple(bool(all(pu[sm].loc[b, "GTV"] >= pu[sm].loc[b].max() for b in mid))
+                                        for sm in (False, True)),
+                gtv_sm_purity=(float(pu[True].loc[s50, "GTV"].min()), float(pu[True].loc[s50, "GTV"].max())),
+                gtv_vs_lap_sm=(float(gap_sm.min()), float(gap_sm.max())),
+                lap_purity_20=float(pu[False].loc[20, "Laplacian"]), lap_purity_250=float(pu[False].loc[250, "Laplacian"]),
+                r_plain="; ".join(f"S={b}: " + ", ".join(f"{s} {r[False].loc[b, s]:+.2f}" for s in SEARCHES) for b in budgets),
+                r_smoothed="; ".join(f"S={b}: " + ", ".join(f"{s} {r[True].loc[b, s]:+.2f}" for s in SEARCHES) for b in budgets))
+
+
+# ------------------------------------------------------------------ self-checks
+def checks(R) -> list[tuple[str, bool, str]]:
+    out = []
+
+    def add(name, ok, detail=""):
+        out.append((name, bool(ok), detail))
+    man = R.get("manifest") or {}
+    st = man.get("settings", {})
+    diff = {k: (st.get(k), v) for k, v in PAPER_SETTINGS.items() if st.get(k) != v}
+    add("run settings are the paper's (T, steps, patience, k, c, mu, seed, S, penalty)", not diff,
+        "; ".join(f"{k}: run {a} vs paper {b}" for k, (a, b) in diff.items()) or "all equal")
+    git = man.get("git", {})
+    add("the run's code was committed (no uncommitted change)", not git.get("dirty_files"),
+        f"commit {git.get('commit', '?')[:10]}; uncommitted: {', '.join(git.get('dirty_files', [])[:8]) or 'none'}")
+    z = R.get("zoo")
+    if z:
+        add("zoo: kept + degenerate + duplicate + unusable = settings",
+            z["kept"] + z["degenerate"] + z["duplicate"] + z["unusable"] == z["settings"],
+            f"{z['kept']} + {z['degenerate']} + {z['duplicate']} + {z['unusable']} = {z['settings']}")
+        add("zoo: selection + validation + test = N", z["n_selection"] + z["n_validation"] + z["n_test"] == z["kept"],
+            f"{z['n_selection']} + {z['n_validation']} + {z['n_test']} = {z['kept']}")
+        add("zoo: per-family models add up to N", sum(f["models"] for f in z["families"].values()) == z["kept"])
+    d = R.get("data")
+    if d and z:
+        add("data: the 50 km grid reproduces the dataset's tiles", d["grid_50km_reproduces_tile_50km"])
+        add("data: Figure 1's sets are the cell's sets",
+            (d["sets"]["Train"]["n"], d["sets"]["ID test"]["n"], d["sets"]["OOD"]["n"]) == (z["n_train"], z["n_id"], z["n_ood"]),
+            f"{d['sets']['Train']['n']}, {d['sets']['ID test']['n']}, {d['sets']['OOD']['n']}")
+        add("data: test tiles of the 50 km grid = the cell's test tiles", d["tiles"]["50km"]["test_tiles"] == z["test_tiles"])
+    s = R.get("shift")
+    if s:
+        add("shift: Palm Beach tile's main county is Palm Beach (12099)", s["palm_beach"]["county_fips"] == "12099",
+            f"tile {s['palm_beach']['tile']}, county {s['palm_beach']['county_fips']}")
+        if z:
+            add("shift: tiles with accuracy = the cell's test tiles", s["metrics"]["acc"]["n_tiles"] == z["test_tiles"])
+    t = R.get("subsets")
+    if t is not None:
+        p = t[~t.smoothing]
+        g = float((p.r_te - p.r_test_search).abs().max())
+        add("searches: corr_te (float64) equals the search's own value (float32) within 1e-3", g < 1e-3, f"max |diff| {g:.1e}")
+        add("subsets: every subset has exactly S points", bool((t.n == t.S).all()))
+    m, comps = R.get("match"), R.get("components")
+    if m is not None and comps is not None:
+        reg = m[m.kind == "region"]
+        pooled = m[m.kind == "pooled"].iloc[0]
+        other = m[m.kind == "other"].iloc[0]
+        base = m[m.kind == "baseline"].iloc[0]
+        add("match: one row per region", len(reg) == len(comps), f"{len(reg)} rows, {len(comps)} regions")
+        add("match: no region point lacks a feature", int(reg.n_missing.sum()) == 0 and int(pooled.n_missing) == 0)
+        add("match: region points = the components' points", int(reg.n.sum()) == int(comps.n_points.sum()) == int(pooled.n))
+        eta_w = float((reg.eta * reg.n_matched).sum() / reg.n_matched.sum())
+        add("match: pooled eta = the regions' eta weighted by matched points", abs(eta_w - pooled.eta) < 1e-12,
+            f"{pooled.eta:.6f} vs {eta_w:.6f}")
+        if z:
+            add("match: Other Zone A = the Zone A test points outside the subset",
+                int(other.n) + int(other.n_missing) == z["n_ood"] - REPORTED_S,
+                f"{int(other.n)} + {int(other.n_missing)} missing = {z['n_ood']} - {REPORTED_S}")
+            ms = R["match_summary"]
+            add("match: baseline = the Zone AE test points with every feature",
+                int(base.n) == z["n_id"] - ms["pool_dropped"], f"{int(base.n)} = {z['n_id']} - {ms['pool_dropped']}")
+        add("regions: no tie for the majority county", not bool(comps.majority_tie.any()),
+            ", ".join(comps.name[comps.majority_tie]) or "none")
+    return out
+
+
+# ------------------------------------------------------------------ the paper
+def paper_tables(tex: str) -> dict:
+    """label -> the tabular block of each table environment of the paper."""
+    out = {}
+    for env in re.finditer(r"\\begin\{table\*?\}(.*?)\\end\{table\*?\}", tex, re.S):
+        body = env.group(1)
+        lab = re.search(r"\\label\{([^}]*)\}", body)
+        tab = re.search(r"\\begin\{tabular\}.*?\\end\{tabular\}", body, re.S)
+        if lab and tab:
+            out[lab.group(1)] = tab.group(0)
+    return out
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def paper_check(tabs: list[dict], secs: list, tex: str) -> list[tuple[str, str, str]]:
+    """(what, PASS / FAIL / NOT IN PAPER, detail) for every generated table row and every phrase."""
+    out = []
+    ptabs = paper_tables(tex)
+    for t in tabs:
+        if t["label"] not in ptabs:
+            out.append((f"{t['label']}", "NOT IN PAPER", "the paper has no table with this label"))
+            continue
+        mine = [_norm(x) for x in t["tex"].splitlines()]
+        theirs = [_norm(x) for x in ptabs[t["label"]].splitlines()]
+        for i, row in enumerate(mine):
+            ok = row in theirs
+            out.append((f"{t['label']} row {i + 1}", "PASS" if ok else "FAIL", row if ok else f"generated: {row}"))
+        extra = [r for r in theirs if r not in mine]
+        if extra:
+            out.append((f"{t['label']}: paper rows not generated", "FAIL", " | ".join(extra)))
+    flat = _norm(tex)
+    for title, items in secs:
+        for it in items:
+            if it.get("phrase"):
+                ok = _norm(it["phrase"]) in flat
+                out.append((f"{title}: {it['label']}", "PASS" if ok else "FAIL", it["phrase"]))
+    return out
