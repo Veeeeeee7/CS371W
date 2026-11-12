@@ -21,6 +21,20 @@ None.
 
 ## Done
 
+### 8. Final pipeline: the code matches the finished paper, three entry points, the last experiments
+
+Asked by Victor on 2026-11-12: `docs/PROMPT-FINAL-PIPELINE-2026-11-11.md`.
+
+**Done 2026-11-12 by Claude Code.** Report: `docs/RUN-FINAL-PIPELINE-2026-11-12.md`. Branch `final-pipeline` (snapshot
+`1f3fd61`, then the deletions, the library, the entry points; not pushed). Run `results/2026-11-12` (logs
+`logs/2026-11-12/`), pilot `results/2026-11-12-pilot`, export `exports/GTV+smoothing_S500_mu3_c20_2026-11-12.zip`,
+paper change log `CS371_Cho_Li/CHANGES-2026-11-12.md`.
+- Three commands: `run_experiments.py`, `make_paper.py`, `export_components.py` (root `README.md`); unused analyses
+  and data-build code deleted; the data build's offline rebuild reproduces `data/processed_v4` exactly.
+- The pilot and the full run reproduce the 2026-11-07 cell and every shared search bit for bit; every paper number
+  matches (126 of 126 checks). The mu sweep is not monotone for GTV and gives no consistent winner at equal purity:
+  two XX of "Regularization weight" stay open (report section 4).
+
 ### 7. Make the code match the revised Experiments section, rebuild the data, rerun everything
 
 Decided by Victor on 2026-11-07. The brief is `docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md` (prompt: `docs/PROMPT-REVISED-EXPERIMENTS-2026-11-07.md`). The local paper (synced with Overleaf on 2026-11-07) is the specification: audit the code against the Approach, Experiments and Appendix A; make the ten known changes (D1 to D10: candidate sampling with no cut, no polygon cap, terrain variability within a 300 m radius, binary fluvial class, one-hot encoding, dropping duplicate models, matching on the six numeric features, μ = 3 kept, and wording notes); rebuild the dataset into `data/processed_v4/`; rerun the full suite; draw `figures/fig_feature_boxes.pdf`; update the paper's numbers only. Victor rewrites the prose with Claude from the report.

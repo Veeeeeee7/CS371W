@@ -11,7 +11,7 @@ Everything runs from the repo root in `.venv` (Python 3.12, torch, optuna, xgboo
 
 | Command | What it does | Time (Apple M4 Pro) |
 |---|---|---|
-| `.venv/bin/python run_experiments.py --stage all` | every computation, into `results/<today>/` | about 1.5 h with 8 searches at a time |
+| `.venv/bin/python run_experiments.py --stage all` | every computation, into `results/<today>/` | 1 h 12 min with `--jobs 10` (2026-11-12) |
 | `.venv/bin/python make_paper.py` | tables, numbers and figures from the latest complete run | about 15 s |
 | `.venv/bin/python export_components.py --method "GTV+smoothing"` | the regions as a GeoPackage + CSVs + README, zipped | a few seconds |
 
