@@ -4,24 +4,41 @@ Fit the model population of one cell and score it on the cell's ID and OOD test 
 
 A cell is (state, negative protocol, training zone, seed). The 50 km tiles are split once, 70/30,
 and every model sees that split. A test tile is kept only if it holds positives of both zones, so
-the ID half (training zone) and the OOD half (other zone) cover the same ground. Each model draws
-its feature subset, row subsample and estimator seed from its own spec seed, so any one model can
-be refitted alone (audit_cell.py does this through cell_data and fit_one).
+the ID half (training zone) and the OOD half (other zone) cover the same ground.
+
+The population is one model per setting of a fixed hyperparameter grid per family (GRIDS, the
+paper's Table tab:models), so models differ only by family and setting: every model trains on all
+features and all training rows of the cell. Some settings are deliberately weak, to spread ID
+accuracy. Two drop rules run after fitting, in this order (docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md
+D6). A model that predicts flood for fewer than 5% or more than 95% of the ID test points is
+degenerate (is_degenerate): its accuracy on any subset only reflects the subset's share of
+positives, which the subset search could exploit. A model whose 0/1 predictions on every ID test
+point and every OOD point equal those of a model earlier in grid order is a duplicate: the first
+in grid order is kept. Each setting draws its estimator seed from the cell seed in grid order, so
+any one model can be refitted alone (through cell_data and fit_one).
+
+The model inputs (model_inputs, D5): each numeric feature as is, and each categorical feature of
+CATEGORICAL one-hot encoded, one 0/1 column per class present in the full dataset (a fixed list,
+no dropped reference column). A point missing a categorical feature has NaN in all of that
+feature's columns; families with an imputer fill each column with its training median, hgb and
+xgb take the NaN as is.
 
 Inputs:  <data>/FEATURES.txt and <data>/dataset_<state>.parquet
-Outputs: <out>/<tag>.npz (scores and per-point keys, see main) and <out>/<tag>_models.csv (one
-         row per model, see model_row), with tag = <state>_<protocol>_<train-dom>_s<seed>
+Outputs (write_cell): <out>/<tag>.npz (scores of the kept models and per-point keys), <out>/<tag>_models.csv (one
+         row per kept model, in grid order, see model_row) and <out>/<tag>_dropped.csv (one row per dropped
+         setting, with why: its share of ID test points predicted flood, and for a duplicate the grid_idx of the
+         model it repeats), with tag = <state>_<protocol>_<train-dom>_s<seed> (the paper's is FL_band_AE_s0).
 
-Run with one BLAS/OpenMP thread, as below, so a --n-jobs 1 run matches a parallel one (run_cell):
-    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \\
-    .venv/bin/python -u aotil/zoo.py --state FL --protocol band --train-dom AE --seed 0 \\
-        --n-models 300 --data data/processed --out data/interim/aotil/cells --n-jobs -1
+run_experiments.py --stage zoo fits the paper's cell with one BLAS/OpenMP thread per process (it sets
+OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS and VECLIB_MAXIMUM_THREADS to 1 before numpy loads), so a
+parallel fit matches a serial one.
 """
 from __future__ import annotations
 
-import argparse
+import itertools
 import time
 import warnings
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -46,12 +63,54 @@ try:
 except Exception:
     _HAS_XGB = False
 
-# The low max_iter MLPs are deliberate: an undertrained model is a legitimate low-accuracy
-# member of the population. sklearn warns on every one of them, which buries the real output.
+# The settings with few iterations are deliberate: an undertrained model is a legitimate
+# low-accuracy member of the population. sklearn warns on every one of them, which buries the real
+# output.
 warnings.filterwarnings("ignore")
 
 TILE = "tile_50km"
-MIN_TRAIN = 500        # rows: a model's smallest row subsample, and a cell's fewest training rows
+MIN_TRAIN = 500        # rows: a cell's fewest training rows
+
+# The features the models see one-hot encoded (the paper's Data statistics): land cover (NLCD
+# class codes), soil flood frequency (ordinal, but encoded as classes) and fluvial class. Every
+# other feature of FEATURES.txt is numeric and enters as is. region_match.py matches land cover
+# exactly and leaves the other two out of its numeric features.
+CATEGORICAL = ("landcover", "soil_floodfreq", "soil_fluvclass")
+
+# The drop rule: a model is degenerate when it predicts flood for fewer than DEGENERATE_CUT or
+# more than 1 - DEGENERATE_CUT of the ID test points. Exact fractions, so a share of exactly 5%
+# or 95% is kept.
+DEGENERATE_CUT = Fraction(1, 20)
+
+# The hyperparameter grids (docs/TASK-ZOO-GRIDS-2026-11-06.md section 2, the paper's Table
+# tab:models). Every combination of a family's axes is one model. Settings not named here are the
+# library defaults, apart from the fixed ones in build. The families are fitted in sorted
+# code-name order and each family's settings in itertools.product order over its axes as listed
+# (first axis slowest), which is also the order of the estimator seeds (zoo_specs).
+_FOREST_AXES = (("n_estimators", (10, 30, 100)),
+                ("max_depth", (1, 2, 3, 5, 8, None)),
+                ("max_features", (1, "sqrt", None)))
+GRIDS: dict[str, tuple] = {
+    "dt": (("max_depth", (1, 2, 3, 4, 5, 6, 8, 10, 12, None)),
+           ("min_samples_leaf", (1, 20, 200, 2000))),
+    "et": _FOREST_AXES,
+    "hgb": (("learning_rate", (0.01, 0.03, 0.1, 0.5)),
+            ("max_iter", (3, 10, 50, 300)),
+            ("max_depth", (1, 3, None))),
+    "lr": (("C", (0.001, 0.01, 0.1, 1, 100)),
+           ("max_iter", (1, 2, 3, 5, 100)),
+           ("class_weight", (None, "balanced"))),
+    "mlp": (("hidden_layer_sizes", ((2,), (8,), (16,), (32,), (64, 32))),
+            ("max_iter", (3, 20, 200)),
+            ("learning_rate_init", (1e-4, 1e-3, 1e-2))),
+    "nb": (("var_smoothing", (1e-9, 1e-5, 1e-4, 1e-3, 3e-3, 1e-2, 0.03, 0.1, 0.2, 0.3, 0.5, 1,
+                              2, 3, 10)),
+           ("priors", (None, (0.5, 0.5)))),
+    "rf": _FOREST_AXES,
+    "xgb": (("learning_rate", (0.01, 0.03, 0.1, 0.5)),
+            ("n_estimators", (3, 10, 50, 300)),
+            ("max_depth", (1, 3, 8))),
+}
 
 # Stored per OOD point: point_id joins back to the point table, lon/lat build the spatial graph,
 # the rest are grouping keys for the restricted graphs and the characterisation.
@@ -72,12 +131,63 @@ def read_features(path: Path) -> list[str]:
     return names
 
 
+def onehot_name(feature: str, level: float) -> str:
+    """The input column of one class of a categorical feature, e.g. landcover_90."""
+    return f"{feature}_{int(level)}"
+
+
+def onehot_levels(df: pd.DataFrame, feats: list[str]) -> dict[str, list[float]]:
+    """The classes of each CATEGORICAL feature in feats, sorted: every finite value over all rows
+    of df (the full dataset), so every model of every cell sees the same columns. A class must be
+    a whole number (its column is named after it)."""
+    levels = {}
+    for f in feats:
+        if f not in CATEGORICAL:
+            continue
+        values = pd.to_numeric(df[f], errors="coerce").to_numpy(float)
+        found = np.unique(values[np.isfinite(values)])
+        if (found != np.round(found)).any():
+            raise ValueError(f"{f}: a class that is not a whole number: {found[found != np.round(found)][:3]}")
+        levels[f] = found.tolist()
+    return levels
+
+
+def model_inputs(df: pd.DataFrame, feats: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    """(df with the one-hot columns added, the model's input columns in order).
+
+    Each numeric feature is its own input column. Each CATEGORICAL feature becomes one 0/1 column
+    per class of onehot_levels, in the feature's place in feats, with no reference column dropped;
+    a row missing the feature (NaN) is NaN in all of its columns, so the imputers and the families
+    that handle NaN treat it as missing, not as a class.
+    """
+    levels = onehot_levels(df, feats)
+    inputs, added = [], {}
+    for f in feats:
+        if f not in levels:
+            inputs.append(f)
+            continue
+        values = pd.to_numeric(df[f], errors="coerce").to_numpy(float)
+        missing = ~np.isfinite(values)
+        for level in levels[f]:
+            column = (values == level).astype(float)
+            column[missing] = np.nan
+            name = onehot_name(f, level)
+            if name in df.columns:
+                raise ValueError(f"the dataset already has a column {name}")
+            added[name] = column
+            inputs.append(name)
+    if added:
+        df = pd.concat([df, pd.DataFrame(added, index=df.index)], axis=1)
+    return df, inputs
+
+
 def load(state: str, data_dir: Path) -> tuple[pd.DataFrame, list[str]]:
-    """The state's point table and the FEATURES.txt columns it actually has."""
+    """The state's point table with the one-hot columns added, and the model's input columns
+    (model_inputs of the FEATURES.txt features the table has)."""
     feats = read_features(data_dir / "FEATURES.txt")
     df = pd.read_parquet(data_dir / f"dataset_{state}.parquet")
     feats = [f for f in feats if f in df.columns]
-    return df, feats
+    return model_inputs(df, feats)
 
 
 def subset(df: pd.DataFrame, domain: str, protocol: str) -> pd.DataFrame:
@@ -105,67 +215,43 @@ def split_tiles(df: pd.DataFrame, seed: int, test_frac: float = 0.30) -> tuple[s
 
 
 # ----------------------------------------------------------------- zoo
-def learner_settings() -> dict[str, list[dict]]:
-    """Every hyperparameter setting of each learner family, in the order the population uses."""
-    settings = {"hgb": [], "rf": [], "et": [], "lr": [], "mlp": [], "dt": [], "nb": [{}]}
-    for depth in (2, 3, None):
-        for n_iter in (30, 120, 400):
-            for rate in (0.02, 0.10, 0.35):
-                settings["hgb"].append(dict(max_depth=depth, max_iter=n_iter, learning_rate=rate))
-    for depth in (3, 6, None):
-        for n_trees in (40, 200):
-            settings["rf"].append(dict(max_depth=depth, n_estimators=n_trees))
-            settings["et"].append(dict(max_depth=depth, n_estimators=n_trees))
-    for C in (0.003, 0.1, 3.0, 100.0):
-        settings["lr"].append(dict(C=C))
-    for hidden in ((8,), (48,), (64, 32)):
-        for n_iter in (25, 120):
-            settings["mlp"].append(dict(hidden_layer_sizes=hidden, max_iter=n_iter))
-    for depth in (2, 4, 10):
-        settings["dt"].append(dict(max_depth=depth))
-    if _HAS_XGB:
-        settings["xgb"] = []
-        for depth in (2, 4, 8):
-            for n_trees in (50, 300):
-                settings["xgb"].append(dict(max_depth=depth, n_estimators=n_trees))
+def grid_settings() -> dict[str, list[dict]]:
+    """Every setting of each family's grid (GRIDS), in population order: the families in sorted
+    code-name order, and within a family itertools.product over its axes as GRIDS lists them
+    (first axis slowest). Without xgboost the population has seven families."""
+    settings = {}
+    for kind in sorted(GRIDS):
+        if kind == "xgb" and not _HAS_XGB:
+            continue
+        names = [name for name, _ in GRIDS[kind]]
+        values = [axis for _, axis in GRIDS[kind]]
+        settings[kind] = [dict(zip(names, combo)) for combo in itertools.product(*values)]
     return settings
 
 
-def zoo_specs(n_target: int, seed: int) -> list[dict]:
-    """A deliberately heterogeneous population of n_target model specs.
+def zoo_specs(seed: int) -> list[dict]:
+    """One spec per grid setting, in population order: grid_idx (the setting's position), kind,
+    kw (the setting) and seed (its estimator seed).
 
-    Diversity comes from four axes at once (family, capacity, feature subset, row subsample):
-    one family at one setting collapses to a single ID accuracy, and the ID-OOD correlation
-    OODSelect needs is then undefined. Families are taken round-robin, not the flat list of
-    settings, which would make the population 2/3 gradient boosting and leave too few models of
-    other kinds for the family-disjoint controls. The specs are drawn in idx order from one RNG,
-    so zoo_specs(n, seed) is a prefix of zoo_specs(N, seed) for N > n.
-    """
-    settings = learner_settings()
-    kinds = sorted(settings)
-    n_used = {kind: 0 for kind in kinds}
+    The seeds are drawn in that order from one RNG seeded with the cell seed, so a setting keeps
+    its seed whichever settings are later dropped, and xgb, the last family, leaves the others'
+    seeds unchanged when xgboost is missing."""
     rng = np.random.default_rng(seed)
-
     specs = []
-    for i in range(n_target):
-        kind = kinds[i % len(kinds)]
-        options = settings[kind]
-        kw = options[n_used[kind] % len(options)]
-        n_used[kind] += 1
-        feat_frac = float(rng.choice([0.3, 0.6, 1.0]))
-        row_frac = float(rng.choice([0.15, 0.5, 1.0]))
-        model_seed = int(rng.integers(1 << 30))
-        specs.append(dict(idx=i, kind=kind, kw=kw, feat_frac=feat_frac, row_frac=row_frac,
-                          seed=model_seed))
+    for kind, settings in grid_settings().items():
+        for kw in settings:
+            specs.append(dict(grid_idx=len(specs), kind=kind, kw=kw,
+                              seed=int(rng.integers(1 << 30))))
     return specs
 
 
 def build(kind: str, kw: dict, seed: int, device: str = "cpu"):
     """An unfitted model of one family.
 
-    xgb and hgb handle NaN natively; every other family imputes the training median.
-    random_state is the model's seed in every family but nb; settings not fixed here or in kw
-    are the installed library's defaults. Any device other than "cpu" puts xgb on CUDA.
+    xgb and hgb handle NaN natively; every other family imputes the training median, and lr and
+    mlp standardize their inputs. random_state is the model's seed in every family but nb;
+    settings not fixed here or in kw are the installed library's defaults. Any device other than
+    "cpu" puts xgb on CUDA.
     """
     if kind == "xgb":
         xgb_device = "cpu" if device == "cpu" else "cuda"
@@ -182,11 +268,11 @@ def build(kind: str, kw: dict, seed: int, device: str = "cpu"):
         return make_pipeline(imputer, DecisionTreeClassifier(random_state=seed, **kw))
     if kind == "lr":
         return make_pipeline(imputer, StandardScaler(),
-                             LogisticRegression(max_iter=400, random_state=seed, **kw))
+                             LogisticRegression(random_state=seed, **kw))
     if kind == "mlp":
         return make_pipeline(imputer, StandardScaler(), MLPClassifier(random_state=seed, **kw))
     if kind == "nb":
-        return make_pipeline(imputer, GaussianNB())
+        return make_pipeline(imputer, GaussianNB(**kw))
     raise ValueError(kind)
 
 
@@ -197,12 +283,12 @@ def score_rows(model, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, float, 
     The score is the probability of the observed class (p if y = 1, else 1 - p), not 0/1
     correctness: AUC has no per-example form, and a 0.5 threshold would mean different things in
     cells with different class ratios. Accuracy is argmax correctness, as in predict() and
-    oodselect_paper.correctness: a negative at exactly p = 0.5 is correct.
+    search.correctness: a negative at exactly p = 0.5 is correct.
 
     The AUC is ranked on p itself. p rebuilt from the scores (1 - (1 - p) for a negative) can be
     an ulp off and split the ties that trees, with few distinct p, make in most pairs; that AUC
     can be off by ~0.1. The clip to [0, 1] is for sklearn's trapezoid sum, which can land an ulp
-    above 1 on a perfect separation and would fail audit_cell's range check.
+    above 1 on a perfect separation.
     """
     p = model.predict_proba(X)[:, 1]
     scores = np.where(y == 1, p, 1.0 - p)
@@ -210,6 +296,25 @@ def score_rows(model, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, float, 
     accuracy = float(correct.mean())
     auc = float(np.clip(roc_auc_score(y, p), 0.0, 1.0))
     return scores, accuracy, auc
+
+
+def predicts_flood(scores: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Whether the model predicts flood (p > 0.5, a tie at 0.5 counting as dry) at each point,
+    from its true-class scores (score_rows: p for a positive, 1 - p for a negative).
+
+    At a negative, flood means S = 1 - p < 0.5. That is exactly p > 0.5: for p >= 0.5 the
+    subtraction 1 - p is exact (Sterbenz), and for p < 0.5 it rounds to at least 0.5."""
+    scores, y = np.asarray(scores), np.asarray(y)
+    return np.where(y == 1, scores > 0.5, scores < 0.5)
+
+
+def is_degenerate(n_flood: int, n_points: int) -> bool:
+    """The drop rule: flood predicted for fewer than 5% or more than 95% of n_points points.
+    Compared as exact fractions, so a share of exactly 5% or 95% is kept."""
+    if n_points <= 0:
+        raise ValueError("the drop rule needs at least one ID test point")
+    share = Fraction(int(n_flood), int(n_points))
+    return share < DEGENERATE_CUT or share > 1 - DEGENERATE_CUT
 
 
 def hp_value(v):
@@ -223,29 +328,9 @@ def hp_value(v):
 
 
 # ----------------------------------------------------------------- run
-def extra_training_rows(df: pd.DataFrame, feats: list[str], extra_ids,
-                        extra_repeat: int) -> tuple[np.ndarray, np.ndarray]:
-    """(X, y) of the --extra-train points, each row repeated extra_repeat times (at least once)."""
-    by_id = df.set_index("point_id")
-    missing = [p for p in extra_ids if p not in by_id.index]
-    if missing:
-        raise SystemExit(f"--extra-train: {len(missing)} point_ids not in the dataset, "
-                         f"first {missing[:3]}")
-    extra = by_id.loc[list(extra_ids)]
-    reps = max(1, int(extra_repeat))
-    X = np.repeat(extra[feats].to_numpy(float), reps, axis=0)
-    y = np.repeat(extra.label.to_numpy(), reps)
-    return X, y
-
-
-def cell_data(df, feats, protocol, train_dom, seed, extra_ids=None, extra_repeat: int = 1) -> dict:
-    """The cell's training rows and its ID and OOD test halves, as frames and float arrays.
-
-    Shared by run_cell and audit_cell.py, so a refit sees the same rows in the same order and the
-    same feature order. extra_ids (point_ids from any zone or tile) become arrays Xextra / yextra;
-    those points also stay in whichever test half holds them, so readers must leave them out of
-    any evaluation.
-    """
+def cell_data(df, feats, protocol, train_dom, seed) -> dict:
+    """The cell's training rows and its ID and OOD test halves, as frames and float arrays (the rows in dataset
+    order, the columns in input order), so a refit sees the same rows in the same order."""
     eval_dom = "AE" if train_dom == "A" else "A"
     tr_tiles, te_tiles = split_tiles(df, seed)
 
@@ -257,9 +342,6 @@ def cell_data(df, feats, protocol, train_dom, seed, extra_ids=None, extra_repeat
     arrays = dict(Xtr=tr[feats].to_numpy(float), ytr=tr.label.to_numpy(),
                   Xid=id_te[feats].to_numpy(float), yid=id_te.label.to_numpy(),
                   Xod=ood_te[feats].to_numpy(float), yod=ood_te.label.to_numpy())
-    if extra_ids is not None and len(extra_ids) > 0:
-        arrays["Xextra"], arrays["yextra"] = extra_training_rows(df, feats, extra_ids,
-                                                                 extra_repeat)
     return dict(eval_dom=eval_dom, tr_tiles=tr_tiles, te_tiles=te_tiles,
                 tr=tr, id_te=id_te, ood_te=ood_te, arrays=arrays)
 
@@ -275,30 +357,19 @@ def varying_columns(X: np.ndarray) -> list[int]:
 
 
 def fit_one(sp: dict, A: dict, device: str = "cpu") -> dict | None:
-    """Fit and score one model of the population; None when its draw is unusable.
+    """Fit and score one model of the population; None when it cannot be fitted.
 
-    A is cell_data's arrays. The spec's seed draws the feature subset, then the row subsample.
-    Extra rows are appended after the draw, so with or without them a model keeps the same base
-    rows, features and seed. Columns without two distinct finite values in those training rows
-    (extra rows included) are then dropped.
+    A is cell_data's arrays. The model trains on every training row and every input column that has at least
+    two distinct finite values in those rows.
+    n_flood_id counts the ID test points it predicts flood (predicts_flood), for the drop rule.
     """
-    Xtr, ytr = A["Xtr"], A["ytr"]
-    n_feats = Xtr.shape[1]
-    rng = np.random.default_rng(sp["seed"])
-    n_cols = max(3, int(n_feats * sp["feat_frac"]))
-    cols = np.sort(rng.choice(n_feats, n_cols, replace=False))
-    n_rows = max(MIN_TRAIN, int(len(Xtr) * sp["row_frac"]))
-    row_idx = rng.choice(len(Xtr), min(n_rows, len(Xtr)), replace=False)
-    Xs, ys = Xtr[np.ix_(row_idx, cols)], ytr[row_idx]
-    if "Xextra" in A:
-        Xs = np.vstack([Xs, A["Xextra"][:, cols]])
-        ys = np.concatenate([ys, A["yextra"]])
+    Xs, ys = A["Xtr"], A["ytr"]
     if len(np.unique(ys)) < 2:
         return None
-    keep = varying_columns(Xs)
-    if len(keep) < 2:
+    cols = np.asarray(varying_columns(Xs), dtype=int)
+    if len(cols) < 2:
         return None
-    cols, Xs = cols[keep], Xs[:, keep]
+    Xs = Xs[:, cols]
 
     try:
         model = build(sp["kind"], sp["kw"], sp["seed"], device=device)
@@ -306,41 +377,85 @@ def fit_one(sp: dict, A: dict, device: str = "cpu") -> dict | None:
         s_id, acc_id, auc_id = score_rows(model, A["Xid"][:, cols], A["yid"])
         s_od, acc_od, auc_od = score_rows(model, A["Xod"][:, cols], A["yod"])
         _, acc_sub, auc_sub = score_rows(model, Xs, ys)
-        _, acc_all, auc_all = score_rows(model, Xtr[:, cols], ytr)
+        _, acc_all, auc_all = score_rows(model, A["Xtr"][:, cols], A["ytr"])
     except Exception as e:
         print(f"    [skip {sp['kind']}] {type(e).__name__}: {e}", flush=True)
         return None
+    n_flood_id = int(predicts_flood(s_id, A["yid"]).sum())
     # Each metric pair is (accuracy, AUC).
-    return dict(sp=sp, cols=cols, n_train=len(row_idx), s_id=s_id, s_od=s_od,
-                id=(acc_id, auc_id), ood=(acc_od, auc_od),
+    return dict(sp=sp, cols=cols, n_train=len(A["Xtr"]), s_id=s_id, s_od=s_od,
+                n_flood_id=n_flood_id, id=(acc_id, auc_id), ood=(acc_od, auc_od),
                 train_sub=(acc_sub, auc_sub), train_all=(acc_all, auc_all))
 
 
-def model_row(got: dict, feats: list[str]) -> dict:
-    """One row of <tag>_models.csv from a fit_one result.
+def hp_columns(kw: dict) -> dict:
+    """hp_<name> -> hp_value(value) for each setting of a spec's kw."""
+    return {f"hp_{name}": hp_value(value) for name, value in kw.items()}
 
-    features lists the columns the model used, after fit_one's constant-column drop. The training
-    metrics show whether a model interpolates its labels, which an inverse ID-OOD line from label
-    noise requires (Sanyal et al. 2025): _train_sub is on the rows it was fitted on (extra rows
-    included), _train_all on every training-tile row of the training zone (no extra rows).
-    hp_<name> holds each setting of the spec's kw; an empty cell means the family does not vary it.
+
+def model_row(got: dict, feats: list[str], idx: int) -> dict:
+    """One row of <tag>_models.csv from a fit_one result; idx is the model's row in the cell's
+    score matrices (its position among the kept models).
+
+    grid_idx is the setting's position in the grid (zoo_specs). features lists the columns the
+    model used, after fit_one's constant-column drop. flood_share_id is the share of ID test
+    points it predicts flood (the drop rule's statistic). The training metrics show whether a
+    model interpolates its labels, which an inverse ID-OOD line from label noise requires (Sanyal
+    et al. 2025): _train_sub is on the rows it was fitted on, _train_all on every training-tile row of
+    the training zone; they are the same rows. hp_<name> holds each setting of the spec's kw; an empty cell means the family
+    does not have that hyperparameter.
     """
     sp, cols = got["sp"], got["cols"]
     acc_id, auc_id = got["id"]
     acc_od, auc_od = got["ood"]
     row = dict(
-        idx=sp["idx"], kind=sp["kind"], feat_frac=sp["feat_frac"], row_frac=sp["row_frac"],
-        n_feat=len(cols),
+        idx=idx, grid_idx=sp["grid_idx"], kind=sp["kind"], n_feat=len(cols),
         score_id=float(got["s_id"].mean()), score_ood=float(got["s_od"].mean()),
         acc_id=acc_id, acc_ood=acc_od, auc_id=auc_id, auc_ood=auc_od,
+        flood_share_id=got["n_flood_id"] / len(got["s_id"]),
         seed=sp["seed"], n_train=got["n_train"],
         features=";".join(feats[j] for j in cols),
         acc_train_sub=got["train_sub"][0], auc_train_sub=got["train_sub"][1],
         acc_train_all=got["train_all"][0], auc_train_all=got["train_all"][1],
     )
-    for name, value in sp["kw"].items():
-        row[f"hp_{name}"] = hp_value(value)
+    row.update(hp_columns(sp["kw"]))
     return row
+
+
+DROPPED_COLUMNS = ["grid_idx", "kind", "seed", "reason", "flood_share_id", "acc_id", "acc_ood",
+                   "duplicate_of"]
+
+
+def dropped_row(sp: dict, got: dict | None, reason: str = "degenerate",
+                duplicate_of: int | None = None) -> dict:
+    """One row of <tag>_dropped.csv: a setting left out of the population, with why. A fitted
+    model ("degenerate" or "duplicate") also gets its ID flood share and test accuracies, and a
+    duplicate the grid_idx of the kept model whose predictions it repeats; a setting fit_one
+    could not fit ("unusable") gets NaN for them."""
+    row = dict(grid_idx=sp["grid_idx"], kind=sp["kind"], seed=sp["seed"],
+               reason="unusable", flood_share_id=np.nan, acc_id=np.nan, acc_ood=np.nan,
+               duplicate_of=np.nan)
+    if got is not None:
+        row.update(reason=reason, flood_share_id=got["n_flood_id"] / len(got["s_id"]),
+                   acc_id=got["id"][0], acc_ood=got["ood"][0])
+        if duplicate_of is not None:
+            row["duplicate_of"] = int(duplicate_of)
+    row.update(hp_columns(sp["kw"]))
+    return row
+
+
+def prediction_key(got: dict, y_id: np.ndarray, y_ood: np.ndarray) -> bytes:
+    """A model's 0/1 predictions (predicts_flood) on every ID test point and every OOD point,
+    packed: two models repeat each other exactly when their keys are equal."""
+    flood = np.concatenate([predicts_flood(got["s_id"], y_id), predicts_flood(got["s_od"], y_ood)])
+    return np.packbits(flood).tobytes() + len(flood).to_bytes(8, "little")
+
+
+def hp_last(table: pd.DataFrame) -> pd.DataFrame:
+    """table with its hp_<name> columns sorted and moved to the end."""
+    hp_cols = sorted(c for c in table.columns if c.startswith("hp_"))
+    other_cols = [c for c in table.columns if not c.startswith("hp_")]
+    return table[other_cols + hp_cols]
 
 
 def fit_population(specs: list[dict], A: dict, n_jobs: int, device: str) -> list:
@@ -356,20 +471,53 @@ def fit_population(specs: list[dict], A: dict, n_jobs: int, device: str) -> list
                                                   for sp in specs)
 
 
-def run_cell(df, feats, protocol, train_dom, n_models, seed,
-             n_jobs: int = 1, device: str = "cpu", extra_ids=None, extra_repeat: int = 1):
-    """Fit and score the population of one cell; None when the cell is unusable."""
-    data = cell_data(df, feats, protocol, train_dom, seed, extra_ids, extra_repeat)
+def split_population(specs: list[dict], fitted: list, y_id: np.ndarray,
+                     y_ood: np.ndarray) -> tuple[list[dict], list[dict]]:
+    """(kept fit_one results, dropped_row rows), both in grid order. A setting is dropped when
+    fit_one could not fit it ("unusable"), when it is degenerate (is_degenerate on the ID test
+    points), and then, among the rest, when its 0/1 predictions on every ID test point and every
+    OOD point (y_id and y_ood, the labels behind its scores) equal those of a model earlier in
+    grid order ("duplicate"; the first one in grid order is kept)."""
+    kept, dropped, first_with = [], [], {}
+    for sp, got in zip(specs, fitted):
+        if got is None:
+            dropped.append(dropped_row(sp, None))
+        elif is_degenerate(got["n_flood_id"], len(got["s_id"])):
+            dropped.append(dropped_row(sp, got, "degenerate"))
+        else:
+            key = prediction_key(got, y_id, y_ood)
+            if key in first_with:
+                dropped.append(dropped_row(sp, got, "duplicate", first_with[key]))
+            else:
+                first_with[key] = sp["grid_idx"]
+                kept.append(got)
+    return kept, dropped
+
+
+DROP_REASONS = ("degenerate", "duplicate", "unusable")
+
+
+def family_counts(specs: list[dict], kept: list[dict], dropped: list[dict]) -> pd.DataFrame:
+    """Per family: grid settings, degenerate, duplicate, unusable and kept models."""
+    table = pd.DataFrame(dict(kind=[sp["kind"] for sp in specs]))
+    table = table.groupby("kind").size().rename("settings").to_frame()
+    reasons = pd.DataFrame(dropped, columns=["kind", "reason"])
+    for reason in DROP_REASONS:
+        table[reason] = reasons[reasons.reason == reason].groupby("kind").size()
+    table["kept"] = pd.Series([got["sp"]["kind"] for got in kept], dtype=object).value_counts()
+    return table.fillna(0).astype(int)
+
+
+def run_cell(df, feats, protocol, train_dom, seed, n_jobs: int = 1, device: str = "cpu"):
+    """Fit and score the population of one cell and apply the drop rule; None when the cell is
+    unusable."""
+    data = cell_data(df, feats, protocol, train_dom, seed)
     tr, id_te, ood_te, A = data["tr"], data["id_te"], data["ood_te"], data["arrays"]
     if len(tr) < MIN_TRAIN or id_te.empty or ood_te.empty:
         return None
 
     print(f"  train {len(tr):,} | ID test {len(id_te):,} | OOD test {len(ood_te):,} "
           f"| tiles train {len(data['tr_tiles'])} test {len(data['te_tiles'])}", flush=True)
-    if "Xextra" in A:
-        print(f"  extra training rows: {len(extra_ids):,} point_ids x {extra_repeat} = "
-              f"{len(A['yextra']):,} rows (positives {int(A['yextra'].sum()):,}) "
-              f"added to every model", flush=True)
     # A protocol with no negatives in the dataset (shadedX on a band-only sample) leaves every
     # set with one label. No model can be fitted on it, and a 0-model cell would break every
     # reader, so it is refused here rather than after the fits.
@@ -383,26 +531,26 @@ def run_cell(df, feats, protocol, train_dom, n_models, seed,
         return None
 
     t0 = time.time()
-    specs = zoo_specs(n_models, seed)
+    specs = zoo_specs(seed)
     fitted = fit_population(specs, A, n_jobs, device)
-
-    rows, S_ood, S_id = [], [], []
-    for got in fitted:
-        if got is None:
-            continue
-        S_id.append(got["s_id"])
-        S_ood.append(got["s_od"])
-        rows.append(model_row(got, feats))
-    print(f"  {len(rows)} models in {time.time() - t0:.0f}s", flush=True)
-    if not rows:                 # every draw unusable: same refusal as above
+    kept, dropped = split_population(specs, fitted, A["yid"], A["yod"])
+    fit_secs = time.time() - t0
+    counts = family_counts(specs, kept, dropped)
+    print(f"  {len(specs)} settings fitted in {fit_secs:.0f}s: {len(kept)} kept, "
+          f"{int(counts.degenerate.sum())} degenerate (flood share of the ID test points "
+          f"< {float(DEGENERATE_CUT):g} or > {float(1 - DEGENERATE_CUT):g}), "
+          f"{int(counts.duplicate.sum())} duplicate (the predictions of a model earlier in "
+          f"grid order), {int(counts.unusable.sum())} unusable", flush=True)
+    print("  " + counts.to_string().replace("\n", "\n  "), flush=True)
+    if not kept:                 # every setting unusable or degenerate: same refusal as above
         return None
-    models = pd.DataFrame(rows)
-    hp_cols = sorted(c for c in models.columns if c.startswith("hp_"))
-    other_cols = [c for c in models.columns if not c.startswith("hp_")]
-    models = models[other_cols + hp_cols]
-    print(f"  training accuracy on own subsample: median {models.acc_train_sub.median():.3f}"
-          f" | >= 0.99 in {(models.acc_train_sub >= .99).sum()} of {len(models)} models"
-          f" | on all training rows: median {models.acc_train_all.median():.3f}",
+
+    models = hp_last(pd.DataFrame([model_row(got, feats, i) for i, got in enumerate(kept)]))
+    dropped_table = pd.DataFrame(dropped, columns=DROPPED_COLUMNS)
+    if dropped:
+        dropped_table = hp_last(pd.DataFrame(dropped))
+    print(f"  training accuracy: median {models.acc_train_sub.median():.3f}"
+          f" | >= 0.99 in {(models.acc_train_sub >= .99).sum()} of {len(models)} models",
           flush=True)
 
     # The per-point keys are taken here, where the row order still matches the columns of
@@ -420,71 +568,22 @@ def run_cell(df, feats, protocol, train_dom, n_models, seed,
             missing.append(f"{c}_id")
     if missing:
         print(f"  note: not in this dataset, omitted from the cell: {missing}", flush=True)
-    return dict(models=models,
-                S_ood=np.asarray(S_ood), S_id=np.asarray(S_id),
+    return dict(models=models, dropped=dropped_table, fit_secs=fit_secs,
+                S_ood=np.asarray([got["s_od"] for got in kept]),
+                S_id=np.asarray([got["s_id"] for got in kept]),
                 y_ood=A["yod"], y_id=A["yid"], tiles_ood=ood_te[TILE].to_numpy(),
                 spatial=spatial, id_cols=id_cols,
                 protocol=protocol, train_dom=train_dom, eval_dom=data["eval_dom"])
 
 
-def read_point_ids(path: Path) -> list[str]:
-    """One point_id per line; blank lines and "point_id" header lines skipped."""
-    ids = []
-    for line in path.read_text().splitlines():
-        value = line.strip()
-        if value and value != "point_id":
-            ids.append(value)
-    return ids
+def write_cell(cell: dict, out: Path, tag: str) -> list[Path]:
+    """Write run_cell's result: <tag>.npz, <tag>_models.csv and <tag>_dropped.csv. Returns the paths.
 
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--state", default="FL")
-    ap.add_argument("--protocol", default="shadedX", choices=["band", "shadedX"])
-    ap.add_argument("--train-dom", default="AE", choices=["A", "AE"])
-    ap.add_argument("--n-models", type=int, default=300)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--data", default="data/processed")
-    ap.add_argument("--out", default="data/interim/aotil/cells")
-    ap.add_argument("--n-jobs", type=int, default=-1,
-                    help="parallel model fits; -1 uses every core")
-    ap.add_argument("--device", default="cpu",
-                    help="cpu, or cuda to put the XGBoost family on the GPU")
-    ap.add_argument("--overwrite", action="store_true",
-                    help="refit a cell whose .npz already exists")
-    ap.add_argument("--extra-train", type=Path, default=None,
-                    help="file of point_ids (one per line, optional 'point_id' header) "
-                         "appended to every model's training rows; default none")
-    ap.add_argument("--extra-train-repeat", type=int, default=1,
-                    help="repeat each --extra-train row this many times (default 1)")
-    args = ap.parse_args()
-
-    tag = f"{args.state}_{args.protocol}_{args.train_dom}_s{args.seed}"
-    out = Path(args.out)
-    # Cells are expensive: an existing one is kept unless --overwrite, so an interrupted sweep
-    # resumes by re-running the same command.
-    if (out / f"{tag}.npz").exists() and not args.overwrite:
-        print(f"{tag}: cell exists, skipping (--overwrite to refit)")
-        return 0
-
-    df, feats = load(args.state, Path(args.data))
-    print(f"[{args.state}] {len(df):,} rows | {len(feats)} features")
-    print(f"cell: protocol={args.protocol} train={args.train_dom} seed={args.seed} "
-          f"models={args.n_models} device={args.device}")
-    extra_ids = None
-    if args.extra_train is not None:
-        extra_ids = read_point_ids(args.extra_train)
-    cell = run_cell(df, feats, args.protocol, args.train_dom, args.n_models, args.seed,
-                    n_jobs=args.n_jobs, device=args.device, extra_ids=extra_ids,
-                    extra_repeat=args.extra_train_repeat)
-    if cell is None:
-        print("cell unusable: nothing written")
-        return 1
-
+    S_ood / S_id: (models x points) true-class scores of the kept models, rows in model-table order. y_id lets
+    readers recover exact argmax correctness on the ID half (ties at p = 0.5). String columns are stored as
+    fixed-width str, not objects."""
+    out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    # S_ood / S_id: (models x points) true-class scores, rows in model-table order. y_id lets
-    # readers recover exact argmax correctness on the ID half (ties at p = 0.5). tiles_ood is
-    # kept for older readers. String columns are stored as fixed-width str, not objects.
     payload = dict(S_ood=cell["S_ood"], S_id=cell["S_id"], y_ood=cell["y_ood"],
                    y_id=cell["y_id"], tiles_ood=cell["tiles_ood"].astype(str))
     per_point = dict(cell["spatial"])
@@ -493,17 +592,8 @@ def main() -> int:
         if values.dtype.kind in "OU":
             values = values.astype(str)
         payload[name] = values
-    if extra_ids is not None:
-        payload["extra_train_point_id"] = np.asarray(extra_ids, dtype=str)
-        payload["extra_train_repeat"] = np.int64(args.extra_train_repeat)
-    np.savez_compressed(out / f"{tag}.npz", **payload)
-    cell["models"].to_csv(out / f"{tag}_models.csv", index=False)
-    print(f"saved {out}/{tag}.npz  (S_ood {cell['S_ood'].shape}, S_id {cell['S_id'].shape}; "
-          f"keys: {', '.join(payload)})")
-    print(f"saved {out}/{tag}_models.csv  ({len(cell['models'])} rows x "
-          f"{cell['models'].shape[1]} columns)")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    paths = [out / f"{tag}.npz", out / f"{tag}_models.csv", out / f"{tag}_dropped.csv"]
+    np.savez_compressed(paths[0], **payload)
+    cell["models"].to_csv(paths[1], index=False)
+    cell["dropped"].to_csv(paths[2], index=False)
+    return paths

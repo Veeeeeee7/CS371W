@@ -3,9 +3,9 @@
 #
 # Every Florida catchment lies in Region 03, split into units 03N, 03S and 03W (547 MB in
 # nine archives). Per unit, only the files pull_hydro.py needs are extracted:
-#   NHDSnapshot        NHDFlowline: COMID, FTYPE, LENGTHKM + geometry
-#   NHDPlusAttributes  PlusFlowlineVAA (StreamOrde, TotDASqKM), elevslope (SLOPE)
-#   NHDPlusCatchment   Catchment: FEATUREID, AreaSqKM + geometry
+#   NHDSnapshot        NHDFlowline: COMID, FTYPE + geometry
+#   NHDPlusAttributes  PlusFlowlineVAA (ComID: which flowlines are in the network)
+#   NHDPlusCatchment   Catchment: FEATUREID + geometry
 # into data/raw/nhdplus/<unit>/<layer>/; prep_nhdplus_units.py then builds the geodatabase.
 # Finished downloads and extractions are skipped on a rerun.
 #
@@ -34,7 +34,7 @@ command -v 7z >/dev/null 2>&1 || { echo "7z not found: brew install p7zip" >&2; 
 members() {
     case "$1" in
         NHDSnapshot)       echo "NHDFlowline.*" ;;
-        NHDPlusAttributes) echo "PlusFlowlineVAA.dbf elevslope.dbf" ;;
+        NHDPlusAttributes) echo "PlusFlowlineVAA.dbf" ;;
         NHDPlusCatchment)  echo "Catchment.*" ;;
     esac
 }
@@ -61,7 +61,7 @@ echo "$FILES" | while read -r unit layer file bytes; do
     mkdir -p "$dl" "$out"
     echo "$file ($(printf "%'d" "$bytes") bytes)"
     fetch "$BASE/NHDPlus$unit/$file" "$dl/$file" "$bytes" || exit 1
-    # .extracted marks a finished extraction (check_gis_inputs.py reads it too).
+    # .extracted marks a finished extraction.
     if [ -f "$out/.extracted" ]; then
         echo "  extracted already"
         continue

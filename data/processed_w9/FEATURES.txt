@@ -1,0 +1,23 @@
+# Model features (w9): the ten predictors of Woznicki et al. (2019), Table 2, mapped onto our
+# columns, as in data/processed_w7/FEATURES.txt, plus its two SSURGO soil predictors (pulled
+# per point by pull_soil_points.py from NRCS Soil Data Access; docs/TASK-SOIL-W9-2026-11-07.md).
+#   NLCD land cover            -> landcover   (NLCD 2021, 30 m; categorical code)
+#   slope                      -> slope       (3DEP 10 m)
+#   DEM5x5 (std. dev. of a 5x5 window of the DEM) -> tri_300 (std. dev. of 10 m elevation in a 300 m cell)
+#   CTI (compound topographic index) -> wetindexcat (EPA StreamCat catchment mean)
+#   OFD / HOFD (distance to channel; coastlines count as channels) -> log10_dist_river, log10_dist_coast (NHDPlus V2)
+#   VOFD / VDC (vertical distance to channel)  -> hand (MERIT Hydro)
+#   fldfreq (flooding frequency class) -> soil_floodfreq (SSURGO muaggatt.flodfreqdcd, dominant
+#       condition; ordinal None 0, Very rare 1, Rare 2, Occasional 3, Frequent 4, Very frequent 5)
+#   fluvclass (fluvial class)          -> soil_fluvclass (dominant component's subgroup fluvial 1,
+#       not fluvial 0; water map unit 2)
+# The w9 experiment of 2026-11-07. The paper's results use w7.
+landcover
+slope
+tri_300
+wetindexcat
+log10_dist_river
+log10_dist_coast
+hand
+soil_floodfreq
+soil_fluvclass

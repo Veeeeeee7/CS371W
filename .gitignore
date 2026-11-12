@@ -9,5 +9,6 @@ data/raw/
 __pycache__/
 logs/
 results/
+exports/
 figures/
 tests/
