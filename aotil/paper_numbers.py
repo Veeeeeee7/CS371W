@@ -334,7 +334,10 @@ def matched_purity(plain: pd.DataFrame) -> dict | None:
         return dict(overlap=None)
     grid = np.linspace(lo, hi, 101)
     diff = np.interp(grid, *curves["GTV"]) - np.interp(grid, *curves["Laplacian"])
-    stronger = "GTV" if diff.mean() < 0 else "Laplacian"
+    # A loss "inverts more strongly at the same purity" only when it does so over most (>= 80%) of the purities both
+    # reach; otherwise there is no consistent winner and the paragraph's blank stays open.
+    share_gtv = float((diff < 0).mean())
+    stronger = "GTV" if share_gtv >= 0.8 else "Laplacian" if share_gtv <= 0.2 else None
     at_points = []
     for s, other in (("GTV", "Laplacian"), ("Laplacian", "GTV")):
         p, r = curves[s]
@@ -344,7 +347,7 @@ def matched_purity(plain: pd.DataFrame) -> dict | None:
                                       other_r_te=float(np.interp(pi, *curves[other]))))
     return dict(overlap=(float(lo), float(hi)), mean_gtv_minus_lap=float(diff.mean()),
                 min_gtv_minus_lap=float(diff.min()), max_gtv_minus_lap=float(diff.max()),
-                share_gtv_stronger=float((diff < 0).mean()), stronger=stronger, at_points=at_points)
+                share_gtv_stronger=share_gtv, stronger=stronger, at_points=at_points)
 
 
 # ------------------------------------------------------------------ numbers
@@ -551,12 +554,17 @@ def numbers(R) -> list[tuple[str, list[dict]]]:
             it.append(item("XX 7-8: Laplacian corr_te at the smallest -> largest mu", f"{l['r_lo']:.2f} to {l['r_hi']:.2f}"))
             mp = mu["matched"]
             if mp and mp.get("overlap"):
-                it.append(item("XX 9 and 10: the loss that inverts more strongly at the same purity", mp["stronger"]))
+                it.append(item("XX 9 and 10: the loss that inverts more strongly at the same purity (one that does so "
+                               "over >= 80% of the purities both reach)",
+                               mp["stronger"] or "none: no consistent winner (see the next line and the mu sweep table)"))
                 it.append(item("matched purity: overlap, mean / min / max of GTV minus Laplacian corr_te, share of "
                                "the overlap where GTV inverts more",
                                f"[{mp['overlap'][0]:.2f}, {mp['overlap'][1]:.2f}], {mp['mean_gtv_minus_lap']:+.3f} / "
                                f"{mp['min_gtv_minus_lap']:+.3f} / {mp['max_gtv_minus_lap']:+.3f}, "
                                f"{mp['share_gtv_stronger']:.0%}"))
+            for x in mp.get("at_points", []) if mp else []:
+                it.append(item(f"at purity {x['purity']:.2f}: {x['search']} corr_te vs the other loss interpolated",
+                               f"{x['r_te']:+.3f} vs {x['other_r_te']:+.3f} ({x['r_te'] - x['other_r_te']:+.3f})"))
             for name in ("GTV", "Laplacian"):
                 x = tr[name]
                 it.append(item(f"CHECK {name}: purity rises with mu (every step; Spearman)",

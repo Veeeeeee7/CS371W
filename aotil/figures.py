@@ -180,9 +180,13 @@ def fig_mu(d: pd.DataFrame, reference: dict, out: Path, preview: Path | None = N
             ax.set_axisbelow(True)
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
-        ax_r.axhline(0, color=INK2, lw=0.5, zorder=1)
-        ax_r.set_ylim(-1.05, 0.2)
-        ax_r.set_yticks([-1, -0.5, 0])
+        # corr_te axis fitted to the values (all negative here), ticks every 0.1, the zero line only when in range.
+        vals = np.r_[d.r_te.to_numpy(float), reference["r_te"]]
+        lo, hi = np.floor(vals.min() * 10) / 10, np.ceil(vals.max() * 10) / 10
+        ax_r.set_ylim(lo - 0.02, hi + 0.02)
+        ax_r.set_yticks(np.round(np.arange(lo, hi + 1e-9, 0.1), 1))
+        if lo < 0 < hi:
+            ax_r.axhline(0, color=INK2, lw=0.5, zorder=1)
         ax_r.set_ylabel(r"corr$_\mathrm{te}$")
         ax_p.set_ylim(0, 1.0)
         ax_p.set_yticks([0, 0.5, 1])

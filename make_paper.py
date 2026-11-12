@@ -170,7 +170,13 @@ def mu_sweep_md(R) -> list[str]:
     if "GTV" in tr and "Laplacian" in tr and mp and mp.get("overlap"):
         g, l = tr["GTV"], tr["Laplacian"]
         stronger = mp["stronger"]
-        art = "the Laplacian" if stronger == "Laplacian" else "GTV"
+        art = {"Laplacian": "the Laplacian", "GTV": "GTV"}.get(stronger, r"\textbf{XX}")
+        monotone = all(x[k] for x in (g, l) for k in ("purity_rises", "r_weakens"))
+        if not monotone or stronger is None:
+            out += ["**Caution before pasting:** " + ("the trends are not monotone in mu (see the % CHECK answers below "
+                    "and the table), so the end points alone do not describe them. " if not monotone else "")
+                    + ("Neither loss inverts more over most of the purities both reach, so the loss blank stays XX."
+                       if stronger is None else ""), ""]
         out += ["Paragraph \"Regularization weight\" with its XX filled (Victor and Claude chat edit the prose):", "",
                 f"> As $\\mu$ grows, purity rises from {g['purity_lo']:.2f} to {g['purity_hi']:.2f} for GTV and from "
                 f"{l['purity_lo']:.2f} to {l['purity_hi']:.2f} for the Laplacian, while $\\text{{corr}}_\\text{{te}}$ "
@@ -225,11 +231,14 @@ def write_numbers(R, run: Path, tabs: list[dict], paper: Path) -> tuple[Path, in
     t = R.get("subsets")
     if t is not None:
         cols = ["unit", "smoothing", "r_te", "ci_lo", "ci_hi", "r_val", "components", "comp_points", "pieces",
-                "purity", "tiles", "ties_at_cut"]
+                "purity", "tiles", "ties_at_cut", "soft_mass"]
         show = t[cols].copy()
         for c in ("r_te", "ci_lo", "ci_hi", "r_val", "purity"):
             show[c] = show[c].map(lambda v: f"{v:+.3f}" if c != "purity" else f"{v:.3f}")
-        out += ["## Every subset of the run (alone and + smoothing)", ""] + md_table(show) + [""]
+        show["soft_mass"] = show.soft_mass.map(lambda v: f"{v:.1f}")
+        out += ["## Every subset of the run (alone and + smoothing)", "",
+                "soft_mass: the sum of the search's final soft weights (the squared budget penalty pulls it to S; far "
+                "from S when the tuned budget weight lambda is near its lower bound).", ""] + md_table(show) + [""]
     path = run / "paper" / "numbers.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(out) + "\n")
