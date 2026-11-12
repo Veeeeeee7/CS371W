@@ -4,14 +4,15 @@ Build the NHDPlus geodatabase pull_hydro.py reads from the per-unit NHDPlus V2.1
 
 Florida lies in Vector Processing Units 03N, 03S and 03W, which fetch_nhdplus_fl.sh downloads
 as shapefiles and .dbf tables under data/raw/nhdplus/<unit>/. This script writes the two
-layers of the national geodatabase, with its names and fields, to
+layers of the national geodatabase, with its layer and field names, to
 data/raw/nhdplus/NHDPlusV21_{ST}.gdb:
 
-    Catchment            FEATUREID, AreaSqKM                <- Catchment.shp
-    NHDFlowline_Network  COMID, LENGTHKM, FTYPE             <- NHDFlowline.shp
-                         StreamOrde, TotDASqKM              <- PlusFlowlineVAA.dbf
-                         SLOPE (-9998 = no data, kept)      <- elevslope.dbf
+    Catchment            FEATUREID                          <- Catchment.shp
+    NHDFlowline_Network  COMID, FTYPE                       <- NHDFlowline.shp, cut to the
+                                                               COMIDs of PlusFlowlineVAA.dbf
 
+pull_hydro.py takes the point's catchment (FEATUREID) from the first and the distances to the
+nearest river flowline and to the coastline (by FTYPE) from the second.
 Features are kept whole if they touch the state's FIRM-panel extent plus PAD_DEG.
 See docs/FEATURE-SOURCES.md section 8.
 
@@ -61,15 +62,12 @@ def read_unit(unit: str, bbox: tuple) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFram
     """One unit's catchments and network flowlines (plus all coastline) inside bbox."""
     root = RAW / unit
     cat = gpd.read_file(one(f"{root}/NHDPlusCatchment/**/Catchment.shp"),
-                        columns=["FEATUREID", "AreaSqKM"], bbox=bbox)
+                        columns=["FEATUREID"], bbox=bbox)
     fl = gpd.read_file(one(f"{root}/NHDSnapshot/**/NHDFlowline.shp"),
-                       columns=["COMID", "LENGTHKM", "FTYPE"], bbox=bbox)
+                       columns=["COMID", "FTYPE"], bbox=bbox)
     vaa = pyogrio.read_dataframe(one(f"{root}/NHDPlusAttributes/**/PlusFlowlineVAA.dbf"),
-                                 columns=["ComID", "StreamOrde", "TotDASqKM"],
-                                 read_geometry=False)
+                                 columns=["ComID"], read_geometry=False)
     vaa = vaa.rename(columns={"ComID": "COMID"})
-    slope = pyogrio.read_dataframe(one(f"{root}/NHDPlusAttributes/**/elevslope.dbf"),
-                                   columns=["COMID", "SLOPE"], read_geometry=False)
 
     # The national NHDFlowline_Network holds only flowlines with a VAA record; the snapshot
     # also holds non-network lines (in 03S, the south Florida canal grid), which would
@@ -77,7 +75,6 @@ def read_unit(unit: str, bbox: tuple) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFram
     # Keys and barrier islands keep their own shoreline.
     n_in_bbox = len(fl)
     fl = fl[fl.COMID.isin(vaa.COMID) | (fl.FTYPE == "Coastline")]
-    fl = fl.merge(vaa, on="COMID", how="left").merge(slope, on="COMID", how="left")
     fl["geometry"] = shapely.force_2d(fl.geometry.values)
     print(f"  {unit}: {len(cat):,} catchments, {len(fl):,} network flowlines and coastline "
           f"of {n_in_bbox:,} in the bbox; FTYPE {fl.FTYPE.value_counts().to_dict()}",
@@ -140,13 +137,10 @@ def build(state: str, overwrite: bool) -> int:
 
     write_geodatabase(cat, fl, out)
 
-    slope = pd.to_numeric(fl.SLOPE, errors="coerce")
     size_mb = sum(f.stat().st_size for f in out.iterdir()) / 1e6
     print(f"[{state}] wrote {out}: {len(cat):,} catchments, {len(fl):,} flowlines "
           f"(dropped {dup_catchments} duplicate catchments, {dup_flowlines} duplicate "
-          f"flowlines); SLOPE null {int(slope.isna().sum()):,}, "
-          f"-9998 {int((slope == -9998).sum()):,}; {size_mb:.0f} MB "
-          f"({time.time() - t0:.0f}s)")
+          f"flowlines); {size_mb:.0f} MB ({time.time() - t0:.0f}s)")
     return 0
 
 

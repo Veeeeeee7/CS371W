@@ -6,7 +6,9 @@ build merges into data/interim/v4_build, never data/processed). Run from the rep
     .venv/bin/python test_pull_hydro.py
 
 1. set_processed points the dataset, FEATURES.txt and the merge lock at the folder.
-2. --merge --processed DIR reads and rewrites DIR/dataset_FL.parquet and DIR/FEATURES.txt only.
+2. --merge --processed DIR reads and rewrites DIR/dataset_FL.parquet and DIR/FEATURES.txt only,
+   adding the three features (wetindexcat, log10_dist_river, log10_dist_coast), meta_comid and the
+   raw distances meta_dist_to_river_m and meta_dist_to_coast_m.
 3. Without --processed, main leaves PROC as it is: a caller that set PROC (as the private tests
    patch it) keeps it, so nothing is written to data/processed.
 4. data/processed is byte-identical before and after.
@@ -44,8 +46,10 @@ def write_world(folder: Path, hydro: Path):
                            geometry=gpd.points_from_xy([1.3e6, 1.31e6], [7.0e5, 7.0e5]), crs=5070)
     pts.to_parquet(folder / "dataset_FL.parquet")
     (folder / "FEATURES.txt").write_text("slope\n")
-    pd.DataFrame({"point_id": pts.point_id, "comid": [11.0, 12.0],
-                  "catch_area_km2": [1.0, 2.0]}).to_parquet(hydro / "comid_FL.parquet")
+    pd.DataFrame({"point_id": pts.point_id, "comid": [11.0, 12.0]}).to_parquet(
+        hydro / "comid_FL.parquet")
+    pd.DataFrame({"point_id": pts.point_id, "dist_to_river_m": [0.5, 100.0],
+                  "dist_to_coast_m": [1000.0, 10.0]}).to_parquet(hydro / "river_FL.parquet")
     pd.DataFrame({"comid": [11.0, 12.0], "wetindexcat": [550.0, 600.0]}).to_parquet(
         hydro / "streamcat_FL.parquet")
 
@@ -70,6 +74,13 @@ def main():
         check(code == 0 and out.wetindexcat.tolist() == [550.0, 600.0]
               and "wetindexcat" in (stage / "FEATURES.txt").read_text(),
               "the staging dataset and its FEATURES.txt gain the hydro columns")
+        added = set(out) - {"point_id", "lon", "lat", "county_fips", "geometry"}
+        check(added == {"meta_comid", "wetindexcat", "meta_dist_to_river_m",
+                        "meta_dist_to_coast_m", "log10_dist_river", "log10_dist_coast"}
+              and out.log10_dist_river.tolist() == [0.0, 2.0]
+              and out.log10_dist_coast.tolist() == [3.0, 1.0],
+              f"exactly the three features, meta_comid and the raw distances; log10 floored at "
+              f"1 m: {sorted(added)}")
         ph.PROC, ph.LOCK = saved
 
         print("3. without --processed")

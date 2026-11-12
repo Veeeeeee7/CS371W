@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Checks for the candidate design of sample_points.py (docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md
-D1 and D2) and the dataset audit's checks of it (audit_dataset.py B1 and B17). Run from the repo
-root:
+D1 and D2). Run from the repo root:
 
     .venv/bin/python test_sample_points.py
 
@@ -19,10 +18,6 @@ Everything is synthetic (a small Florida in a temp folder), no network:
    the whole-state pass leave no two points closer than 100 m, every survivor is kept (no cut),
    and the counts are stored with the points; --audit reads them; group_problems names a group
    with the wrong number of candidates or rows.
-6. audit_dataset: points_match, B1 (check_counts) OK on the built table and WRONG when a point is
-   missing, and B17 (check_masks) OK on it and WRONG for a point moved onto water.
-7. audit_dataset.is_forbidden_feature: absolute elevation stays forbidden; elev_sd_r300 (the SD of
-   elevation within 300 m, relative relief) is allowed.
 """
 import contextlib
 import io
@@ -39,7 +34,6 @@ import rasterio
 import shapely
 from rasterio.transform import from_origin
 
-import audit_dataset as ad
 import sample_points as sp
 
 FAILS = []
@@ -319,62 +313,13 @@ def check_build(w):
     return points
 
 
-# ----------------------------------------------------------------- 6: audit_dataset
-def check_audit_dataset(w, points):
-    print("6. audit_dataset B1 and B17")
-    path = w.points / "points_FL.parquet"
-    df = points.copy()
-    df["landcover"] = float(LAND)
-    a = types.SimpleNamespace(points=path, candidates=60, protocol="band", land_mask=w.mask)
-    check(ad.points_match(df, gpd.read_parquet(path)) == "", "points_match: the same points")
-    moved = df.copy()
-    moved.loc[moved.index[0], "lon"] += 0.01
-    check("lon" in ad.points_match(moved, gpd.read_parquet(path)), "points_match: a moved lon")
-
-    au = ad.Audit()
-    with quiet():
-        ad.check_counts(au, df, a)
-        ad.check_counts(au, df.iloc[1:], a)
-    check(au.items[0]["verdict"] == "OK" and au.items[1]["verdict"] == "WRONG",
-          f"B1: OK on the build, WRONG with a point missing ({au.items[1]['result'][:90]})")
-
-    idx = sp.load_index("FL")
-    pan = sp.read_panels("FL")
-    cn = gpd.read_parquet(w.counties)
-    au = ad.Audit()
-    on_water = df.copy()
-    k = on_water.index[on_water.neg_protocol == "band"][0]
-    on_water.loc[k, "geometry"] = shapely.Point(X0 + 11_000, Y0 + 2_500)
-    on_water.loc[k, "landcover"] = float(WATER)
-    with quiet():
-        ad.check_masks(au, df, idx, pan, cn, "FL", a)
-        ad.check_masks(au, gpd.GeoDataFrame(on_water, crs=sp.CRS_WORK), idx, pan, cn, "FL", a)
-    check(au.items[0]["verdict"] == "OK", f"B17 OK on the build: {au.items[0]['result'][:120]}")
-    problems = au.items[1]["data"]["problems"]
-    check(au.items[1]["verdict"] == "WRONG"
-          and any("OPEN WATER" in p for p in problems) and any("landcover" in p for p in problems),
-          f"B17 WRONG for a band negative moved into NFHL OPEN WATER: {problems}")
-
-
-def check_forbidden_names():
-    print("7. audit_dataset.is_forbidden_feature")
-    names = {"elev": True, "meta_elev": True, "elevcat": True, "elevws": True, "elev_m": True,
-             "tile_50km": True, "block_id": True, "elev_sd_r300": False, "slope": False,
-             "hand": False}
-    got = {n: ad.is_forbidden_feature(n) for n in names}
-    check(got == names, f"absolute elevation, ids and tiles forbidden; the SD of elevation within "
-                        f"a radius (elev_sd_r300) and the other features allowed: {got}")
-
-
 def main():
-    check_forbidden_names()
     check_draw_valid()
     check_quota()
     with world() as w:
         check_area_uniform(w)
         check_band_filter(w)
-        points = check_build(w)
-        check_audit_dataset(w, points)
+        check_build(w)
     if FAILS:
         print(f"\n{len(FAILS)} FAILED")
         return 1

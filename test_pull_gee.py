@@ -9,8 +9,8 @@ Offline (no network):
 1. sample_group's request, against a stand-in for the Earth Engine client: a group with buffer_m
    buffers every point by that radius (to BUFFER_ERROR_M) and reduces with its own reducer on the
    group's grid; a plain group reads the point with ee.Reducer.first().
-2. derive: tri_300 (the SD inside the fixed 300 m cell) becomes meta_tri_300, elev_sd_r300 stays a
-   feature, FEATURES names elev_sd_r300 and not tri_300.
+2. derive: the four bands (slope, elev_sd_r300, hand, landcover) pass through as the features,
+   which FEATURES and ALL_BANDS name; tile_50km comes from block_id, and no other tile.
 3. merge --processed: the dataset and FEATURES.txt go to the given folder, data/processed is not
    touched, and stale shards are refused.
 Online (--online, needs an Earth Engine login; skipped otherwise):
@@ -102,16 +102,15 @@ def check_request():
 # ----------------------------------------------------------------- 2: derive
 def check_derive():
     print("2. derive")
-    raw = pd.DataFrame({"elev": [3.0], "slope": [1.0], "aspect": [90.0], "tri_300": [0.4],
-                        "elev_sd_r300": [0.6], "log1p_upa": [1.0], "block_id": ["10_20"]})
-    out = pg.derive(raw)
-    check("tri_300" not in out and out.meta_tri_300.tolist() == [0.4]
-          and out.elev_sd_r300.tolist() == [0.6],
-          "tri_300 -> meta_tri_300 (comparison only); elev_sd_r300 kept as is")
-    check("elev_sd_r300" in pg.FEATURES and "tri_300" not in pg.FEATURES
-          and "elev_sd_r300" in pg.ALL_BANDS and "tri_300" in pg.ALL_BANDS,
-          "FEATURES names elev_sd_r300; both bands are pulled")
-    check(out.tile_50km.tolist() == ["2_4"], "tiles still derived from block_id")
+    raw = pd.DataFrame({"slope": [1.0], "elev_sd_r300": [0.6], "hand": [2.5],
+                        "landcover": [42.0], "block_id": ["10_20"]})
+    out = pg.derive(raw.copy())
+    four = ["slope", "elev_sd_r300", "hand", "landcover"]
+    check(out[four].equals(raw[four]), "the four bands pass through unchanged")
+    check(pg.FEATURES == four and pg.ALL_BANDS == four,
+          "FEATURES and ALL_BANDS: slope, elev_sd_r300, hand, landcover")
+    check(out.tile_50km.tolist() == ["2_4"] and not {"tile_30km", "tile_100km"} & set(out),
+          "tile_50km still derived from block_id, and no other tile")
 
 
 # ----------------------------------------------------------------- 3: merge --processed
@@ -135,10 +134,11 @@ def check_merge(tmp: Path):
     with mock.patch.multiple(pg, PTS_DIR=pts_dir, GEE_DIR=gee_dir):
         code = pg.main(["--merge", "FL", "--processed", str(out)])
     data = pd.read_parquet(out / "dataset_FL.parquet")
-    names = pg.FEATURES
-    check(code == 0 and len(data) == 2 and "elev_sd_r300" in data and "meta_tri_300" in data
-          and (out / "FEATURES.txt").read_text().count("elev_sd_r300") == 1,
-          f"dataset and FEATURES.txt written to {out.name}, with elev_sd_r300 and meta_tri_300")
+    listed = [ln for ln in (out / "FEATURES.txt").read_text().splitlines()
+              if ln and not ln.startswith("#")]
+    check(code == 0 and len(data) == 2 and set(pg.FEATURES) <= set(data) and "tile_50km" in data
+          and listed == pg.FEATURES,
+          f"dataset and FEATURES.txt written to {out.name}, with the four features and tile_50km")
     after = sorted(p.name for p in Path("data/processed").glob("*")) \
         if Path("data/processed").exists() else []
     check(after == processed_before, "data/processed untouched")
@@ -157,7 +157,6 @@ def check_merge(tmp: Path):
     with mock.patch.multiple(pg, PTS_DIR=pts_dir, GEE_DIR=gee_dir):
         code = pg.main(["--merge", "FL", "--processed", str(out)])
     check(code == 1, "shards from other locations are refused")
-    check(len(names) == 13, "13 FEATURES as before (elev_sd_r300 in tri_300's place)")
 
 
 # ----------------------------------------------------------------- 4: Earth Engine
