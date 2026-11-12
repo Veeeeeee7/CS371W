@@ -14,6 +14,8 @@ Checks for o5_pooling.py (Part F of docs/TASK-O5-REGIONS.md). Run from the repo 
    force), eval 2 holds no region point, and no added point is scored.
 4. The written CSV: one primary row; pooled point estimates = the mean over the models of all
    seeds; every interval has ci_lo <= ci_hi.
+5. same_specs (synthetic): equal tables pass; a different length (a population that dropped
+   other settings), seed or grid setting fails without raising.
 """
 import argparse
 import sys
@@ -143,6 +145,20 @@ def check_csv(csv):
     check((out.ci_lo <= out.ci_hi).all(), "every interval has lo <= hi")
 
 
+def check_same_specs():
+    """Check 5: same_specs on hand-made model tables."""
+    print("5. same_specs")
+    base = pd.DataFrame(dict(kind=["dt", "dt", "lr"], seed=[11, 12, 13], grid_idx=[0, 1, 40]))
+    check(fp.same_specs(base.copy(), base), "identical tables pass")
+    check(not fp.same_specs(base.iloc[[0, 2]].reset_index(drop=True), base),
+          "a population that kept fewer settings fails (no exception)")
+    check(not fp.same_specs(base.assign(seed=[11, 12, 99]), base), "another seed fails")
+    check(not fp.same_specs(base.assign(grid_idx=[0, 2, 40]), base), "another grid setting fails")
+    old = base.drop(columns="grid_idx")
+    check(fp.same_specs(old.copy(), old), "tables without grid_idx (pre-grid cells) still pass")
+    check(not fp.same_specs(old, base), "one table with grid_idx and one without fails")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -152,6 +168,7 @@ def main() -> int:
     parser.add_argument("--dataset", type=Path, default=Path("data/processed/dataset_FL.parquet"))
     parser.add_argument("--csv", default=None, help="o5_pooling's output CSV (check 4)")
     args = parser.parse_args()
+    check_same_specs()
     xy = xy_table(args.dataset)
 
     check_auc_path(args.root)

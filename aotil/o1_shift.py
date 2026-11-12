@@ -53,9 +53,9 @@ import oodselect_paper as op      # noqa: E402
 from report_paper import model_convergence  # noqa: E402
 
 N_BOOT = 2000  # percentile intervals need about 1,000-2,000 draws (Carpenter and Bithell 2000)
-# Bootstrap every k-th model (1 = all). The zoo fits its 8 families round-robin (model i is
-# family i mod 8), so a stride sharing a factor with 8 skips families: 10, the first look's
-# stride (docs/RUN-W7-REPORT-2026-10-16.md, B2), keeps only dt, hgb, mlp and rf.
+# Bootstrap every k-th model (1 = all). The cell's models are in grid order (zoo.py): each family
+# is one contiguous block of its kept settings, so a stride k keeps about 1/k of every family's
+# settings, but within a family it follows the grid's axes and can keep only some of their values.
 MODEL_STRIDE = 1
 NLCD_OPEN_WATER = 11  # NLCD land cover class code
 SCOPE_NAMES = ("all", "land", "paired land")
@@ -751,8 +751,8 @@ def main() -> int:
     parser.add_argument("out_csv")
     parser.add_argument("--boot", type=int, default=N_BOOT, help="tile-bootstrap draws")
     parser.add_argument("--model-stride", type=int, default=MODEL_STRIDE,
-                        help="bootstrap over every k-th model (default 1, all models; "
-                             "10 keeps only 4 of the 8 families)")
+                        help="bootstrap over every k-th model (default 1, all models; the "
+                             "models are in grid order, so k > 1 thins every family's grid)")
     parser.add_argument("--seed", type=int, default=0, help="bootstrap seed")
     args = parser.parse_args()
 

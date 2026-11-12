@@ -4,6 +4,8 @@
 #
 # Writes results/<date>/oodselect_paper/{classic,spatial_mu3_knn10}/... and
 #        logs/<date>/oodselect_paper/...
+# (results/<date>/<SUBDIR>/... and logs/<date>/<SUBDIR>/... when SUBDIR is set, e.g. SUBDIR=w9 for
+# the 9-feature experiment of docs/TASK-SOIL-W9-2026-11-07.md; empty by default.)
 # Each (variant, cell, budget) is one single-threaded process, JOBS at a time (xargs -P): the
 # selection is dispatch-bound, so N single-thread processes beat one N-thread process.
 #
@@ -33,7 +35,7 @@
 # Resumable: a budget whose _result.csv exists is skipped, so re-running the
 # same command after an interruption only does what is missing.
 #
-# Needs in the venv: torch, optuna (and xgboost for the full 300-model family):
+# Needs in the venv: torch, optuna (and xgboost for the XGBoost family of the grid population):
 #   .venv/bin/pip install torch optuna xgboost      # + `brew install libomp` for xgboost
 # Keep the Mac plugged in; the script wraps itself in `caffeinate -i` so it
 # does not idle-sleep (closing the lid on battery still will).
@@ -66,7 +68,6 @@ CELLS="${CELLS:-FL:band:AE:0 FL:band:A:0}"
 VARIANTS="${VARIANTS:-classic spatial}"
 MU_SPATIAL="${MU_SPATIAL:-3}"
 KNN="${KNN:-10}"
-N_MODELS="${N_MODELS:-300}"
 TRIALS="${TRIALS:-100}"
 MAX_EPOCHS="${MAX_EPOCHS:-50000}"
 PATIENCE="${PATIENCE:-500}"
@@ -76,6 +77,11 @@ SPLITS="${SPLITS:-random}"
 BUDGETS="${BUDGETS:-}"
 BUDGET_PENALTY="${BUDGET_PENALTY:-squared}"
 REG="${REG:-laplacian}"
+SUBDIR="${SUBDIR:-}"
+if ! echo "$SUBDIR" | grep -Eq '^([A-Za-z0-9_-]+)?$'; then
+    echo "SUBDIR must be one folder name of letters, digits, _ or -" >&2
+    exit 1
+fi
 # Default: the performance cores (Apple silicon), leaving the efficiency cores
 # for the rest of the machine.
 if [ -z "${JOBS:-}" ]; then
@@ -88,8 +94,8 @@ if [ -z "${JOBS:-}" ]; then
     fi
 fi
 
-ROOT="results/${DATE}/oodselect_paper"
-LOG_DIR="logs/${DATE}/oodselect_paper"
+ROOT="results/${DATE}${SUBDIR:+/$SUBDIR}/oodselect_paper"
+LOG_DIR="logs/${DATE}${SUBDIR:+/$SUBDIR}/oodselect_paper"
 mkdir -p "$ROOT" "$LOG_DIR" "$CELLS_DIR"
 
 # ---------------------------------------------------------------- preflight
@@ -100,7 +106,7 @@ if ! "$PY" -c "import optuna, torch, sklearn, scipy, pandas, pyarrow" 2>/dev/nul
 fi
 if ! "$PY" -c "import xgboost" 2>/dev/null; then
     echo "WARNING: xgboost not importable -- the population will lack the XGBoost"
-    echo "         family, so it will NOT match the full 300-model population."
+    echo "         family, so it will NOT match the paper's grid population."
     echo "         $PY -m pip install xgboost   (and: brew install libomp)"
     if [ "${ALLOW_NO_XGB:-0}" != "1" ]; then
         echo "         ALLOW_NO_XGB=1 to run anyway." >&2
@@ -133,7 +139,7 @@ variant_dir() {
 
 echo "[local] date=$DATE cells=[$CELLS] variants=[$VARIANTS] jobs=$JOBS"
 echo "[local] splits=[$SPLITS] null_seeds=[${NULL_SEEDS:-off}] budgets=[${BUDGETS:-paper grid}]"
-echo "[local] models=$N_MODELS trials=$TRIALS max_epochs=$MAX_EPOCHS patience=$PATIENCE budget_penalty=$BUDGET_PENALTY reg=$REG"
+echo "[local] trials=$TRIALS max_epochs=$MAX_EPOCHS patience=$PATIENCE budget_penalty=$BUDGET_PENALTY reg=$REG"
 T0=$(date +%s)
 
 # ---------------------------------------------------------------- 1. zoo
@@ -145,7 +151,7 @@ for spec in $CELLS; do
     echo "[zoo] $tag"
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
     "$PY" -u aotil/zoo.py --state "$state" --protocol "$protocol" --train-dom "$train_dom" \
-        --seed "$cell_seed" --n-models "$N_MODELS" --data "$DATA_DIR" --out "$CELLS_DIR" \
+        --seed "$cell_seed" --data "$DATA_DIR" --out "$CELLS_DIR" \
         --n-jobs -1 --device cpu \
         >>"${LOG_DIR}/zoo_${tag}_local.out" 2>>"${LOG_DIR}/zoo_${tag}_local.err"
     tail -1 "${LOG_DIR}/zoo_${tag}_local.out"

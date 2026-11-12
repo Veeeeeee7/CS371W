@@ -2,8 +2,11 @@
 """
 o5_feature_inclusion.py -- which feature carries the inversion? (docs/TASK-O5-REGIONS.md, Part D1)
 
-zoo.py gave every model a random subset of the 7 features, so "model i saw feature f" is assigned
-like a treatment in a randomized trial. Per seed, response and model set this fits, by OLS,
+The model populations built before 2026-11-06 gave every model a random subset of the 7
+features, so "model i saw feature f" is assigned like a treatment in a randomized trial. Since
+2026-11-06 zoo.py trains every model on all features (one model per grid setting), so a cell built
+since then has nothing to randomize and is refused (require_varying_inclusion). Per seed, response
+and model set this fits, by OLS,
     probit(acc_R) ~ 1 + probit(acc_ID) + family + sum_f saw_f
 where acc_R is a model's accuracy on the response's points (the seed's regions, pooled and one by
 one, and the spatial S = 500 selection) and acc_ID its accuracy on the Zone AE test half. A
@@ -80,6 +83,18 @@ def indicators(feature_lists, feats: list[str]) -> np.ndarray:
                 raise SystemExit(f"model {i}: feature {name!r} is not in the feature list {feats}")
             I[i, column_of[name]] = 1
     return I
+
+
+def require_varying_inclusion(I: np.ndarray, feats: list[str], tag: str) -> None:
+    """Stop unless some feature is seen by some models and not by others: without that, no
+    saw_f coefficient is identified. A grid cell (zoo.py since 2026-11-06) trains every model on
+    every feature, so it always stops here."""
+    varies = (I.min(axis=0) != I.max(axis=0))
+    if not varies.any():
+        raise SystemExit(f"{tag}: every feature is seen by all models or by none "
+                         f"({', '.join(feats)}), so feature inclusion is not randomized and "
+                         f"this analysis does not apply; it needs a cell built before "
+                         f"2026-11-06, whose models drew random feature subsets")
 
 
 def probit(a) -> np.ndarray:
@@ -269,6 +284,7 @@ def seed_inputs(a, seed: int, lc: pd.Series, feats: list[str]):
     counts.append(count_row(seed, "spatial_S500_land", selected, land))
 
     I = indicators(models.features.tolist(), feats)
+    require_varying_inclusion(I, feats, tag)
     return dict(tag=tag, Z=Z, acc_id=acc_id, kinds=models.kind.astype(str).to_numpy(), I=I,
                 n_feat=models.n_feat.to_numpy(), masks=masks, counts=counts)
 

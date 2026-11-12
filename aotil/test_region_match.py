@@ -22,6 +22,17 @@ region names, the exclusion matrices, the hardest points, the halo exclusions, t
 and an end-to-end run on a synthetic cell.
 9. The real check (Stop S2): on the 2026-10-23 cell and regions with --exclude own-tile, eps and
    the sandbox's eta and unmatched shares to 0.01. Skipped when those files are missing.
+10. q = the numeric features of FEATURES.txt (docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md D7):
+   every feature except the categorical ones of zoo.CATEGORICAL (land cover, matched exactly; the
+   two soil classes, not matched), in file order: 6 on a nine-feature file, on
+   data/processed_w7, data/processed_w9 and data/processed_v4; any count on a synthetic file; a
+   file without landcover or with a repeated name stops the run.
+11. Zone A points with a missing feature (w9: the soil columns are NaN on water map units): left
+   out of every matched set and counted (n_missing per row, ood_dropped in the summary); a region's
+   tiles, its kind and its corr_te still count all of its points; with no point missing the
+   outputs have neither column nor key (the w7 schema).
+12. On the 2026-11-06 w7 inputs the four outputs are byte-identical to results/2026-11-06/region_match/
+   (skipped when those files are missing).
 """
 import argparse
 import sys
@@ -37,6 +48,18 @@ import region_match as rm  # noqa: E402
 
 FAILS = []
 FEATURES = ["slope", "tri_300", "wetindexcat", "log10_dist_river", "log10_dist_coast", "hand"]
+W7_FEATURES = Path("data/processed_w7/FEATURES.txt")
+W9_FEATURES = Path("data/processed_w9/FEATURES.txt")
+V4_FEATURES = Path("data/processed_v4/FEATURES.txt")
+SOIL = ["soil_floodfreq", "soil_fluvclass"]
+W7_RUN = dict(cells="data/interim/aotil/cells_grid_2026-11-06",
+              dataset="data/processed_w7/dataset_FL.parquet", features=str(W7_FEATURES),
+              regions="results/2026-11-06/regions/FL_band_AE_s0_spatial_mu3_knn10_S500_points.parquet",
+              classic="results/2026-11-06/regions/FL_band_AE_s0_classic_S500_points.parquet",
+              gtv="results/2026-11-06/regions/FL_band_AE_s0_spatial_gtv_mu3_knn10_S500_points.parquet",
+              out="results/2026-11-06/region_match")
+W7_OUTPUTS = ["region_match.csv", "region_match_kinds.csv", "region_match_sensitivity.csv",
+              "region_match.json"]
 REAL = dict(cells="data/interim/aotil/cells_v3",
             dataset="data/processed_w7/dataset_FL.parquet",
             features="data/processed_w7/FEATURES.txt",
@@ -232,14 +255,122 @@ def check_inputs(tmp: Path, ood: pd.DataFrame, idd: pd.DataFrame):
           and ctx["missing"] == {"wetindexcat": 10, "hand": 1},
           f"10 pool points dropped and counted: {ctx['n_dropped']}, {ctx['missing']}")
     check(rm.numeric_features(tmp / "FEATURES.txt") == FEATURES, "the 6 numeric features")
-    (tmp / "BAD.txt").write_text("landcover\nslope\n")
-    try:
-        rm.numeric_features(tmp / "BAD.txt")
-        raised = False
-    except SystemExit:
-        raised = True
-    check(raised, "a feature list without 6 numeric features stops the run")
+    check("ood_dropped" not in rm.run(args_for(tmp))["summary"]
+          and "n_missing" not in rm.run(args_for(tmp))["table"],
+          "no Zone A point missing a feature: no n_missing column, no ood_dropped key (w7 schema)")
     return ctx
+
+
+def stops(path: Path) -> bool:
+    """True when numeric_features refuses the file."""
+    try:
+        rm.numeric_features(path)
+        return False
+    except SystemExit:
+        return True
+
+
+def check_feature_count(tmp: Path):
+    print("10. q = the numeric features of FEATURES.txt")
+    nine = ["landcover", "soil_floodfreq", "soil_fluvclass"] + FEATURES
+    (tmp / "F9.txt").write_text("# nine\n" + "\n".join(nine) + "\n")
+    (tmp / "F2.txt").write_text("landcover\nslope\n")
+    check(rm.numeric_features(tmp / "F9.txt") == FEATURES, "q = 6 of nine features: the soil "
+          "classes and land cover are not in z, the six numeric ones are, in file order")
+    check(rm.numeric_features(tmp / "F2.txt") == ["slope"], "q = 1 on a two-feature file")
+    eight = FEATURES + SOIL
+    (tmp / "NOLC.txt").write_text("\n".join(eight) + "\n")
+    (tmp / "REP.txt").write_text("landcover\nslope\nslope\n")
+    (tmp / "ONLY.txt").write_text("landcover\nsoil_floodfreq\n")
+    check(stops(tmp / "NOLC.txt") and stops(tmp / "REP.txt") and stops(tmp / "ONLY.txt"),
+          "no landcover, a repeated name or no numeric feature stops the run")
+    for path, label in ((W7_FEATURES, "w7"), (W9_FEATURES, "w9"), (V4_FEATURES, "v4")):
+        if not path.exists():
+            print(f"  skip  {path} missing")
+            continue
+        got = rm.numeric_features(path)
+        check(len(got) == 6 and not set(got) & {"landcover", *SOIL},
+              f"{label}: q = {len(got)}: {', '.join(got)}")
+
+
+def check_missing_queries(tmp: Path, ood: pd.DataFrame):
+    print("11. Zone A points with a missing feature")
+    data = pd.read_parquet(tmp / "dataset.parquet")
+    points = pd.read_parquet(tmp / "regions.parquet")
+    region0 = points[points.component == 0].point_id.tolist()
+    # 3 points of region 0 (one of them the only point of its tile in the region, if any) and 4
+    # points outside every region lose one feature each.
+    gone = region0[:3]
+    outside = ood.point_id[~ood.point_id.isin(points.point_id)].tolist()[:4]
+    data.loc[data.point_id.isin(gone), "wetindexcat"] = np.nan
+    data.loc[data.point_id.isin(outside), "hand"] = np.nan
+    data.to_parquet(tmp / "dataset_missing.parquet")
+    a = args_for(tmp, dataset=str(tmp / "dataset_missing.parquet"), out=str(tmp / "out_missing"))
+    ctx = rm.load_inputs(a)
+    check(int((~ctx["ood_complete"]).sum()) == 7 and ctx["ood_missing"] == {"wetindexcat": 3,
+                                                                           "hand": 4},
+          f"7 Zone A points flagged incomplete: {ctx['ood_missing']}")
+    regions = rm.regions_of(ctx, points, 20, {})
+    r0 = regions[0]
+    full = rm.selection_rows(ctx, points[points.component == 0])
+    check(len(r0["rows"]) == 22 and len(r0["all_rows"]) == 25
+          and np.array_equal(r0["tiles"], np.unique(ctx["ood_tile"][full])),
+          "region 0: 22 queries of 25 points; its tiles are those of all 25")
+    q = rm.queries(ctx, full)
+    check(q["n_missing"] == 3 and len(q["z"]) == 22 and np.isfinite(q["z"]).all(),
+          "queries drop the 3 incomplete points and count them")
+    selected = np.zeros(len(ctx["ood"]), bool)
+    selected[rm.selection_rows(ctx, points)] = True
+    halo_ok = all(ctx["ood_complete"][rows].all()
+                  for _, rows, _ in rm.halo_sets(ctx, regions, selected, "region-tiles"))
+    check(halo_ok, "halos hold complete points only")
+
+    out = rm.run(a)
+    t = out["table"].set_index("set")
+    reg = out["table"][out["table"].kind == "region"]
+    first = reg[reg.component == 0].iloc[0]
+    pooled = out["table"][out["table"].kind == "pooled"].iloc[0]
+    others = t.loc["Other Zone A points"]
+    check(first.n == 22 and first.n_missing == 3 and pooled.n_missing == 3
+          and pooled.n == reg.n.sum() and others.n_missing == 4
+          and others.n == int((~selected).sum()) - 4,
+          f"rows: region n 22 + n_missing 3; pooled n_missing 3; other Zone A n_missing 4")
+    check(out["summary"]["ood_dropped"] == 7 and out["summary"]["ood_points"] == len(ood),
+          "summary: ood_dropped 7 of all Zone A points")
+    kinds = out["kinds"]
+    _, _, test = op.model_split(ctx["Z_ood"].shape[0])
+    y = ctx["ood"].label.to_numpy()
+    ok = True
+    for _, k in kinds.iterrows():
+        members = [r for r in regions if (y[r["all_rows"]].mean() >= 0.5) == (k.kind == "positive")]
+        every = np.concatenate([r["all_rows"] for r in members])
+        mask = np.zeros(len(y), np.float32)
+        mask[every] = 1
+        want = op.hard_corr(ctx["Z_ood"][test], ctx["acc"][test], mask, len(every), is_mask=True)
+        ok &= k.points == len(every) and np.isclose(k.corr_te, want, equal_nan=True)
+    check(ok and kinds.points.sum() == 47, "kinds: points and corr_te count all region points")
+
+
+def check_w7_reproduces():
+    print("12. the 2026-11-06 w7 outputs, byte for byte")
+    paths = [W7_RUN[k] for k in ("cells", "dataset", "features", "regions", "classic", "gtv")]
+    if not all(Path(p).exists() for p in paths + [W7_RUN["out"]]):
+        print("  skip  the 2026-11-06 cell, regions or outputs are missing")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        argv = ["region_match.py", "--cells-dir", W7_RUN["cells"], "--tag", "FL_band_AE_s0",
+                "--dataset", W7_RUN["dataset"], "--features", W7_RUN["features"],
+                "--regions", W7_RUN["regions"], "--classic", W7_RUN["classic"],
+                "--extra-regions", W7_RUN["gtv"], "--out", tmp]
+        saved = sys.argv
+        sys.argv = argv
+        try:
+            rm.main()
+        finally:
+            sys.argv = saved
+        for name in W7_OUTPUTS:
+            same = (Path(tmp) / name).read_bytes() == (Path(W7_RUN["out"]) / name).read_bytes()
+            check(same, f"{name} identical to results/2026-11-06/region_match/{name}")
 
 
 def check_helpers(tmp: Path, ctx: dict):
@@ -372,7 +503,10 @@ def main():
         ctx = check_inputs(tmp, ood, idd)
         check_helpers(tmp, ctx)
         check_run(tmp)
+        check_feature_count(tmp)
+        check_missing_queries(tmp, ood)
     check_real()
+    check_w7_reproduces()
     if FAILS:
         print(f"\n{len(FAILS)} FAILED")
         return 1

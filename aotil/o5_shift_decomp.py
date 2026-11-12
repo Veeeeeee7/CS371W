@@ -296,9 +296,9 @@ def seed_points(s: int, df: pd.DataFrame, feats, ctx: mc.SeedContext, cells_dir:
                 cell_prefix: str, K: pd.DataFrame, threads: int, log=print):
     """Feature space, kNN measures and the C1 propensity for one seed.
 
-    The Zone AE training rows are rebuilt with zoo.cell_data exactly as the 300 models saw them and
-    are kept whole, water included, as the kNN reference. Returns (a table indexed by point_id of
-    every Zone A and Zone AE test point, an info dict, the arrays c3_seed needs).
+    The Zone AE training rows are rebuilt with zoo.cell_data exactly as the cell's models saw them
+    and are kept whole, water included, as the kNN reference. Returns (a table indexed by point_id
+    of every Zone A and Zone AE test point, an info dict, the arrays c3_seed needs).
     """
     tag = f"{cell_prefix}_s{s}"
     halves = zoo.cell_data(df, feats, "band", "AE", s)

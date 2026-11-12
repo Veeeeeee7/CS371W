@@ -3,7 +3,8 @@
 Part F of docs/TASK-O5-REGIONS.md: does adding the region labels to training cost accuracy
 on detailed (Zone AE) studies more than adding as many ordinary Zone A labels?
 
-Populations per seed, 300 models each with the same specs (zoo.py --extra-train): base
+Populations per seed, each with the same model specs (zoo.py --extra-train; 300 models each on
+the 2026-10-17 cells): base
 (cells_w7), +region (the seed's region land points that have a terrain-matched control),
 +matched (those controls: same count, labels and tiles), and both with every added row
 repeated 10 times (_x10). All are scored on the same land test points (never the added ones):
@@ -64,9 +65,20 @@ def pflood(S: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 
 def same_specs(models: pd.DataFrame, base_models: pd.DataFrame) -> bool:
-    """Same model family and seed, model by model."""
-    return ((models.kind.to_numpy() == base_models.kind.to_numpy()).all()
-            and (models.seed.to_numpy() == base_models.seed.to_numpy()).all())
+    """Same number of models, and the same family, seed and (in a grid cell, zoo.py since
+    2026-11-06) grid setting, model by model. Populations fitted with --extra-train can drop
+    different settings under the drop rule, which this refuses instead of pairing them."""
+    if len(models) != len(base_models):
+        return False
+    columns = ["kind", "seed"]
+    if "grid_idx" in models.columns or "grid_idx" in base_models.columns:
+        columns.append("grid_idx")
+    for column in columns:
+        if column not in models.columns or column not in base_models.columns:
+            return False
+        if not (models[column].to_numpy() == base_models[column].to_numpy()).all():
+            return False
+    return True
 
 
 def check_points_and_specs(z: dict, models: dict, conds: dict, tag: str) -> None:

@@ -1,0 +1,23 @@
+# Model features (v4): the nine of the paper's Sources paragraph, in its order, as the
+# predictors of Woznicki et al. (2019), Table 2 (docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md).
+# zoo.py one-hot encodes the first three (zoo.CATEGORICAL); the other six are numeric.
+#   land cover            -> landcover        (NLCD 2021 class code, 30 m; pull_gee.py)
+#   soil flood frequency  -> soil_floodfreq   (SSURGO muaggatt.flodfreqdcd, dominant condition;
+#       None 0, Very rare 1, Rare 2, Occasional 3, Frequent 4, Very frequent 5; pull_soil_points.py)
+#   fluvial class         -> soil_fluvclass   (dominant component's subgroup fluvial 1, not 0;
+#       NaN with soil_floodfreq in a water map unit or outside every map unit)
+#   slope                 -> slope            (degrees, 3DEP 10 m; pull_gee.py)
+#   terrain variability   -> elev_sd_r300     (SD of the 3DEP 10 m elevations within 300 m)
+#   height above drainage -> hand             (MERIT Hydro, m)
+#   topographic wetness   -> wetindexcat      (EPA StreamCat catchment mean, x100; pull_hydro.py)
+#   distance to river     -> log10_dist_river (log10 m to the nearest NHDPlus V2 river, floor 1 m)
+#   distance to coast     -> log10_dist_coast (log10 m to the NHDPlus V2 coastline, floor 1 m)
+landcover
+soil_floodfreq
+soil_fluvclass
+slope
+elev_sd_r300
+hand
+wetindexcat
+log10_dist_river
+log10_dist_coast

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Attach NHDPlus V2 and EPA StreamCat hydrology covariates to data/processed/dataset_{ST}.parquet.
+Attach NHDPlus V2 and EPA StreamCat hydrology covariates to <processed>/dataset_{ST}.parquet
+(--processed, default data/processed: the dataset the stages read the points from and --merge
+rewrites, next to its FEATURES.txt).
 
 Stages, run in this order (the three fetch stages write to data/interim/hydro/ and skip a
 state whose output already exists; --merge can be rerun safely):
@@ -14,6 +16,7 @@ state whose output already exists; --merge can be rerun safely):
                 FEATURES.txt
 
     python pull_hydro.py --catchments FL
+    python pull_hydro.py --merge FL --processed data/interim/v4_build
 """
 import argparse
 import glob
@@ -39,7 +42,8 @@ from shapely import STRtree
 from urllib3.util.retry import Retry
 
 RAW = Path("data/raw/nhdplus")
-PROC = Path("data/processed")
+DEFAULT_PROC = Path("data/processed")
+PROC = DEFAULT_PROC          # set_processed points the stages elsewhere
 HYDRO = Path("data/interim/hydro")
 
 STATES = ["FL"]
@@ -93,6 +97,14 @@ FEATURES_HEADER = (
 
 
 # ----------------------------------------------------------------- shared helpers
+def set_processed(folder) -> None:
+    """Point every stage at folder: the dataset it reads the points from, the dataset and
+    FEATURES.txt --merge rewrites, and the merge lock beside them."""
+    global PROC, LOCK
+    PROC = Path(folder)
+    LOCK = PROC / ".merge.lock"
+
+
 def session() -> requests.Session:
     """HTTPS session that retries the resets and 5xx answers the EPA API gives under load."""
     retry = Retry(total=6, connect=6, read=6, backoff_factor=1.5,
@@ -639,7 +651,14 @@ def main(argv: list[str]) -> int:
                     help="river and coast distance, reach attributes, drainage density")
     ap.add_argument("--streamcat", action="store_true", help="EPA StreamCat metrics by county")
     ap.add_argument("--merge", action="store_true", help="join everything into dataset_{ST}")
+    ap.add_argument("--processed", type=Path, default=None,
+                    help=f"folder of dataset_{{ST}}.parquet and FEATURES.txt "
+                         f"(default {DEFAULT_PROC})")
     args = ap.parse_args(argv)
+    # Only a folder given on the command line moves the stages: without --processed, PROC stays
+    # what it is (data/processed, or what a caller set it to).
+    if args.processed is not None:
+        set_processed(args.processed)
 
     states = args.states or STATES
     unknown = [s for s in states if s not in STATES]

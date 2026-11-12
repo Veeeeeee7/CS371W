@@ -16,9 +16,9 @@ a curve of constant ground elevation, like a contour line. EPSG:5070 and EPSG:30
 
 | file | what it does |
 |---|---|
-| `zoo.py` | fits a cell's 300 models (dt, et, hgb, lr, mlp, nb, rf, xgb) and stores each model's probability of the true class on every ID and OOD point |
+| `zoo.py` | fits a cell's model population, one model per setting of a fixed hyperparameter grid per family (dt, et, hgb, lr, mlp, nb, rf, xgb; 369 settings, the paper's Table tab:models), each on all features and all training points; drops degenerate models (flood predicted for under 5% or over 95% of the ID test points), then models whose 0/1 predictions on every ID and OOD test point repeat a model earlier in grid order (since 2026-11-07); one-hot encodes land cover, soil flood frequency and fluvial class (`model_inputs`: one 0/1 column per class of the full dataset, NaN in all of a feature's columns where it is missing; since 2026-11-07); stores each kept model's probability of the true class on every ID and OOD point, with the dropped settings and why in `<tag>_dropped.csv` (since 2026-11-06; before, 300 models drew random feature and row shares and the families took turns) |
 | `cells.py` | `load_cell`, the one way every stage reads a cell; the tree families of the family-disjoint split |
-| `audit_cell.py` | re-derives a cell from the point table and the code (shapes, model table, rows, tiles, refits); PASS or FAIL |
+| `audit_cell.py` | re-derives a cell from the point table and the code (shapes; the kept and dropped settings against the grid and the drop rules, no two kept models with the same predictions; rows; tiles; refits of kept and of every dropped setting, a duplicate against the predictions of the model it repeats); PASS or FAIL. A model table written before the grid population fails |
 | `graph.py` | the kNN graph (EPSG:3086), its Laplacian and the coherence metrics (purity, cut share, components, tiles); `python aotil/graph.py` runs its built-in checks |
 | `oodselect_paper.py` | OODSelect as its authors released it, plus the optional spatial term (`--reg laplacian`, the default, or `--reg gtv`, graph total variation on the same edges, folder `spatial_gtv_mu<mu>_knn<k>`); one run = (cell, budget S, variant) |
 | `report_paper.py` | per cell and variant: r on the held-out models with a Fisher interval, the random and most-misclassified baselines, cross-budget overlap (the paper's Eq. 6), the model-count rule, classic vs spatial |
@@ -27,7 +27,9 @@ a curve of constant ground elevation, like a contour line. EPSG:5070 and EPSG:30
 | `o1_tile_null.py` | null check of the per-tile gap: zones shuffled within each (tile, label) group, same models, no refit |
 | `o1_table.py` | Table 1 (tab:shift) as LaTeX, pooled and per-tile rows, from an `o1_shift.py` log |
 | `regions.py` | the connected components of a selection's top S points on the same kNN graph, one row per region |
-| `region_match.py` | the paper's region analysis (Approach 3.6): matches each region point to held-out Zone AE points with the same land cover within a caliper on the 6 standardized numeric inputs (at most 5, never from a tile of the region), and reports the unmatched share (covariate shift) and the label disagreement η (concept shift) per region, pooled, for the Zone AE baseline, reference sets and halos; `--exclude own-tile` reproduces the 2026-10-25 sandbox rule |
+| `variogram_ranges.py` | the effective range of each feature's semivariogram (1 km lags to 200 km, spherical or exponential by weighted least squares, 95% of the partial sill) on a 20,000-point subsample, for the Split paragraph's "at most XX km" (since 2026-11-07) |
+| `fig_feature_boxes.py` | the paper's data figure (Figure fig:data): the numeric features as box plots and the categorical ones as stacked bars, by set of the seed-0 split (since 2026-11-07) |
+| `region_match.py` | the paper's region analysis (Approach 3.6): matches each region point to held-out Zone AE points with the same land cover within a caliper on the standardized numeric features of `--features` (every feature but the categorical ones of `zoo.CATEGORICAL`: q = 6 on every dataset since 2026-11-07; a Zone A point missing one is left out and counted) (at most 5, never from a tile of the region), and reports the unmatched share (covariate shift) and the label disagreement η (concept shift) per region, pooled, for the Zone AE baseline, reference sets and halos; `--exclude own-tile` reproduces the 2026-10-25 sandbox rule |
 | `region_recurrence.py` | whether a seed's regions come back in the other seeds |
 | `lobes.py` | per region: its Zone A lobes, matched unselected Zone A lobes and Zone AE lobes in its tiles, with edge vertices every 30 m |
 | `edge_layers.py` | distance from every edge vertex to soil-survey lines, county lines, map-panel edges and canals, with coverage checks |
@@ -57,9 +59,16 @@ superseded: do not run them for the paper.
    and controls, regions and their recurrence, lobes and distances (RUN-FL-V2 steps 12-15), `boundary_stat.py`.
 3. `docs/TASK-O5-REGIONS.md`: S1 (`match_controls.py`), S2 (`region_null.py`), then Parts A-F (`o5_*.py`).
 4. `docs/TASK-REGION-TWINS.md`: the twins analysis (superseded by `region_match.py`).
-5. `docs/TASK-RERUN-ALL-2026-10-25.md`: the paper's current numbers: the refit cell, every selection with the squared
-   budget penalty (Laplacian and GTV), the downstream analyses and `region_match.py`; the commands are in
-   `logs/2026-10-25/C_chain.sh` and `D_chain.sh`.
+5. `docs/TASK-RERUN-ALL-2026-10-25.md`: the refit cell, every selection with the squared budget penalty (Laplacian
+   and GTV), the downstream analyses and `region_match.py`; the commands are in `logs/2026-10-25/C_chain.sh` and
+   `D_chain.sh`.
+6. `docs/TASK-ZOO-GRIDS-2026-11-06.md`: the paper's current numbers. The grid population
+   (`data/interim/aotil/cells_grid_2026-11-06`, `logs/2026-11-06/B1_zoo.log`), then the commands of step 5 on it:
+   `logs/2026-11-06/T_chain.sh`, `C_chain.sh` and `D_chain.sh`.
+7. `docs/TASK-SOIL-W9-2026-11-07.md` (an experiment; the paper stays on step 6): `pull_soil_points.py` (repo root)
+   adds Woznicki's two SSURGO soil predictors to every point (`data/processed_w9`, 9 features), then the grid
+   population on it (`data/interim/aotil/cells_w9_2026-11-07`) and the commands of step 6 with only the paths
+   changed: `logs/2026-11-07/w9/T_chain.sh`, `C_chain.sh` and `D_chain.sh`, outputs under `results/2026-11-07/w9/`.
 
 `run_oodselect_local.sh` (repo root) builds each cell in `CELLS` with `zoo.py` (skipped when it exists), runs
 `oodselect_paper.py` for every (variant, budget) as single-threaded processes, `JOBS` at a time, then
@@ -67,7 +76,8 @@ superseded: do not run them for the paper.
 are the 45-feature table and both directions, so the routines always set `CELLS` (the seven-feature run also
 `DATA_DIR=data/processed_w7 CELLS_DIR=data/interim/aotil/cells_w7`). Other knobs: `SEED`, `VARIANTS`, `MU_SPATIAL`
 (3), `KNN` (10), `BUDGETS`, `NULL_SEEDS`, `SPLITS`, `BUDGET_PENALTY` (squared) and `REG` (laplacian; `REG=gtv`
-with `VARIANTS=spatial` runs GTV). Outputs the 2026-10-21 code review made stale: `docs/RUN-FL-V2.md`.
+with `VARIANTS=spatial` runs GTV); `SUBDIR` (empty) puts the outputs under `results/<date>/<SUBDIR>/` and the logs
+under `logs/<date>/<SUBDIR>/` (the w9 experiment uses `SUBDIR=w9`). Outputs the 2026-10-21 code review made stale: `docs/RUN-FL-V2.md`.
 
 ## How `oodselect_paper.py` follows the authors' code
 

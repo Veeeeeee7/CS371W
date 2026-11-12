@@ -10,9 +10,12 @@ used) or DECIDE (works, but needs a decision or a sentence in the paper). Inputs
 Writes under --out: audit.md (paste-ready), audit.json (the same, machine readable),
 missingness.csv and, with --v1, shift_v1.csv. Run from the repo root, because
 sample_points.read_geoms reads data/interim/prep/:
-    python audit_dataset.py --state FL --dataset data/processed/dataset_FL.parquet \\
-        --v1 data/interim/archive/sampling-v1/data/processed/dataset_FL.parquet \\
-        --out results/$D/data_audit
+    python audit_dataset.py --state FL --dataset data/processed_v4/dataset_FL.parquet \\
+        --features data/processed_v4/FEATURES.txt --n-features 9 --out results/$D/data_audit
+
+B1 reads the candidate and survivor counts that sample_points.py stored with the points (--points):
+every group drew exactly --candidates candidates and the table keeps every survivor
+(docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md D1). B17 retests every sampling mask on the table.
 """
 import argparse
 import json
@@ -290,53 +293,56 @@ def state_polygons(path: Path, state: str) -> gpd.GeoDataFrame:
 # =========================================================================
 # Part B: the table on its own
 # =========================================================================
-def neg_rank_status(df: pd.DataFrame) -> tuple[bool, str]:
-    """meta_neg_rank must run 0..n-1 within each negative stratum and be -1 on positives."""
-    if "meta_neg_rank" not in df.columns:
-        return True, "meta_neg_rank absent"
-    neg = df[df.label == 0]
-    broken = []
-    for key, g in neg.groupby(["domain", neg.neg_protocol.fillna("-")]):
-        ranks = np.sort(g.meta_neg_rank.to_numpy())
-        if not np.array_equal(ranks, np.arange(len(g))):
-            broken.append(key)
-    positives_ok = bool((df.loc[df.label == 1, "meta_neg_rank"] == -1).all())
-    if not broken and positives_ok:
-        return True, "meta_neg_rank dense 0..n-1 per stratum, -1 on positives"
-    return False, f"meta_neg_rank broken in {broken or 'positives'}"
+def points_match(df: pd.DataFrame, points: pd.DataFrame) -> str:
+    """"" when the table holds exactly the points file's points (point_id, domain, label,
+    protocol and lon/lat to 1e-9 degrees), else what differs."""
+    if len(df) != len(points) or set(df.point_id) != set(points.point_id):
+        return f"{len(df):,} rows against {len(points):,} points, other point_ids"
+    left = df.set_index("point_id")
+    right = points.set_index("point_id").reindex(left.index)
+    bad = []
+    for column in ("domain", "label"):
+        if not (left[column].to_numpy() == right[column].to_numpy()).all():
+            bad.append(column)
+    if not (left.neg_protocol.fillna("-").to_numpy() == right.neg_protocol.fillna("-").to_numpy()).all():
+        bad.append("neg_protocol")
+    for column in ("lon", "lat"):
+        if not np.allclose(left[column].to_numpy(float), right[column].to_numpy(float),
+                           rtol=0, atol=1e-9):
+            bad.append(column)
+    return f"{', '.join(bad)} differ" if bad else ""
 
 
 def check_counts(au, df, a):
-    """B1: both zones hold exactly the v2 targets and nothing else."""
+    """B1: every group (zone and label) drew exactly --candidates candidates, and the table keeps
+    every survivor of the two thinning passes, as sample_points.py stored them with the points,
+    and holds exactly the points file's points."""
     counts = strata(df)
-    by_zone = counts.unstack("domain", fill_value=0)
-    n_neg = int(round(a.per_domain * a.neg_ratio))
-    targets = {(1, "-"): a.per_domain, (0, a.protocol): n_neg}
-    tab = by_zone.reset_index()
-    tab["target per zone"] = [targets.get((label, protocol), 0)
-                              for label, protocol in zip(tab.label, tab.neg_protocol)]
-    both_zones = {"A", "AE"} <= set(by_zone.columns)
-    identical = both_zones and bool((by_zone["A"] == by_zone["AE"]).all())
-    exact = both_zones and set(by_zone.index) == set(targets)
-    if exact:
-        for key, target in targets.items():
-            if int(by_zone.loc[key, "A"]) != target or int(by_zone.loc[key, "AE"]) != target:
-                exact = False
-    extra = sorted(p for _, p in by_zone.index if p not in ("-", a.protocol))
-    rank_ok, rank_note = neg_rank_status(df)
-
-    verdict = "OK" if identical and exact and rank_ok else "WRONG"
-    result = (f"{len(df):,} rows; A/AE strata identical: {'yes' if identical else 'NO'}; "
-              f"exact v2 targets ({a.per_domain:,} positives + {n_neg:,} {a.protocol} "
-              f"negatives per zone, nothing else): {'yes' if exact else 'NO'}")
-    if extra:
-        result += f" (extra protocols: {', '.join(extra)})"
-    result += f"; {rank_note}"
-    au.add("B1", "Counts by domain x label x neg_protocol", verdict, result,
-           "`df.groupby(['domain','label',neg_protocol.fillna('-')]).size()` against "
-           "--per-domain and round(--per-domain * --neg-ratio).",
-           [("rows per stratum", tab)],
-           dict(strata={f"{d}/{l}/{p}": int(n) for (d, l, p), n in counts.items()}))
+    have_points = a.points is not None and a.points.exists()
+    settings = (sp.build_config(a.points) if have_points else None) or {}
+    groups = sp.build_counts(a.points) if have_points else None
+    settings = dict(settings, candidates=a.candidates)
+    bad = sp.group_problems(counts, settings, groups)
+    if have_points:
+        differ = points_match(df, gpd.read_parquet(a.points))
+        if differ:
+            bad.append(f"table vs {a.points}: {differ}")
+    else:
+        bad.append(f"{a.points} not found")
+    tab = sp.group_table(groups) if groups else pd.DataFrame()
+    result = (f"{len(df):,} rows; {a.candidates:,} candidates per group and every survivor "
+              f"kept: {'yes' if not bad else 'NO: ' + '; '.join(bad[:4])}")
+    if groups:
+        result += "; kept " + ", ".join(f"{key} {c['kept']:,}" for key, c in sorted(groups.items()))
+    au.add("B1", "Candidates and survivors per group (zone x label x neg_protocol)",
+           "OK" if not bad else "WRONG", result,
+           "`df.groupby(['domain','label',neg_protocol.fillna('-')]).size()` against the "
+           "candidate and survivor counts sample_points.py stored in the points file's parquet "
+           "metadata (`sample_points.build_counts`, `group_problems`), and the table's point_ids, "
+           "zones, labels and lon/lat against the points file.",
+           [("candidates and survivors per group", tab)],
+           dict(strata={f"{d}/{l}/{p}": int(n) for (d, l, p), n in counts.items()},
+                groups=groups or {}))
 
 
 def check_split(au, df, a):
@@ -505,10 +511,18 @@ def check_constant(au, b, feats):
            dict(constant=const, near_constant=near))
 
 
+# The spread of elevation around a point (terrain variability, elev_sd_r300: the SD within 300 m,
+# docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md D3) is relative relief, like the old tri_300; absolute
+# elevation (elev, StreamCat's elevcat and elevws) says where a point is and stays out.
+ELEVATION_SPREAD = re.compile(r"^elev_sd_")
+
+
 def is_forbidden_feature(name: str) -> bool:
-    """Identifiers, split keys, metadata and elevation must never be features."""
+    """Identifiers, split keys, metadata and absolute elevation must never be features; the SD of
+    elevation within a radius (ELEVATION_SPREAD) may."""
+    absolute_elevation = "elev" in name.lower() and not ELEVATION_SPREAD.match(name.lower())
     return (name.startswith(sp.META_PREFIX) or name in ID_COLS or name.startswith("tile_")
-            or name.endswith("_id") or "elev" in name.lower())
+            or name.endswith("_id") or absolute_elevation)
 
 
 def check_features_txt(au, feats, df, n_expect):
@@ -529,7 +543,7 @@ def check_features_txt(au, feats, df, n_expect):
               f"an identifier, a tile nor meta_: {other or 'none'}")
     au.add("B6", "FEATURES.txt hygiene", verdict, result,
            "parsed as `zoo.load` does; forbidden: `meta_*`, `tile_*`, `*_id`, any name "
-           "containing `elev`, and " + ", ".join(f"`{c}`" for c in sorted(ID_COLS)) + ".",
+           "containing `elev` (absolute elevation) but not the SD of elevation `elev_sd_*`, and " + ", ".join(f"`{c}`" for c in sorted(ID_COLS)) + ".",
            data=dict(n=len(feats), absent=absent, banned=banned, unclassified=other))
 
 
@@ -766,6 +780,69 @@ def check_invariants(au, df, a):
            "STRtree over the EPSG:5070 points (as `sample_points.audit`) and "
            "`meta_dist_to_sfha_m`; repeated here so a merge cannot have broken them.",
            data=dict(min_nn_m=float(nearest.min()), close_pairs=close))
+
+
+def check_masks(au, df, idx, pan, cn, state, a):
+    """B17: every sampling mask retested on the table: every point on land per the land-mask
+    raster and per its own landcover; every band negative 500 m to 5 km from the nearest SFHA
+    (meta_dist_to_sfha_m; B16 recomputes it), inside a FIRM panel, outside Zone D and AREA NOT
+    INCLUDED, outside the NFHL OPEN WATER polygons, and inside the state's county polygons."""
+    x, y = xy(df)
+    problems, parts = [], []
+    if a.land_mask is not None and a.land_mask.exists():
+        land = sp.LandMask(a.land_mask)
+        off = int((~sp.LandMask.is_land(land.classes_at(x, y))).sum())
+        parts.append(f"not on land per {a.land_mask.name}: {off}")
+        if off:
+            problems.append(f"{off} points not on land per the mask")
+    else:
+        problems.append("no land-mask raster to test against")
+    if "landcover" in df.columns:
+        lc = pd.to_numeric(df.landcover, errors="coerce")
+        water = int((lc.isna() | lc.isin([sp.MASK_OPEN_WATER, sp.MASK_NODATA])).sum())
+        parts.append(f"landcover 11, 0 or missing: {water}")
+        if water:
+            problems.append(f"{water} points with landcover 11, 0 or missing")
+    band = df[df.neg_protocol == a.protocol]
+    bx, by = xy(band)
+    band_pts = shapely.points(bx, by)
+    dist = band.meta_dist_to_sfha_m.to_numpy(float)
+    band_min, band_max = sp.DEFAULTS["band_min_m"], sp.DEFAULTS["band_max_m"]
+    off_band = int(((dist < band_min) | (dist > band_max) | ~np.isfinite(dist)).sum())
+    parts.append(f"{a.protocol} negatives outside {band_min:.0f}-{band_max:.0f} m: {off_band}")
+    if off_band:
+        problems.append(f"{off_band} {a.protocol} negatives outside the band")
+    tests = []
+    if pan is not None:
+        inside = sp._query_mask(STRtree(np.asarray(pan.geometry.values)), band_pts, "within")
+        tests.append(("outside every FIRM panel", int((~inside).sum())))
+    else:
+        problems.append("no FIRM panels to test against")
+    unassessed = sp.read_unassessed(state, idx)
+    n_in = 0
+    if len(unassessed):
+        n_in = int(sp._query_mask(STRtree(unassessed), band_pts, "intersects").sum())
+    tests.append((f"in {' or '.join(sp.UNASSESSED_ZONES)}", n_in))
+    water_polys = sp.read_open_water(state, idx)
+    n_water = 0
+    if len(water_polys):
+        n_water = int(sp._query_mask(STRtree(water_polys), band_pts, "intersects").sum())
+    tests.append((f"in NFHL {sp.OPEN_WATER_ZONE}", n_water))
+    if cn is not None:
+        home = sp._query_mask(STRtree(np.asarray(cn.geometry.values)), band_pts, "within")
+        tests.append((f"outside the {len(cn)} {state} county polygons", int((~home).sum())))
+    else:
+        problems.append("no county polygons to test against")
+    for name, n in tests:
+        parts.append(f"{a.protocol} negatives {name}: {n}")
+        if n:
+            problems.append(f"{n} {a.protocol} negatives {name}")
+    au.add("B17", "Every sampling mask holds on the table", "OK" if not problems else "WRONG",
+           f"{len(df):,} points, {len(band):,} {a.protocol} negatives; " + "; ".join(parts),
+           "the land-mask raster at every point (`sample_points.LandMask`), the landcover column, "
+           "`meta_dist_to_sfha_m`, and the FIRM panels, Zone D / AREA NOT INCLUDED, NFHL OPEN "
+           "WATER and county polygons against every band negative (`sample_points._query_mask`).",
+           data=dict(problems=problems))
 
 
 def check_positive_polygons(au, df, idx, state):
@@ -1314,9 +1391,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=0, help="tile split seed (zoo.split_tiles)")
     ap.add_argument("--protocol", default="band", choices=list(sp.PROTOCOLS))
     ap.add_argument("--train-dom", default="AE", choices=["A", "AE"])
-    ap.add_argument("--per-domain", type=int, default=20000, help="positives per zone (v2)")
-    ap.add_argument("--neg-ratio", type=float, default=1.0, help="negatives per positive (v2)")
-    ap.add_argument("--min-sep", type=float, default=100.0, help="spacing floor, metres (v2)")
+    ap.add_argument("--points", type=Path,
+                    help="the points file the table was built from (B1 reads its stored counts); "
+                         "default data/interim/points/points_<ST>.parquet")
+    ap.add_argument("--candidates", type=int, default=sp.DEFAULTS["candidates"],
+                    help="candidates per group (sample_points.py --candidates)")
+    ap.add_argument("--land-mask", type=Path, default=GIS_DIR / "nlcd2021_FL.tif",
+                    help="the land-mask raster the points were drawn with (B17)")
+    ap.add_argument("--min-sep", type=float, default=100.0, help="spacing floor, metres")
     ap.add_argument("--n-features", type=int, default=45)
     ap.add_argument("--nearest-sample", type=int, default=-1,
                     help="band negatives per zone for the nearest-SFHA check; "
@@ -1334,6 +1416,7 @@ def main(argv: list[str]) -> int:
     a.dataset = a.dataset or DATA / f"dataset_{st}.parquet"
     a.idx = a.idx or sp.PREP_DIR / f"idx_{st}.parquet"
     a.panels = a.panels or sp.IN_DIR / f"pan_{st}.parquet"
+    a.points = a.points or sp.OUT_DIR / f"points_{st}.parquet"
     haz = sp.PREP_DIR / f"haz_{st}_5070.parquet"
     for p in (a.dataset, a.features, a.idx, haz, a.v1, a.counties):
         if p is not None and not p.exists():
@@ -1380,6 +1463,7 @@ def main(argv: list[str]) -> int:
     check_point_id(au, df, st)
     check_spatial_keys(au, df)
     check_invariants(au, df, a)
+    check_masks(au, df, idx, pan, cn, st, a)
     check_positive_polygons(au, df, idx, st)
     check_fld_zone(au, df, a)
     check_county(au, df, st)
@@ -1396,7 +1480,8 @@ def main(argv: list[str]) -> int:
     inputs = []
     for role, path in (("dataset", a.dataset), ("v1", a.v1), ("features", a.features),
                        ("idx", a.idx), ("haz", haz), ("panels", a.panels),
-                       ("counties", a.counties)):
+                       ("counties", a.counties), ("points", a.points),
+                       ("land mask", a.land_mask)):
         if path is not None and path.exists():
             inputs.append(dict(role=role, **file_info(path)))
     meta = dict(state=st, generated=datetime.now().isoformat(timespec="seconds"),

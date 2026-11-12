@@ -9,7 +9,9 @@ plus seed = "pooled" rows that average Fisher z over seeds for the full selectio
 Subsets: the spatial and classic S = 500 selections, each region (>= 20 points), the region
 unions; each also land only (NLCD class 11, open water, dropped). Model sets: all300, test60,
 test_lt099, all_lt099 (the primary), all_lt095, fam_<kind>. Only test60 and test_lt099 are held
-out from the selection (column `circular`). See docs/TASK-O5-REGIONS.md Part A and
+out from the selection (column `circular`). all300 and test60 keep the names of the first 300-model
+cells so that every run's CSV reads the same: they are all of the cell's models and its test models
+(op.model_split), whatever their number (n_models). See docs/TASK-O5-REGIONS.md Part A and
 docs/O5-REGIONS-REPORT-2026-10-17.md Part A.
 
     .venv/bin/python aotil/o5_interpolation.py --cells-dir data/interim/aotil/cells_w7 \\
@@ -39,8 +41,9 @@ INTERP = 0.99           # acc_train_sub at or above which a model interpolates i
 STRICT_CUT = 0.95       # all_lt095: a stricter "does not interpolate" cut
 MIN_REGION = 20         # smallest region kept, in points (as regions.py)
 FAMILIES = ("dt", "et", "hgb", "lr", "mlp", "nb", "rf", "xgb")
-# The selection was optimised on the 180 selection models and tuned on the 60 validation models,
-# so a model set that contains them measures r partly in-sample. Unlisted sets (fam_*) are circular.
+# The selection was optimised on the selection models and tuned on the validation models of the
+# 60/20/20 split, so a model set that contains them measures r partly in-sample. Unlisted sets
+# (fam_*) are circular.
 CIRCULAR = {"all300": True, "test60": False, "test_lt099": False,
             "all_lt099": True, "all_lt095": True}
 PRIMARY = ("spatial_full", False, "all_lt099")   # (subset, land_only, model set), pooled row
@@ -180,7 +183,8 @@ def seed_rows(seed: int, a, rl: pd.DataFrame, landcover: pd.Series) -> list[dict
     interpolates = models.acc_train_sub.to_numpy() >= INTERP
     print(f"seed {seed}: {Z.shape[0]} models x {Z.shape[1]} OOD points; water OOD points "
           f"{int((~land).sum())}; interpolating (acc_train_sub >= {INTERP}) "
-          f"{int(interpolates.sum())} of {len(models)}, {int((interpolates & is_test).sum())} of 60 test")
+          f"{int(interpolates.sum())} of {len(models)}, {int((interpolates & is_test).sum())} of "
+          f"{int(is_test.sum())} test")
 
     rows = []
     subsets = subsets_for_seed(seed, cell, a.sel_root, a.regions_dir, rl, a.budget, a.variant, a.classic)
@@ -329,7 +333,7 @@ def main() -> int:
     table = interp_table(a.cells_dir, a.cell_prefix, a.seeds)
     print("\ninterpolating models (acc_train_sub >= 0.99) by seed and family:")
     print(table.pivot(index="family", columns="seed", values="interp_099").to_string())
-    print("of them in the 60 test models:")
+    print("of them in the test models:")
     print(table.pivot(index="family", columns="seed", values="test_interp_099").to_string())
     print()
 

@@ -2,11 +2,16 @@
 """Sample a point-level flood-label dataset from FEMA NFHL flood-zone polygons.
 
 Domain A draws its positives inside Zone A polygons (approximate study), domain AE inside Zone AE
-polygons (detailed study). Both domains are built by one protocol and trimmed to identical stratum
-sizes, so they differ only in the polygons behind them. Negatives are `band` (500-5,000 m from
-every SFHA, inside a FIRM panel) or `shadedX` (inside Zone X 0.2%-chance polygons). Columns named
-`meta_*` record how the map was made and are never features; every downstream split is made on
-`block_id`. Protocol v2 settings and their citations: docs/PROJECT-PLAN.md section 2a.
+polygons (detailed study). Both domains are built by one protocol, so they differ only in the
+polygons behind them. Negatives are `band` (500-5,000 m from every SFHA, inside a FIRM panel) or
+`shadedX` (inside Zone X 0.2%-chance polygons). Columns named `meta_*` record how the map was made
+and are never features; every downstream split is made on `block_id`.
+
+Each group (zone and label, docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md D1) draws exactly
+--candidates candidates that pass every requirement of its group: positives uniform by area over
+the zone's polygons (no polygon cap, D2), band negatives inside the band and its masks. The
+candidates are thinned to --min-sep-m within each group, then once over the whole state, and every
+survivor is kept: the groups end a few hundred points apart, not at a round number.
 
 With --land-mask (off by default), no point lies on open water: positives and shadedX negatives
 are drawn over the land inside their polygons, band negatives over the land in the band and
@@ -15,11 +20,11 @@ outside NFHL OPEN WATER polygons. The mask is NLCD land cover from pull_land_mas
 Inputs:  data/interim/nfhl_states/{haz,pan,s_bfe}_FL.parquet
          data/interim/gis/nlcd2021_FL.tif (--land-mask only)
 Outputs: data/interim/prep/{idx_FL,haz_FL_5070}.parquet (--prep, run once)
-         data/interim/points/points_FL.parquet
+         data/interim/points/points_FL.parquet (the settings and the candidate and survivor counts
+         per group in its parquet metadata: build_config, build_counts)
 
     python sample_points.py --prep FL
-    python sample_points.py FL --protocols band --exact --ring-oversample 6
-    python sample_points.py FL --protocols band --exact --ring-oversample 6 \\
+    python sample_points.py FL --protocols band --candidates 25000 \\
         --state-polygons data/interim/gis/counties_FL.parquet \\
         --land-mask data/interim/gis/nlcd2021_FL.tif
     python sample_points.py --audit FL
@@ -56,23 +61,27 @@ RG_ROWS = 10_000    # rows per row group in the prep repack; read_geoms relies o
 ATTRS = ["DFIRM_ID", "FLD_AR_ID", "STUDY_TYP", "FLD_ZONE", "ZONE_SUBTY",
          "SFHA_TF", "STATIC_BFE", "DEPTH", "SOURCE_CIT"]
 
-# Every key is also a CLI option (--per-domain, --ring-oversample, ...), in this order.
+# Every key is also a CLI option (--candidates, --min-sep-m, ...), in this order.
 DEFAULTS = dict(
-    per_domain=20000,     # positives per domain (A, AE)
-    neg_ratio=1.0,        # negatives per positive, per protocol
+    candidates=25000,     # valid candidates per group (zone and label, or zone and protocol)
     min_sep_m=100.0,      # floor between any two points, any class or zone; de-cluttering only
     block_km=10.0,        # spatial CV block edge; spatial autocorrelation is handled by blocks
-    poly_cap_frac=0.02,   # no polygon may supply more than this share of a domain's candidates
     band_min_m=500.0,     # band negatives: nearest SFHA at least this far
     band_max_m=5000.0,    # ... and at most this far
-    oversample=3.0,       # candidates drawn per point wanted, before thinning
-    ring_oversample=2.0,  # band candidates = n_neg * oversample * ring_oversample
-    surplus=0.03,         # extra share per stratum, absorbed by the whole-state separation pass
     protocols="band,shadedX",
     state_polygons="",    # optional polygon file (e.g. counties) band negatives must lie inside
     seed=20260918,
 )
 PROTOCOLS = ("band", "shadedX")
+
+# First batch of proposals per valid candidate wanted (draw_valid): about the inverse of the share
+# that passes (positives: 85-97% on land; band: about 8.5% in the 2026-10-23 build, most of the
+# rest closer than 500 m to an SFHA). Later batches use the share actually seen.
+FIRST_BATCH = {"positive": 1.25, "band": 13.0, "shadedX": 1.25}
+MAX_BATCHES = 20
+MAX_GROWTH = 10          # a batch proposes at most this many times the one before
+MAX_BATCH = 5_000_000    # and at most this many candidates
+EMPTY_AFTER = 100        # no valid candidate after this many proposals per one wanted: give up
 UNASSESSED_ZONES = ("D", "AREA NOT INCLUDED")   # inside FIRM panels but never studied
 OPEN_WATER_ZONE = "OPEN WATER"    # NFHL's mapped open water; --land-mask keeps band negatives out
 
@@ -90,12 +99,13 @@ MAX_RINGS = 10_000        # distinct polygons buffered for the band (FL: ~4,400 
 RING_SIMPLIFY_M = 100.0   # simplification before buffering; the exact distance filter decides
 
 CONFIG_KEY = b"sample_points"   # parquet metadata key holding the build settings
+COUNTS_KEY = b"sample_points_counts"   # ... and the candidate and survivor counts per group
 LEAD_COLUMNS = ["point_id", "state", "county_fips", "dfirm_id", "block_id",
                 "domain", "label", "neg_protocol", "lon", "lat"]
 
 
 class SupplyError(RuntimeError):
-    """A stratum fell short of its exact target under --exact."""
+    """A group could not reach its candidate count within MAX_BATCHES batches."""
 
 
 # =========================================================================
@@ -384,9 +394,10 @@ def _has_kept_neighbour(xi, yi, cell, x, y, kept_in_cell, min_sep_sq) -> bool:
     return False
 
 
-def sample_in_polygons(geoms: np.ndarray, weights, n: int, cap: int,
+def sample_in_polygons(geoms: np.ndarray, weights, n: int, cap: int | None,
                        rng: np.random.Generator, max_rounds: int = 30):
-    """n points uniform over the union of geoms (weights: their areas), at most cap per polygon.
+    """n points over the union of geoms, each polygon drawn in proportion to its weight (its area:
+    a uniform draw), at most cap per polygon (no cap when cap is None).
 
     Returns (x, y, index into geoms).
     """
@@ -396,20 +407,25 @@ def sample_in_polygons(geoms: np.ndarray, weights, n: int, cap: int,
     return place_points(geoms, quota, rng, max_rounds)
 
 
-def polygon_quota(weights, n: int, cap: int, rng: np.random.Generator) -> np.ndarray:
-    """Points per polygon: n draws with replacement in proportion to weight, at most cap each.
+def polygon_quota(weights, n: int, cap: int | None, rng: np.random.Generator) -> np.ndarray:
+    """Points per polygon: n draws with replacement in proportion to weight, at most cap each
+    (no cap when cap is None).
 
     Drawing polygons by area and placing one uniform point in each is a uniform draw over their
-    union; a fixed count per polygon would over-represent small polygons. The cap keeps a few huge
-    polygons from dominating; draws it cut off are redrawn once among the polygons below it.
-    Needs no geometry, so it runs over a whole zone's index before any geometry is read.
+    union; a fixed count per polygon would over-represent small polygons. Positives use no cap,
+    so they stay uniform by area (docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md D2). The band's
+    rings keep one (sample_band_negatives); draws it cuts off are redrawn once among the polygons
+    below it. Needs no geometry, so it runs over a whole zone's index before any geometry is read.
     """
     weight = np.asarray(weights, dtype=float)
     weight = np.where(np.isfinite(weight) & (weight > 0), weight, 0.0)
     if n <= 0 or weight.sum() <= 0:
         return np.zeros(len(weight), dtype=np.int64)
 
-    quota = np.minimum(rng.multinomial(n, weight / weight.sum()), cap)
+    quota = rng.multinomial(n, weight / weight.sum())
+    if cap is None:
+        return quota
+    quota = np.minimum(quota, cap)
     deficit = n - int(quota.sum())
     if deficit > 0:
         room = cap - quota
@@ -521,6 +537,44 @@ def distances_to_sfha(state: str, pts: np.ndarray, sfha_idx: pd.DataFrame,
     return dist
 
 
+def draw_valid(propose, n: int, first: int, rng: np.random.Generator,
+               max_batches: int = MAX_BATCHES) -> tuple[dict, dict]:
+    """Exactly n valid candidates, in random order: (their columns, counts summed over batches).
+
+    propose(k) proposes k independent candidates from one distribution and returns (the columns of
+    the valid ones, a dict of counts with "proposed" and how many each test removed). The first
+    batch proposes `first`; each later one the shortfall over the share valid so far, plus 20%,
+    but at most MAX_GROWTH times the batch before and at most MAX_BATCH (a share near zero would
+    otherwise ask for billions). With no valid candidate after EMPTY_AFTER proposals per candidate
+    wanted, the group cannot be supplied.
+    The valid candidates of every batch are independent draws from the valid region, whatever the
+    number of batches, so a random n of the pool are too. counts gains "batches", "valid" (the
+    pool, before the cut to n) and "candidates" (n). Raises SupplyError after max_batches.
+    """
+    parts, counts = [], {"proposed": 0}
+    have, k = 0, max(int(first), 1)
+    for _ in range(max_batches):
+        cols, batch_counts = propose(k)
+        for key, value in batch_counts.items():
+            counts[key] = counts.get(key, 0) + int(value)
+        counts["batches"] = counts.get("batches", 0) + 1
+        parts.append(cols)
+        have += len(cols["x"])
+        if have >= n:
+            break
+        if have == 0 and counts["proposed"] >= EMPTY_AFTER * n:
+            break
+        share = max(have, 1) / counts["proposed"]
+        k = min(int(np.ceil((n - have) / share * 1.2)), MAX_GROWTH * k, MAX_BATCH)
+    if have < n:
+        raise SupplyError(f"{have:,} valid candidates of the {n:,} wanted after {max_batches} "
+                          f"batches ({counts['proposed']:,} proposed)")
+    pooled = {key: np.concatenate([part[key] for part in parts]) for key in parts[0]}
+    take = rng.permutation(have)[:n]
+    counts.update(valid=have, candidates=n)
+    return {key: values[take] for key, values in pooled.items()}, counts
+
+
 # =========================================================================
 # point frames
 # =========================================================================
@@ -581,27 +635,78 @@ def _tag(frame: pd.DataFrame, domain: str, label: int, protocol) -> pd.DataFrame
 # =========================================================================
 # negatives
 # =========================================================================
+def band_filter(state, x, y, sfha_idx, pan_tree, cfg, state_tree=None, unassessed_tree=None):
+    """Which band candidates (EPSG:5070 x, y) pass the band and every mask, tested in the build's
+    order: (valid mask, distance to the nearest SFHA, mask class or None, counts).
+
+    A point counts as absence only where FEMA assessed the area: band_min_m to band_max_m from
+    every SFHA (the exact distance), inside a FIRM panel (pan_tree), outside Zone D and AREA NOT
+    INCLUDED (unassessed_tree), with --land-mask outside the NFHL OPEN WATER polygons
+    (cfg["open_water_tree"]) and on land (cfg["land"]), and, given state_tree, inside the state,
+    whose NFHL lacks the neighbours' floodplains. Each count is of the candidates that passed every
+    earlier test.
+    """
+    pts = shapely.points(x, y)
+    band_min, band_max = cfg["band_min_m"], cfg["band_max_m"]
+    dist = distances_to_sfha(state, pts, sfha_idx, band_max)
+    too_near = dist < band_min
+    too_far = dist > band_max
+    ok = ~too_near & ~too_far
+    counts = dict(too_near=int(too_near.sum()), too_far=int(too_far.sum()))
+    if pan_tree is not None:
+        inside = _query_mask(pan_tree, pts, "within")
+        counts["outside_panel"] = int((ok & ~inside).sum())
+        ok &= inside
+    if unassessed_tree is not None:
+        unassessed = _query_mask(unassessed_tree, pts, "intersects")
+        counts["unassessed"] = int((ok & unassessed).sum())
+        ok &= ~unassessed
+    mask_lc = None
+    land = cfg.get("land")
+    if land is not None:
+        if cfg.get("open_water_tree") is not None:
+            water = _query_mask(cfg["open_water_tree"], pts, "intersects")
+            counts["open_water"] = int((ok & water).sum())
+            ok &= ~water
+        mask_lc = land.classes_at(x, y)
+        land_ok = LandMask.is_land(mask_lc)
+        counts["not_on_land"] = int((ok & ~land_ok).sum())
+        ok &= land_ok
+    if state_tree is not None:
+        home = _query_mask(state_tree, pts, "within")
+        counts["outside_state"] = int((ok & ~home).sum())
+        ok &= home
+    return ok, dist, mask_lc, counts
+
+
+def _counts_text(counts: dict, labels: dict) -> str:
+    """The counts named in labels, in its order, as "N label" phrases."""
+    return ", ".join(f"{counts[key]:,} {label}" for key, label in labels.items() if key in counts)
+
+
+BAND_LABELS = {"too_near": "< band_min", "too_far": "> band_max",
+               "outside_panel": "outside a panel",
+               "unassessed": "in " + " or ".join(UNASSESSED_ZONES),
+               "open_water": f"in {OPEN_WATER_ZONE}", "not_on_land": "not on land per the mask",
+               "outside_state": "outside the state polygons", "unplaced": "never placed"}
+
+
 def sample_band_negatives(state, src_idx, src_geoms, sfha_idx, pan_tree, n, cfg, rng,
                           state_tree=None, unassessed_tree=None):
-    """Up to n band negatives, band_min_m to band_max_m from every SFHA, as a frame (or None).
+    """Exactly n band candidates (band_filter), thinned to min_sep_m with every survivor kept:
+    (frame, counts), or None without source polygons.
 
-    The band is a ring around the polygons behind the domain's positives, so the protocol never
-    reads FLD_ZONE and is identical for A and AE. A point counts as absence only where FEMA
-    assessed the area: inside a FIRM panel (pan_tree), outside Zone D and AREA NOT INCLUDED
-    (unassessed_tree) and, given state_tree, inside the state, whose NFHL lacks the neighbours'
-    floodplains. The ring only bounds the candidates (the exact distance filter decides), so it
-    is built from simplified polygons and widened by the simplification tolerance; its 8-segment
-    corners sit at most ~25 m inside the true buffer.
-
-    With --land-mask, build_state puts the mask (cfg["land"]) and the NFHL OPEN WATER polygons
-    (cfg["open_water_tree"]) into the cfg it passes, and candidates in OPEN WATER or not on land
-    are dropped too; each kept point records its mask class in meta_mask_lc.
+    The band is a ring around the polygons behind the domain's positive candidates, so the
+    protocol never reads FLD_ZONE and is identical for A and AE. The ring only bounds the
+    candidates (band_filter decides), so it is built from simplified polygons and widened by the
+    simplification tolerance; its 8-segment corners sit at most ~25 m inside the true buffer. A
+    ring is drawn in proportion to its area, and no ring may supply more than four times an even
+    share of a batch, so a few huge polygons cannot dominate; overlapping rings make the band
+    denser where many polygons are near. Each kept point records its mask class in meta_mask_lc
+    (with --land-mask). Raises SupplyError when the band cannot supply n.
     """
     if n <= 0 or len(src_geoms) == 0:
         return None
-
-    band_min, band_max = cfg["band_min_m"], cfg["band_max_m"]
-    want = int(n * cfg["oversample"] * cfg["ring_oversample"])
 
     ring_src = np.arange(len(src_geoms))
     flag = ""
@@ -611,216 +716,107 @@ def sample_band_negatives(state, src_idx, src_geoms, sfha_idx, pan_tree, n, cfg,
     print(f"    band rings from {len(src_geoms):,} polygons "
           f"(cap {MAX_RINGS:,}){flag}", flush=True)
     simplified = shapely.simplify(src_geoms[ring_src], RING_SIMPLIFY_M)
-    rings = shapely.buffer(simplified, band_max + RING_SIMPLIFY_M, quad_segs=8)
-    # No ring may supply more than four times an even share of the candidates.
-    cap = max(4, int(np.ceil(want / max(len(rings) // 4, 1))))
+    rings = shapely.buffer(simplified, cfg["band_max_m"] + RING_SIMPLIFY_M, quad_segs=8)
+    ring_area = shapely.area(rings)
 
-    x, y, ring_i = sample_in_polygons(rings, shapely.area(rings), want, cap, rng)
-    if len(x) == 0:
-        return None
+    def propose(k):
+        cap = max(4, int(np.ceil(k / max(len(rings) // 4, 1))))
+        x, y, ring_i = sample_in_polygons(rings, ring_area, k, cap, rng)
+        ok, dist, mask_lc, counts = band_filter(state, x, y, sfha_idx, pan_tree, cfg,
+                                                state_tree, unassessed_tree)
+        counts.update(proposed=k, unplaced=k - len(x))
+        cols = dict(x=x[ok], y=y[ok], ring=ring_i[ok], dist=dist[ok])
+        if mask_lc is not None:
+            cols["mask_lc"] = mask_lc[ok]
+        return cols, counts
 
-    pts = shapely.points(x, y)
-    dist = distances_to_sfha(state, pts, sfha_idx, band_max)
-    too_near = dist < band_min
-    too_far = dist > band_max
-    ok = ~too_near & ~too_far
-    # Each mask below counts only the points that passed every earlier test.
-    outside_panel = np.zeros(len(pts), dtype=bool)
-    if pan_tree is not None:
-        inside = _query_mask(pan_tree, pts, "within")
-        outside_panel = ok & ~inside
-        ok &= inside
-    unassessed = np.zeros(len(pts), dtype=bool)
-    if unassessed_tree is not None:
-        in_unassessed = _query_mask(unassessed_tree, pts, "intersects")
-        unassessed = ok & in_unassessed
-        ok &= ~in_unassessed
-    land = cfg.get("land")
-    mask_lc = None
-    water_note = ""
-    if land is not None:
-        open_water = np.zeros(len(pts), dtype=bool)
-        if cfg.get("open_water_tree") is not None:
-            in_open_water = _query_mask(cfg["open_water_tree"], pts, "intersects")
-            open_water = ok & in_open_water
-            ok &= ~in_open_water
-        mask_lc = land.classes_at(x, y)
-        land_ok = LandMask.is_land(mask_lc)
-        off_land = ok & ~land_ok
-        ok &= land_ok
-        water_note = (f", {int(open_water.sum()):,} in {OPEN_WATER_ZONE}, "
-                      f"{int(off_land.sum()):,} not on land per the mask")
-    abroad = np.zeros(len(pts), dtype=bool)
-    if state_tree is not None:
-        home = _query_mask(state_tree, pts, "within")
-        abroad = ok & ~home
-        ok &= home
-    if not ok.any():
-        return None
-
-    x, y, dist, ring_i = x[ok], y[ok], dist[ok], ring_i[ok]
-    thinned = grid_thin(x, y, cfg["min_sep_m"], rng)
-    mask_note = ""
-    if state_tree is not None:
-        mask_note = f", {int(abroad.sum()):,} outside the state polygons"
-    print(f"    band candidates {len(pts):,}: {int(too_near.sum()):,} < {band_min:.0f} m, "
-          f"{int(too_far.sum()):,} > {band_max:.0f} m, {int(outside_panel.sum()):,} outside a "
-          f"panel, {int(unassessed.sum()):,} in {' or '.join(UNASSESSED_ZONES)}"
-          f"{water_note}{mask_note}; {len(x):,} valid, {len(thinned):,} after thinning",
-          flush=True)
-    if len(thinned) < n:
-        suggested = cfg["ring_oversample"] * n / max(len(thinned), 1) * 1.1
-        print(f"    band supply short: {len(thinned):,}/{n:,}; try --ring-oversample "
-              f"{suggested:.1f}", flush=True)
-    keep = thinned[:n]
-    x, y, dist, ring_i = x[keep], y[keep], dist[keep], ring_i[keep]
-    src = ring_src[ring_i]
-    frame = _blank_frame(src_idx["DFIRM_ID"].to_numpy()[src], x, y, dist,
+    cand, counts = draw_valid(propose, n, int(np.ceil(n * FIRST_BATCH["band"])), rng)
+    thinned = grid_thin(cand["x"], cand["y"], cfg["min_sep_m"], rng)
+    counts["after_group_thinning"] = len(thinned)
+    counts["rings"] = len(rings)
+    labels = dict(BAND_LABELS, too_near=f"< {cfg['band_min_m']:.0f} m",
+                  too_far=f"> {cfg['band_max_m']:.0f} m")
+    print(f"    band: {counts['proposed']:,} proposed in {counts['batches']} batches: "
+          f"{_counts_text(counts, labels)}; {counts['valid']:,} valid, {n:,} candidates, "
+          f"{len(thinned):,} after thinning", flush=True)
+    src = ring_src[cand["ring"][thinned]]
+    frame = _blank_frame(src_idx["DFIRM_ID"].to_numpy()[src], cand["x"][thinned],
+                         cand["y"][thinned], cand["dist"][thinned],
                          src_idx["row_id"].to_numpy()[src])
-    if mask_lc is not None:
-        frame["meta_mask_lc"] = mask_lc[ok][keep]
-    return frame
+    if "mask_lc" in cand:
+        frame["meta_mask_lc"] = cand["mask_lc"][thinned]
+    return frame, counts
 
 
-def sample_shaded_x(state, domain, shaded_idx, src, sfha_idx, n_neg, cfg, rng):
-    """Up to n_neg shadedX negatives, inside Zone X 0.2%-chance polygons of the DFIRMs behind
-    the domain's positives. They control for whether a place was mapped at all, which the
-    distance band does not. Returns a frame, or None."""
+def area_uniform_candidates(state, polys: pd.DataFrame, n: int, cfg: dict, rng, kind: str):
+    """Exactly n candidates uniform by area over the land of polys (index rows with row_id and
+    area_m2), with no polygon cap: (columns x, y, owner (the row of polys) and, with
+    --land-mask, mask_lc; counts; the geometry of every polygon read, by row_id).
+
+    Each batch draws its polygons in proportion to area over all of polys and reads geometry only
+    for the polygons that drew a point, once. A placed candidate not on land per cfg["land"]
+    fails (on_land): dropping points from an area-uniform draw leaves an area-uniform draw over
+    the land, where rejecting water inside place_points would keep each polygon's count
+    proportional to its whole area and over-sample the land of mostly-water polygons.
+    """
+    areas = polys["area_m2"].to_numpy()
+    row_ids = polys["row_id"].to_numpy()
+    cache: dict[int, object] = {}
+
+    def propose(k):
+        quota = polygon_quota(areas, k, None, rng)
+        live = np.nonzero(quota > 0)[0]
+        new = [int(r) for r in row_ids[live] if int(r) not in cache]
+        if new:
+            cache.update(zip(new, read_geoms(state, new)))
+        geoms = np.array([cache[int(r)] for r in row_ids[live]], dtype=object)
+        found = _is_present(geoms)
+        x, y, i = place_points(geoms[found], quota[live][found], rng)
+        owner = live[found][i]
+        counts = dict(proposed=k, no_geometry=int(quota[live][~found].sum()),
+                      unplaced=int(quota[live][found].sum()) - len(x))
+        cols = dict(x=x, y=y, owner=owner)
+        if cfg.get("land") is not None:
+            x, y, owner, mask_lc = on_land(cfg["land"], x, y, owner)
+            counts["not_on_land"] = len(cols["x"]) - len(x)
+            cols = dict(x=x, y=y, owner=owner, mask_lc=mask_lc)
+        return cols, counts
+
+    cand, counts = draw_valid(propose, n, int(np.ceil(n * FIRST_BATCH[kind])), rng)
+    return cand, counts, cache
+
+
+def sample_shaded_x(state, domain, shaded_idx, src, sfha_idx, n, cfg, rng):
+    """Exactly n shadedX candidates, uniform by area over the land of the Zone X 0.2%-chance
+    polygons of the DFIRMs behind the domain's positives, thinned to min_sep_m with every
+    survivor kept: (frame, counts), or None. They control for whether a place was mapped at all,
+    which the distance band does not."""
     candidates = shaded_idx[shaded_idx.DFIRM_ID.isin(set(src.DFIRM_ID))]
     if len(candidates) == 0:
         print(f"  [{domain}] negatives shadedX none in these DFIRMs")
         return None
-
-    over = cfg["oversample"]
-    quota = polygon_quota(candidates["area_m2"].to_numpy(), int(n_neg * over),
-                          int(_polygon_cap(cfg) * over), rng)
-    live = np.nonzero(quota > 0)[0]
-    polys = candidates.iloc[live]
-    quota = quota[live]
-    geoms = read_geoms(state, polys["row_id"].to_numpy())
-    found = _is_present(geoms)
-    polys, geoms, quota = polys[found], geoms[found], quota[found]
-
-    x, y, pidx = place_points(geoms, quota, rng)
-    if len(x) == 0:
-        return None
-    mask_lc = None
-    if cfg.get("land") is not None:
-        n_placed = len(x)
-        x, y, pidx, mask_lc = on_land(cfg["land"], x, y, pidx)
-        print(f"  [{domain}] shadedX: {n_placed - len(x):,} of {n_placed:,} candidates not on "
-              f"land per the mask", flush=True)
-        if len(x) == 0:
-            return None
-    keep = grid_thin(x, y, cfg["min_sep_m"], rng)[:n_neg]
-    x, y, pidx = x[keep], y[keep], pidx[keep]
+    cand, counts, _ = area_uniform_candidates(state, candidates, n, cfg, rng, "shadedX")
+    thinned = grid_thin(cand["x"], cand["y"], cfg["min_sep_m"], rng)
+    counts["after_group_thinning"] = len(thinned)
+    x, y, owner = cand["x"][thinned], cand["y"][thinned], cand["owner"][thinned]
     dist = distances_to_sfha(state, shapely.points(x, y), sfha_idx, cfg["band_max_m"])
-    frame = _tag(_attr_frame(polys.iloc[pidx], x, y, dist), domain, 0, "shadedX")
-    if mask_lc is not None:
-        frame["meta_mask_lc"] = mask_lc[keep]
-    print(f"  [{domain}] negatives shadedX {len(x):,}/{n_neg:,}", flush=True)
-    return frame
-
-
-# =========================================================================
-# strata: ranking, trimming, balancing
-# =========================================================================
-def rank_negatives(df: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
-    """Add meta_neg_rank: each negative's position in a random ordering within its stratum.
-
-    This makes the negative ratio a post hoc filter: `meta_neg_rank < r * n_pos` gives ratio r,
-    and the samples nest (a 1:2 set contains the 1:1 set), so two ratios differ only in how many
-    negatives they hold, not which. Positives get -1. Works on a copy.
-    """
-    df = df.copy()
-    df["meta_neg_rank"] = -1
-    is_neg = df.label == 0
-    if not is_neg.any():
-        return df
-    df["_order"] = rng.permutation(len(df))     # a random position for every row
-    df.loc[is_neg, "meta_neg_rank"] = _rank_within_strata(df[is_neg], "_order")
-    return df.drop(columns="_order")
-
-
-def dense_ranks(df: pd.DataFrame) -> pd.DataFrame:
-    """Renumber meta_neg_rank 0..n-1 within each stratum after rows were dropped (in place)."""
-    is_neg = df.label == 0
-    if is_neg.any():
-        df.loc[is_neg, "meta_neg_rank"] = _rank_within_strata(df[is_neg], "meta_neg_rank")
-    return df
-
-
-def _rank_within_strata(neg: pd.DataFrame, column: str) -> pd.Series:
-    """0-based rank of `column` within each (domain, neg_protocol) stratum of the negatives."""
-    strata = [neg["domain"], neg["neg_protocol"].fillna("-")]
-    ranks = neg.groupby(strata)[column].rank(method="first")
-    return ranks.astype(int) - 1
-
-
-def achieved_ratios(df: pd.DataFrame) -> pd.DataFrame:
-    """Negatives actually obtained per positive, per stratum."""
-    pos = df[df.label == 1].groupby("domain").size()
-    rows = []
-    for (domain, protocol), negs in df[df.label == 0].groupby(
-            ["domain", df.neg_protocol.fillna("-")]):
-        n_pos = int(pos.get(domain, 0))
-        rows.append(dict(domain=domain, protocol=protocol, pos=n_pos, neg=len(negs),
-                         ratio=round(len(negs) / max(n_pos, 1), 2)))
-    return pd.DataFrame(rows)
-
-
-def trim_to_targets(df: pd.DataFrame, cfg: dict, protocols: list[str]):
-    """Cut every stratum to its target; return (df, shortfalls).
-
-    Positives keep the first per_domain rows of each domain in frame order, which is grid_thin's
-    random visit order, so the cut is a uniform subsample. Each requested negative protocol keeps
-    the round(n_pos * neg_ratio) rows with the lowest meta_neg_rank, n_pos being the positives its
-    domain kept. A short stratum is reported as (domain, label, protocol, have, want); positives
-    are never trimmed to reach a ratio.
-    """
-    keep = []
-    short = []
-    for domain in ("A", "AE"):
-        rows = df[df.domain == domain]
-        pos = rows[rows.label == 1]
-        if len(pos) < cfg["per_domain"]:
-            short.append((domain, 1, "-", len(pos), cfg["per_domain"]))
-        pos = pos.iloc[:cfg["per_domain"]]
-        keep.append(pos)
-        target = int(round(len(pos) * cfg["neg_ratio"]))
-        for protocol in protocols:
-            negs = rows[(rows.label == 0) & (rows.neg_protocol.fillna("-") == protocol)]
-            if len(negs) < target:
-                short.append((domain, 0, protocol, len(negs), target))
-            keep.append(negs.nsmallest(target, "meta_neg_rank"))
-    return pd.concat(keep, ignore_index=True), short
-
-
-def balance_domains(df: pd.DataFrame) -> pd.DataFrame:
-    """Trim each (label, protocol) stratum to the smaller domain's size, so A and AE match.
-
-    A transfer gap between unequal datasets would be uninterpretable.
-    """
-    df = df.copy()
-    df["_p"] = df["neg_protocol"].fillna("-")
-    sizes = df.groupby(["label", "_p", "domain"]).size().unstack("domain")
-    if sizes.shape[1] < 2:
-        return df.drop(columns="_p")
-    target = sizes.min(axis=1)
-    parts = []
-    for (label, protocol), stratum in df.groupby(["label", "_p"]):
-        n = int(target.get((label, protocol), 0))
-        for _, rows in stratum.groupby("domain"):
-            parts.append(rows.iloc[:n])
-    out = pd.concat(parts, ignore_index=True).drop(columns="_p")
-    if len(out) != len(df):
-        print(f"  balanced A/AE: {len(df):,} -> {len(out):,}")
-    return out
+    frame = _tag(_attr_frame(candidates.iloc[owner], x, y, dist), domain, 0, "shadedX")
+    if "mask_lc" in cand:
+        frame["meta_mask_lc"] = cand["mask_lc"][thinned]
+    print(f"  [{domain}] negatives shadedX: {counts['proposed']:,} proposed, "
+          f"{counts.get('not_on_land', 0):,} not on land; {n:,} candidates, "
+          f"{len(thinned):,} after thinning", flush=True)
+    return frame, counts
 
 
 def stratum_sizes(df: pd.DataFrame) -> pd.Series:
     """Rows per (domain, label, neg_protocol); positives' protocol shows as '-'."""
     return df.fillna({"neg_protocol": "-"}).groupby(["domain", "label", "neg_protocol"]).size()
+
+
+def group_key(domain: str, label: int, protocol: str) -> str:
+    """A group's name in the stored counts: "A/1/-", "AE/0/band"."""
+    return f"{domain}/{int(label)}/{protocol}"
 
 
 # =========================================================================
@@ -946,16 +942,6 @@ def parse_protocols(text: str) -> list[str]:
     return protocols
 
 
-def _polygon_cap(cfg: dict) -> int:
-    """Most points one polygon may supply to a domain, before oversampling."""
-    return max(1, int(cfg["poly_cap_frac"] * cfg["per_domain"]))
-
-
-def _with_surplus(n: int, surplus: float) -> int:
-    """n plus the extra share drawn so the whole-state pass cannot leave a stratum short."""
-    return n + int(np.ceil(n * surplus))
-
-
 def read_panels(state: str):
     """The state's FIRM panels in EPSG:5070, or None when there is no panel file."""
     path = IN_DIR / f"pan_{state}.parquet"
@@ -991,57 +977,40 @@ def read_open_water(state: str, idx: pd.DataFrame) -> np.ndarray:
 
 
 def sample_positives(state, domain, zone_idx, cfg, rng):
-    """A domain's positives, thinned to min_sep_m, kept up to per_domain plus the surplus.
+    """A domain's positives: exactly cfg["candidates"] candidates uniform by area over the land of
+    the zone's polygons (area_uniform_candidates, no polygon cap), thinned to min_sep_m with every
+    survivor kept.
 
-    Quotas are drawn over every polygon of the zone, and geometry is read only for the polygons
-    that drew a point (about 9,000 per zone in Florida). With cfg["land"] (--land-mask), placed
-    candidates not on land are dropped before thinning (on_land). Returns (frame, src, geoms,
-    pidx), where src and geoms are those polygons and pidx maps each kept point to them, or None.
+    Returns (frame, src, geoms, counts), where src (index rows) and geoms are the polygons behind
+    the candidates, which seed the band's rings, or None.
     """
     if len(zone_idx) == 0:
         print(f"  [{domain}] no polygons")
         return None
+    n = cfg["candidates"]
+    zone_idx = zone_idx.reset_index(drop=True)
+    cand, counts, cache = area_uniform_candidates(state, zone_idx, n, cfg, rng, "positive")
+    thinned = grid_thin(cand["x"], cand["y"], cfg["min_sep_m"], rng)
+    counts["after_group_thinning"] = len(thinned)
+    owner = cand["owner"][thinned]
+    frame = _tag(_attr_frame(zone_idx.iloc[owner], cand["x"][thinned], cand["y"][thinned],
+                             np.zeros(len(thinned))), domain, 1, pd.NA)
+    if "mask_lc" in cand:
+        frame["meta_mask_lc"] = cand["mask_lc"][thinned]
 
-    n_target = cfg["per_domain"]
-    over = cfg["oversample"]
-    quota = polygon_quota(zone_idx["area_m2"].to_numpy(), int(n_target * over),
-                          int(_polygon_cap(cfg) * over), rng)
-    live = np.nonzero(quota > 0)[0]
-    src = zone_idx.iloc[live]
-    quota = quota[live]
-    geoms = read_geoms(state, src["row_id"].to_numpy())
-    found = _is_present(geoms)
-    src, geoms, quota = src[found], geoms[found], quota[found]
-    if len(geoms) == 0:
-        print(f"  [{domain}] no geometry read")
-        return None
+    used = np.unique(cand["owner"])
+    src = zone_idx.iloc[used].reset_index(drop=True)
+    geoms = np.array([cache[int(r)] for r in src["row_id"]], dtype=object)
+    counts["polygons"] = len(used)
+    print(f"  [{domain}] positives: {counts['proposed']:,} proposed in {counts['batches']} "
+          f"batches, {_counts_text(counts, POSITIVE_LABELS)}; {counts['valid']:,} valid, "
+          f"{n:,} candidates from {len(used):,} polygons, {src.DFIRM_ID.nunique()} DFIRMs; "
+          f"{len(thinned):,} after thinning ({100 * len(thinned) / n:.1f}%)", flush=True)
+    return frame, src, geoms, counts
 
-    x, y, pidx = place_points(geoms, quota, rng)
-    if len(x) == 0:
-        print(f"  [{domain}] sampling produced nothing")
-        return None
-    mask_lc = None
-    if cfg.get("land") is not None:
-        n_placed = len(x)
-        x, y, pidx, mask_lc = on_land(cfg["land"], x, y, pidx)
-        print(f"  [{domain}] positives: {n_placed - len(x):,} of {n_placed:,} candidates not on "
-              f"land per the mask", flush=True)
-        if len(x) == 0:
-            return None
-    drawn = len(x)
-    thinned = grid_thin(x, y, cfg["min_sep_m"], rng)
-    keep = thinned[:_with_surplus(n_target, cfg["surplus"])]
-    x, y, pidx = x[keep], y[keep], pidx[keep]
 
-    frame = _tag(_attr_frame(src.iloc[pidx], x, y, np.zeros(len(x))), domain, 1, pd.NA)
-    if mask_lc is not None:
-        frame["meta_mask_lc"] = mask_lc[keep]
-    supply_flag = "" if len(x) >= n_target else "   <-- SUPPLY-LIMITED"
-    print(f"  [{domain}] positives {len(x):,} kept for {n_target:,} from "
-          f"{len(src):,} polygons, {src.iloc[pidx].DFIRM_ID.nunique()} DFIRMs "
-          f"(thinning kept {100*len(thinned)/drawn:.0f}% of {drawn:,}){supply_flag}",
-          flush=True)
-    return frame, src, geoms, pidx
+POSITIVE_LABELS = {"not_on_land": "not on land per the mask", "unplaced": "never placed",
+                   "no_geometry": "without geometry"}
 
 
 def separate_whole_state(df: pd.DataFrame, min_sep_m: float, rng):
@@ -1064,65 +1033,39 @@ def separate_whole_state(df: pd.DataFrame, min_sep_m: float, rng):
     return df, sizes_before
 
 
-def trim_and_balance(df: pd.DataFrame, cfg: dict, protocols: list[str],
-                     sizes_before: pd.Series, state: str) -> pd.DataFrame:
-    """Cut the strata to their targets, report each shortfall with its remedy, match A to AE.
-
-    Raises SupplyError under --exact when any stratum is short, so a short build is never written.
-    """
-    n_before = len(df)
-    df, short = trim_to_targets(df, cfg, protocols)
-    print(f"  trimmed surplus to targets: {n_before:,} -> {len(df):,}")
-    remedies = set()
-    for domain, label, protocol, have, want in short:
-        # Enough rows before the whole-state pass means the pass ate the surplus;
-        # otherwise the stratum never had the candidates.
-        if int(sizes_before.get((domain, label, protocol), 0)) >= want:
-            why = "lost to the whole-state pass"
-            fix = "--surplus"
-        elif label == 1:
-            why = "supply"
-            fix = "--oversample"
-        else:
-            why = "supply"
-            fix = "--ring-oversample"
-        remedies.add(fix)
-        what = "positives" if label == 1 else protocol
-        print(f"  [{domain}] {what} {have:,}/{want:,}   <-- SHORT ({why}: raise {fix})")
-    if short and cfg.get("exact"):
-        raise SupplyError(
-            f"[{state}] {len(short)} strata short of the exact targets; nothing "
-            f"written. Raise {' and '.join(sorted(remedies))}.")
-    return dense_ranks(balance_domains(df))
+def group_table(groups: dict) -> pd.DataFrame:
+    """One row per group: candidates, survivors of the group's own thinning, survivors of the
+    whole-state pass (kept), the candidates proposed, and the share kept."""
+    rows = []
+    for key, c in groups.items():
+        rows.append(dict(group=key, proposed=c.get("proposed"), candidates=c["candidates"],
+                         after_group_thinning=c["after_group_thinning"], kept=c["kept"],
+                         kept_share=round(c["kept"] / c["candidates"], 4)))
+    table = pd.DataFrame(rows)
+    total = dict(group="total", proposed=table.proposed.sum(), candidates=table.candidates.sum(),
+                 after_group_thinning=table.after_group_thinning.sum(), kept=table.kept.sum())
+    total["kept_share"] = round(total["kept"] / total["candidates"], 4)
+    return pd.concat([table, pd.DataFrame([total])], ignore_index=True)
 
 
-def print_achieved_ratios(df: pd.DataFrame, neg_ratio: float) -> None:
-    """Print each stratum's negatives per positive, flagging those below the request."""
-    ratios = achieved_ratios(df)
-    short = ratios[ratios.ratio < neg_ratio - 0.01]
-    print("  achieved negatives per positive:")
-    for row in ratios.itertuples():
-        flag = "   <-- SUPPLY-CAPPED" if row.ratio < neg_ratio - 0.01 else ""
-        print(f"    {row.domain:<3} {row.protocol:<8} {row.neg:>7,}/{row.pos:<7,} "
-              f"= {row.ratio:.2f}{flag}")
-    if len(short):
-        print(f"  {len(short)}/{len(ratios)} strata below the requested "
-              f"{neg_ratio:g}:1 -- report the achieved ratio, not the request")
-
-
-def write_points(points: gpd.GeoDataFrame, path: Path, cfg: dict) -> None:
-    """Write the points with the build settings in the parquet metadata, so --audit tests what
-    was built."""
+def write_points(points: gpd.GeoDataFrame, path: Path, cfg: dict,
+                 groups: dict | None = None) -> None:
+    """Write the points with the build settings and the per-group counts in the parquet
+    metadata, so --audit tests what was built."""
     path.parent.mkdir(parents=True, exist_ok=True)
     points.to_parquet(path)
     table = pq.read_table(path)
     metadata = dict(table.schema.metadata or {})
     metadata[CONFIG_KEY] = json.dumps(cfg, sort_keys=True).encode()
+    if groups is not None:
+        metadata[COUNTS_KEY] = json.dumps(groups, sort_keys=True).encode()
     pq.write_table(table.replace_schema_metadata(metadata), path)
 
 
 def build_state(state: str, cfg: dict):
-    """Sample one state's points and write points_{state}.parquet; return them, or None."""
+    """Sample one state's points and write points_{state}.parquet; return them, or None.
+
+    Raises SupplyError when a group cannot reach cfg["candidates"]; nothing is written then."""
     t0 = time.time()
     idx = load_index(state)
     rng = np.random.default_rng(cfg["seed"] + sum(map(ord, state)))
@@ -1168,54 +1111,54 @@ def build_state(state: str, cfg: dict):
     n_panels = 0 if pan is None else len(pan)
     print(f"\n[{state}] A={int((pos_idx.FLD_ZONE == 'A').sum()):,}  "
           f"AE={int((pos_idx.FLD_ZONE == 'AE').sum()):,}  "
-          f"shadedX={len(shaded_idx):,}  panels={n_panels:,}", flush=True)
+          f"shadedX={len(shaded_idx):,}  panels={n_panels:,}; "
+          f"{cfg['candidates']:,} candidates per group", flush=True)
     bfe = bfe_density_map(state, sfha_idx)
     if bfe:
         print(f"  BFE density for {len(bfe)} DFIRMs")
 
-    frames = []
+    frames, groups = [], {}
     for domain in ("A", "AE"):
         positives = sample_positives(state, domain, pos_idx[pos_idx.FLD_ZONE == domain],
                                      sample_cfg, rng)
         if positives is None:
             continue
-        pos, src, geoms, pidx = positives
+        pos, src, geoms, counts = positives
         frames.append(pos)
-
-        # Negatives are sized to the positives this stratum will keep, and only those
-        # positives' polygons seed the ring: the surplus absorbs the whole-state pass,
-        # it does not widen the band.
-        n_pos = min(len(pos), cfg["per_domain"])
-        n_neg = _with_surplus(int(round(n_pos * cfg["neg_ratio"])), cfg["surplus"])
+        groups[group_key(domain, 1, "-")] = counts
 
         if "band" in protocols:
-            used = np.unique(pidx[:n_pos])
-            band = sample_band_negatives(state, src.iloc[used].reset_index(drop=True),
-                                         geoms[used], sfha_idx, pan_tree, n_neg, sample_cfg,
-                                         rng, state_tree, unassessed_tree)
-            if band is not None and len(band):
-                frames.append(_tag(band, domain, 0, "band"))
-                print(f"  [{domain}] negatives band    {len(band):,}/{n_neg:,}", flush=True)
+            band = sample_band_negatives(state, src, geoms, sfha_idx, pan_tree,
+                                         cfg["candidates"], sample_cfg, rng, state_tree,
+                                         unassessed_tree)
+            if band is not None:
+                frame, counts = band
+                frames.append(_tag(frame, domain, 0, "band"))
+                groups[group_key(domain, 0, "band")] = counts
 
         if "shadedX" in protocols:
-            shaded = sample_shaded_x(state, domain, shaded_idx, src, sfha_idx, n_neg,
-                                     sample_cfg, rng)
+            shaded = sample_shaded_x(state, domain, shaded_idx, src, sfha_idx,
+                                     cfg["candidates"], sample_cfg, rng)
             if shaded is not None:
-                frames.append(shaded)
+                frame, counts = shaded
+                frames.append(frame)
+                groups[group_key(domain, 0, "shadedX")] = counts
 
     if not frames:
         return None
     df = pd.concat(frames, ignore_index=True)
-
-    df, sizes_before = separate_whole_state(df, cfg["min_sep_m"], rng)
-    df = rank_negatives(df, rng)
-    df = trim_and_balance(df, cfg, protocols, sizes_before, state)
-    print_achieved_ratios(df, cfg["neg_ratio"])
+    df, _ = separate_whole_state(df, cfg["min_sep_m"], rng)
+    kept = stratum_sizes(df)
+    for key, counts in groups.items():
+        domain, label, protocol = key.split("/")
+        counts["kept"] = int(kept.get((domain, int(label), protocol), 0))
+    print("  candidates and survivors per group:\n"
+          + _indented(group_table(groups).to_string(index=False)), flush=True)
 
     df = attach_panel_meta(df, pan)
     points = add_point_columns(df, state, cfg, bfe, state_polys)
     out = OUT_DIR / f"points_{state}.parquet"
-    write_points(points, out, cfg)
+    write_points(points, out, cfg, groups)
     print(f"[{state}] wrote {len(points):,} points, {points.block_id.nunique():,} blocks "
           f"-> {out}  ({time.time()-t0:.0f}s)")
     return points
@@ -1225,6 +1168,14 @@ def build_config(path: Path) -> dict | None:
     """The settings stored with a build, or None for a build that predates them."""
     metadata = pq.read_schema(path).metadata or {}
     raw = metadata.get(CONFIG_KEY)
+    return json.loads(raw) if raw else None
+
+
+def build_counts(path: Path) -> dict | None:
+    """The per-group counts stored with a build ("A/1/-" -> candidates, after_group_thinning,
+    kept, ...), or None for a build that predates them."""
+    metadata = pq.read_schema(path).metadata or {}
+    raw = metadata.get(COUNTS_KEY)
     return json.loads(raw) if raw else None
 
 
@@ -1256,14 +1207,8 @@ def audit_points(state: str, path: Path, cfg: dict) -> None:
     strata = ["domain", "label", points.neg_protocol.fillna("-")]
     counts = points.groupby(strata).size()
     print("  strata:\n" + _indented(counts.to_string()))
-    if {"A", "AE"} <= set(points.domain.unique()):
-        a = counts.xs("A", level=0)
-        ae = counts.xs("AE", level=0)
-        a_on_ae = a.reindex(ae.index).fillna(0).astype(int)
-        same = a_on_ae.equals(ae.astype(int))
-        print(f"  A/AE strata identical: {'YES' if same else 'NO  <-- BROKEN'}")
     if built:
-        _audit_exact_targets(counts, settings)
+        _audit_groups(counts, settings, build_counts(path))
 
     _audit_spacing(points, strata, settings["min_sep_m"])
 
@@ -1288,7 +1233,7 @@ def audit_points(state: str, path: Path, cfg: dict) -> None:
         share = per_polygon.sort_values(ascending=False) / len(domain_pos)
         print(f"  [{domain}] positives from {len(share):,} polygons; largest "
               f"{100*share.iloc[0]:.2f}%, top 10 {100*share.iloc[:10].sum():.1f}% "
-              f"(cap {100*settings['poly_cap_frac']:.0f}% applies to candidates)")
+              f"(uniform by area, no polygon cap)")
     shaded = points[points.neg_protocol == "shadedX"]
     if len(shaded):
         print(f"  shadedX negatives inside an SFHA: "
@@ -1303,21 +1248,37 @@ def audit_points(state: str, path: Path, cfg: dict) -> None:
     print("  positive study regimes (%):\n" + _indented(regimes.to_string()))
 
 
-def _audit_exact_targets(counts: pd.Series, settings: dict) -> None:
-    """Whether every stratum holds exactly its target: per_domain positives, and
-    round(per_domain * neg_ratio) negatives per protocol, in each domain."""
-    n_pos = settings["per_domain"]
-    n_neg = int(round(n_pos * settings["neg_ratio"]))
-    want = {}
-    for domain in ("A", "AE"):
-        want[(domain, 1, "-")] = n_pos
-    for domain in ("A", "AE"):
-        for protocol in parse_protocols(settings["protocols"]):
-            want[(domain, 0, protocol)] = n_neg
-    got = {key: int(counts.get(key, 0)) for key in want}
-    ok = got == want and len(counts) == len(want)
-    print(f"  exact targets ({n_pos:,} positives, {n_neg:,} per "
-          f"negative protocol, per domain): {'YES' if ok else 'NO'}")
+def group_problems(counts: pd.Series, settings: dict, groups: dict | None) -> list[str]:
+    """How a build's groups break the candidate design (D1): every group of the stored counts
+    drew exactly settings["candidates"] candidates, kept no more than its own thinning left and
+    that no more than its candidates, and the file holds exactly the stored kept counts and no
+    other group. counts are the file's rows per (domain, label, protocol)."""
+    if groups is None:
+        return ["no candidate counts stored with the build"]
+    n = settings["candidates"]
+    bad = []
+    in_file = {group_key(d, label, p): int(v) for (d, label, p), v in counts.items()}
+    for key in sorted(set(in_file) - set(groups)):
+        bad.append(f"{key}: {in_file[key]:,} rows but no stored counts")
+    for key, c in sorted(groups.items()):
+        if c["candidates"] != n:
+            bad.append(f"{key}: {c['candidates']:,} candidates, not {n:,}")
+        if not c["kept"] <= c["after_group_thinning"] <= c["candidates"]:
+            bad.append(f"{key}: kept {c['kept']:,} > thinned {c['after_group_thinning']:,} "
+                       f"or thinned > candidates")
+        if in_file.get(key, 0) != c["kept"]:
+            bad.append(f"{key}: {in_file.get(key, 0):,} rows in the file, {c['kept']:,} stored")
+    return bad
+
+
+def _audit_groups(counts: pd.Series, settings: dict, groups: dict | None) -> None:
+    """Print each group's candidates and survivors and whether they follow the design."""
+    if groups is not None:
+        print("  candidates and survivors:\n"
+              + _indented(group_table(groups).to_string(index=False)))
+    bad = group_problems(counts, settings, groups)
+    print(f"  {settings['candidates']:,} candidates per group, every survivor kept: "
+          f"{'YES' if not bad else 'NO  <-- ' + '; '.join(bad[:3])}")
 
 
 def _audit_spacing(points: gpd.GeoDataFrame, strata: list, sep: float) -> None:
@@ -1425,16 +1386,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--audit", action="store_true")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--exact", action="store_true",
-                        help="fail, writing nothing, unless every stratum reaches "
-                             "per_domain positives and per_domain*neg_ratio negatives")
     for key, default in DEFAULTS.items():
         parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
     args = parser.parse_args(argv)
 
     options = vars(args)
     cfg = {key: options[key] for key in DEFAULTS}
-    cfg["exact"] = args.exact
     if mask_args.land_mask:
         cfg["land_mask"] = mask_args.land_mask
     parse_protocols(cfg["protocols"])
@@ -1462,8 +1419,8 @@ def main(argv: list[str]) -> int:
             print(f"[{state}] exists -- skipping (use --force to rebuild)")
             continue
         try:
-            if build_state(state, cfg) is None and cfg["exact"]:
-                print(f"[{state}] FAILED: nothing built under --exact", file=sys.stderr)
+            if build_state(state, cfg) is None:
+                print(f"[{state}] FAILED: nothing built", file=sys.stderr)
                 failed.append(state)
         except SupplyError as err:
             print(f"[{state}] FAILED: {err}", file=sys.stderr)

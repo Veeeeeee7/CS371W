@@ -6,14 +6,21 @@ native grid, and written as its own shard; finished shards are skipped, so a rer
 --merge joins the shards to the points and derives the model features (see derive()). TWI and
 SPI are left out on purpose: docs/COVARIATES.md section 4.
 
+Terrain variability (elev_sd_r300, docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md D3) is the standard
+deviation of the 3DEP 10 m elevations within a circle of radius 300 m centred on the point: each
+point is buffered by 300 m and the DEM pixels inside are reduced on the DEM's native grid
+(terrain_variability_group). The older tri_300, the standard deviation inside the fixed 300 m
+grid cell that holds the point, is still pulled and kept as meta_tri_300 for comparison.
+
 Input   data/interim/points/points_FL.parquet
 Output  data/interim/gee/FL/chunk_{i:05d}.parquet   one shard per chunk
-        data/processed/dataset_FL.parquet           after --merge, plus FEATURES.txt if absent
+        <processed>/dataset_FL.parquet              after --merge (default data/processed),
+                                                    plus FEATURES.txt if absent
 
     python pull_gee.py --selftest --project $EE_PROJECT   # three Vermont points, prints the table
     python pull_gee.py FL --project $EE_PROJECT
     python pull_gee.py --status FL
-    python pull_gee.py --merge FL
+    python pull_gee.py --merge FL --processed data/interim/v4_build
 """
 import argparse
 import os
@@ -43,14 +50,17 @@ WORKERS = 6         # concurrent Earth Engine requests
 RETRIES = 5         # attempts per request
 
 # The raw bands every shard carries, in shard column order.
-ALL_BANDS = ["elev", "slope", "aspect", "curvature", "tpi_300", "tri_300",
+ALL_BANDS = ["elev", "slope", "aspect", "curvature", "tpi_300", "tri_300", "elev_sd_r300",
              "hand", "log1p_upa", "tpi_broad", "landcover", "impervious",
              "gsw_occurrence", "water_frac_900m"]
 
 # The columns a model may use; derive() makes them from ALL_BANDS. Seeded into FEATURES.txt.
-FEATURES = ["slope", "aspect_sin", "aspect_cos", "curvature", "tpi_300", "tri_300",
+FEATURES = ["slope", "aspect_sin", "aspect_cos", "curvature", "tpi_300", "elev_sd_r300",
             "hand", "log10_upa", "tpi_broad", "landcover", "impervious",
             "gsw_occurrence", "water_frac_900m"]
+
+SD_RADIUS_M = 300.0     # terrain variability: SD of the 10 m elevations within this radius
+BUFFER_ERROR_M = 1.0    # most a buffer circle's polygon may stray from the true circle
 FEATURES_HEADER = (
     "# columns a model may use. everything else in dataset_*.parquet is an\n"
     "# identifier or provenance metadata and must stay out.\n"
@@ -71,13 +81,18 @@ SELFTEST_POINTS = [         # (name, lon, lat)
 # Each group is one Earth Engine request: name, image, scale (nominal metres, for printing),
 # proj (the source's native grid, which sample_group samples on) and bands.
 
+def dem_3dep():
+    """(the USGS 3DEP 10 m DEM as one image, its native projection). mosaic() drops the
+    projection and ee.Terrain silently returns null on an image without one, so the collection's
+    native projection is put back."""
+    coll = ee.ImageCollection("USGS/3DEP/10m_collection")
+    native = coll.first().select("elevation").projection()
+    return coll.mosaic().select("elevation").setDefaultProjection(native), native
+
+
 def terrain_group() -> dict:
     """USGS 3DEP 10 m elevation and the terrain derived from it."""
-    coll = ee.ImageCollection("USGS/3DEP/10m_collection")
-    # mosaic() drops the projection and ee.Terrain silently returns null on an image without
-    # one, so the collection's native projection is put back first.
-    native = coll.first().select("elevation").projection()
-    dem = coll.mosaic().select("elevation").setDefaultProjection(native)
+    dem, native = dem_3dep()
 
     slope = ee.Terrain.slope(dem).rename("slope")
     aspect = ee.Terrain.aspect(dem).rename("aspect")
@@ -95,6 +110,19 @@ def terrain_group() -> dict:
              .addBands(curvature).addBands(tpi300).addBands(tri300))
     return dict(name="fine", image=image, scale=10, proj=native,
                 bands=["elev", "slope", "aspect", "curvature", "tpi_300", "tri_300"])
+
+
+def terrain_variability_group(dem=None, proj=None, radius_m: float = SD_RADIUS_M) -> dict:
+    """Terrain variability: the standard deviation of the DEM's elevations within radius_m of the
+    point (D3). sample_group buffers each point into a circle of radius_m (to BUFFER_ERROR_M) and
+    reduces the pixels inside with stdDev on the DEM's own grid (proj), each pixel weighted by the
+    share of it inside the circle, as Earth Engine's reduceRegions does by default. dem and proj
+    default to dem_3dep(); a test passes a synthetic image instead."""
+    if dem is None:
+        dem, proj = dem_3dep()
+    return dict(name="sd300", image=dem.rename("elev_sd_r300"), scale=10, proj=proj,
+                bands=["elev_sd_r300"], buffer_m=radius_m,
+                reducer=ee.Reducer.stdDev().setOutputs(["elev_sd_r300"]))
 
 
 def merit_group() -> dict:
@@ -152,7 +180,7 @@ def build_groups() -> list[dict]:
     """The request groups, one per source resolution. Sampling everything in one request at
     10 m would make Earth Engine evaluate the 300 m and 900 m reductions on a 10 m grid, which
     is slow and times out; separate requests also mean one failure does not cost the others."""
-    groups = [terrain_group(), merit_group(), nlcd_group()]
+    groups = [terrain_group(), terrain_variability_group(), merit_group(), nlcd_group()]
     asset_id = gsw_asset()
     if asset_id:
         groups.append(surface_water_group(asset_id))
@@ -166,16 +194,22 @@ def build_groups() -> list[dict]:
 def sample_group(group: dict, ids: list[str], lon: np.ndarray,
                  lat: np.ndarray) -> pd.DataFrame:
     """One Earth Engine request: the group's bands at each point, keyed by point_id.
-    Raises on failure; the caller retries."""
+
+    By default each point reads the cell that contains it (ee.Reducer.first() on the point). A
+    group with buffer_m reduces the circle of that radius around the point with its own reducer
+    (terrain_variability_group). Raises on failure; the caller retries."""
     features = []
     for pid, x, y in zip(ids, lon, lat):
-        point = ee.Geometry.Point([float(x), float(y)])
-        features.append(ee.Feature(point, {"pid": pid}))
+        geometry = ee.Geometry.Point([float(x), float(y)])
+        if group.get("buffer_m"):
+            geometry = geometry.buffer(group["buffer_m"], BUFFER_ERROR_M)
+        features.append(ee.Feature(geometry, {"pid": pid}))
     # On the source's own grid (crs, no scale), so each point reads the cell that contains it.
     # A scale alone rescales the first band's grid (90 m against MERIT's 92.77 m) and moves
     # ~43% of points to a neighbouring cell.
     response = group["image"].reduceRegions(
-        collection=ee.FeatureCollection(features), reducer=ee.Reducer.first(),
+        collection=ee.FeatureCollection(features),
+        reducer=group.get("reducer") or ee.Reducer.first(),
         crs=group["proj"],
         tileScale=4,                       # smaller tiles: fewer out-of-memory aborts
     ).getInfo()
@@ -315,6 +349,12 @@ def derive(out: pd.DataFrame) -> pd.DataFrame:
     if "elev" in out.columns:
         out = out.rename(columns={"elev": "meta_elev"})
 
+    # Terrain variability is elev_sd_r300 (the 300 m circle around the point, D3). The SD inside
+    # the fixed 300 m cell that holds the point is kept for comparison only, so that no reader can
+    # take it for the feature.
+    if "tri_300" in out.columns:
+        out = out.rename(columns={"tri_300": "meta_tri_300"})
+
     # log1p barely transforms upstream areas of hundredths of a km2. Floor at one MERIT cell
     # and take log10 instead; expm1(meta_log1p_upa) recovers the pulled value.
     if "log1p_upa" in out.columns:
@@ -363,11 +403,13 @@ def count_stale_rows(cov: pd.DataFrame, pts: pd.DataFrame) -> int:
     return stale
 
 
-def merge(states: list[str]) -> int:
+def merge(states: list[str], out_dir: Path | None = None) -> int:
     """Join each state's shards to its points, derive the features and write
-    data/processed/dataset_<ST>.parquet. Returns 1 if any state was refused, else 0."""
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    features_path = OUT_DIR / "FEATURES.txt"
+    <out_dir>/dataset_<ST>.parquet (out_dir: OUT_DIR, read when called). Returns 1 if any state
+    was refused, else 0."""
+    out_dir = OUT_DIR if out_dir is None else Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    features_path = out_dir / "FEATURES.txt"
     summary = []
     seeded = False
     refused = 0
@@ -414,7 +456,7 @@ def merge(states: list[str]) -> int:
         n_tiles = out.tile_50km.nunique()
         print(f"  {len(have)} features, {len(meta)} meta_ columns, {n_tiles:,} 50 km tiles")
 
-        dataset_path = OUT_DIR / f"dataset_{state}.parquet"
+        dataset_path = out_dir / f"dataset_{state}.parquet"
         out.to_parquet(dataset_path)
         # Seed the list on a first build only. A later merge must not cut it back to these 13:
         # pull_hydro and pull_atlas14 extend it, and zoo.py takes the model's columns in its order.
@@ -507,7 +549,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--selftest", action="store_true",
                     help="sample three Vermont points and print the values")
     ap.add_argument("--merge", action="store_true",
-                    help="join the shards into data/processed/dataset_<ST>.parquet")
+                    help="join the shards into <processed>/dataset_<ST>.parquet")
+    ap.add_argument("--processed", type=Path, default=None,
+                    help=f"folder --merge writes to (default {OUT_DIR})")
     ap.add_argument("--status", action="store_true", help="show finished chunks per state")
     args = ap.parse_args(argv)
 
@@ -520,7 +564,7 @@ def main(argv: list[str]) -> int:
         status(states)
         return 0
     if args.merge:
-        return merge(states)
+        return merge(states, args.processed)
 
     try:
         if args.project:

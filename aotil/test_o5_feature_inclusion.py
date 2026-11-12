@@ -7,13 +7,16 @@ Checks for o5_feature_inclusion.py (Part D1). Run from the repo root:
         --dataset data/processed/dataset_FL.parquet
         --regions-land results/2026-10-17/o5/regions_land.csv]
 
-1. indicators() reads the `features` strings and refuses a name that is not a model feature.
+1. indicators() reads the `features` strings and refuses a name that is not a model feature;
+   require_varying_inclusion() refuses a population where every model saw every feature (a grid
+   cell, zoo.py since 2026-11-06) and passes one with random feature subsets.
 2. probit() equals oodselect_paper.probit_t, clamp included (0 and 1 map to -/+4.753).
 3. ols() matches lstsq, sklearn, the textbook slope SE and r2_score; a rank-deficient X raises.
 4. vif() is 1 / (1 - corr^2) with two predictors.
 5. design(): one column per non-reference family, probit_acc_id only in the id formula, and an
    absent reference family is refused.
-6. A synthetic population drawn as zoo.py draws it, with one planted spurious feature: the fit
+6. A synthetic population drawn as zoo.py drew it before 2026-11-06 (random feature subsets),
+   with one planted spurious feature: the fit
    and its bootstrap find it; at a fixed n_feat two indicators correlate at -1/6.
 7. boot_draws() leaves a rank-deficient resample NaN.
 8. Real cells (skipped when missing): the masks are the stored selection, the region land counts
@@ -62,6 +65,17 @@ def test_indicators():
         check(False, "an unknown feature name is refused")
     except SystemExit:
         check(True, "an unknown feature name is refused")
+    # A grid cell (zoo.py since 2026-11-06): every model saw every feature, nothing to fit.
+    try:
+        fi.require_varying_inclusion(np.ones((5, len(FEATS)), int), FEATS, "grid")
+        check(False, "a population where every model saw every feature is refused")
+    except SystemExit:
+        check(True, "a population where every model saw every feature is refused")
+    try:
+        fi.require_varying_inclusion(I, FEATS, "random subsets")
+        check(True, "a population with random feature subsets passes")
+    except SystemExit:
+        check(False, "a population with random feature subsets passes")
 
 
 def test_probit():

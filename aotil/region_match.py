@@ -11,11 +11,16 @@ restricted to one land-cover class and to tiles the region does not touch, with 
 distance (the caliper).
 
 Definitions (3.6):
-  z(x)      the q = 6 numeric model inputs (FEATURES.txt minus landcover), each standardized by
-            its mean and standard deviation (ddof 1, as pandas computes it) over D_OOD, all Zone A
-            test points.
+  z(x)      the q numeric features (every feature of --features except the categorical ones of
+            zoo.CATEGORICAL: land cover, matched exactly, and the two soil classes, not matched;
+            q = 6 on data/processed_v4, docs/TASK-REVISED-EXPERIMENTS-2026-11-07.md D7), each
+            standardized by its mean and standard deviation (ddof 1, as pandas computes it,
+            skipping missing values) over D_OOD, all Zone A test points.
   pool      the Zone AE test points (D_ID) with all q features present; the others are dropped
-            and counted (missing values, not zeros).
+            and counted (missing values, not zeros). A Zone A point with a missing feature has no
+            z either: it is left out of every matched set and counted (n_missing, and ood_dropped
+            in the JSON; both appear only when some point is left out, which never happens on w7),
+            while the tiles of a region and its corr_te still count all of its points.
   P_C       candidates for region C: the pool points in test tiles (tile_50km) that hold no point
             of C (--exclude region-tiles, the paper's rule). --exclude own-tile drops only each
             query point's own tile, the rule of the 2026-10-25 sandbox reference, for Stop S2 of
@@ -42,7 +47,7 @@ Sets, one output row each:
   pooled          all regions together
   baseline        the Zone AE pool against itself
   reference       one-point regions: the other Zone A test points (D_OOD outside the
-                  selection), the 500 hardest points (most errors of the 60 test models, ties at
+                  selection), the 500 hardest points (most errors of the test models, ties at
                   the cut in a seeded random order), and the --classic (OODSelect) selection
   halo            Zone A test points outside the selection within 1, 2 and 3 km (straight line,
                   EPSG:3086 metres) of a region; each excludes its own tile and the tiles of
@@ -60,7 +65,7 @@ medians). These descriptive columns are not in 3.6.
 
 Also written: <out>/region_match_kinds.csv (positive and negative regions, by the majority
 label: the shares of positives among the points and their matches, the pooled unmatched share and
-eta, the strongest models' FN and FP shares of their errors, corr_te over the 60 test models
+eta, the strongest models' FN and FP shares of their errors, corr_te over the test models
 and over those below 99% training accuracy) and <out>/region_match_sensitivity.csv (eps at other
 percentiles, other match caps), and <out>/region_match.json (eps, pool counts).
 
@@ -87,9 +92,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import graph  # noqa: E402
 import oodselect_paper as op  # noqa: E402
 from regions import NLCD, point_county  # noqa: E402
+from zoo import CATEGORICAL  # noqa: E402
 
 LANDCOVER = "landcover"      # matched exactly, so not one of the numeric features
-N_NUMERIC = 6                # q in the paper
 MAX_MATCHES = 5
 CALIPER_PCT = 95.0           # 5% of Zone AE points unmatched, after Stuart (2010)
 MIN_REGION = 20              # c in the paper
@@ -107,13 +112,15 @@ COUNTIES = Path("data/interim/gis/counties_FL.parquet")
 
 # ------------------------------------------------------------------ inputs
 def numeric_features(path: str | Path) -> list[str]:
-    """The model inputs of FEATURES.txt except land cover; there must be N_NUMERIC of them."""
+    """The numeric features of FEATURES.txt, in file order (q of them): every feature except the
+    categorical ones (zoo.CATEGORICAL). Land cover is matched exactly instead; the soil classes
+    are not matched."""
     names = [line.strip() for line in Path(path).read_text().splitlines()
              if line.strip() and not line.startswith("#")]
-    numeric = [n for n in names if n != LANDCOVER]
-    if LANDCOVER not in names or len(numeric) != N_NUMERIC:
-        raise SystemExit(f"{path}: expected landcover and {N_NUMERIC} numeric features, got "
-                         f"{names}")
+    numeric = [n for n in names if n not in CATEGORICAL]
+    if LANDCOVER not in names or not numeric or len(set(names)) != len(names):
+        raise SystemExit(f"{path}: expected landcover, at least one numeric feature and no "
+                         f"repeats, got {names}")
     return numeric
 
 
@@ -281,6 +288,8 @@ def set_row(name: str, kind: str, q: dict, idx: np.ndarray, dist: np.ndarray,
                pos_points=float(np.mean(q["y"])) if n else np.nan,
                pos_matched=float(np.mean(q["y"][matched])) if n_matched else np.nan,
                fn_share15=q["fn15"] / max(q["fn15"] + q["fp15"], 1))
+    if q.get("n_missing"):
+        row["n_missing"] = int(q["n_missing"])
     if not n_matched:
         return row
     m_idx, m_dist = idx[matched], dist[matched]
@@ -330,8 +339,8 @@ def load_inputs(a) -> dict:
     strong = strongest_test_models(cell.models)
     complete = idd[features].notna().all(axis=1).to_numpy()
     missing = {f: int(idd[f].isna().sum()) for f in features if idd[f].isna().any()}
-    if ood[features].isna().any().any():
-        raise SystemExit("Zone A test points with a missing feature: they cannot be matched")
+    ood_complete = ood[features].notna().all(axis=1).to_numpy()
+    ood_missing = {f: int(ood[f].isna().sum()) for f in features if ood[f].isna().any()}
     tiles = sorted(set(ood.tile_50km) | set(idd.tile_50km))
     code = {t: i for i, t in enumerate(tiles)}
     keep = np.flatnonzero(complete)
@@ -345,18 +354,29 @@ def load_inputs(a) -> dict:
                 acc15=Z_id[strong][:, keep].mean(0), Z15_pool=Z_id[strong][:, keep],
                 hand=pool_df.hand.to_numpy(float),
                 river_m=pool_df.meta_dist_to_river_m.to_numpy(float), strong=strong,
-                n_id=len(idd), n_dropped=int((~complete).sum()), missing=missing)
+                n_id=len(idd), n_dropped=int((~complete).sum()), missing=missing,
+                ood_complete=ood_complete, ood_missing=ood_missing)
+
+
+def complete_rows(ctx: dict, rows: np.ndarray) -> np.ndarray:
+    """The OOD columns among rows whose point has every numeric feature, in their order."""
+    rows = np.asarray(rows, int)
+    return rows[ctx["ood_complete"][rows]]
 
 
 def queries(ctx: dict, rows: np.ndarray) -> dict:
-    """The query arrays of the Zone A test points at the given OOD columns."""
+    """The query arrays of the Zone A test points at the given OOD columns; a point with a
+    missing feature is left out and counted in n_missing."""
+    all_rows = np.asarray(rows, int)
+    rows = complete_rows(ctx, all_rows)
     ood = ctx["ood"].iloc[rows]
     y = ood.label.to_numpy()
     wrong = ctx["Z_ood"][ctx["strong"]][:, rows] == 0
     return dict(z=ctx["ood_z"][rows], y=y, landcover=ood[LANDCOVER].to_numpy(),
                 acc15=ctx["ood_acc15"][rows], hand=ood.hand.to_numpy(float),
                 river_m=ood.meta_dist_to_river_m.to_numpy(float), tile=ctx["ood_tile"][rows],
-                fn15=int((wrong & (y == 1)).sum()), fp15=int((wrong & (y == 0)).sum()))
+                fn15=int((wrong & (y == 1)).sum()), fp15=int((wrong & (y == 0)).sum()),
+                n_missing=len(all_rows) - len(rows))
 
 
 def pool_queries(ctx: dict) -> dict:
@@ -378,12 +398,15 @@ def selection_rows(ctx: dict, points: pd.DataFrame) -> np.ndarray:
 
 
 def regions_of(ctx: dict, points: pd.DataFrame, min_size: int, names: dict) -> list[dict]:
-    """Each region (component of >= min_size points): its name, OOD columns and tile codes."""
+    """Each region (component of >= min_size points): its name, the OOD columns of its points
+    with every feature (rows, the queries) and of all its points (all_rows), and the tile codes
+    of all its points."""
     out = []
     for comp, g in points[points.component_size >= min_size].groupby("component", sort=True):
-        rows = selection_rows(ctx, g)
-        out.append(dict(component=int(comp), name=region_name(g, names), rows=rows,
-                        tiles=np.unique(ctx["ood_tile"][rows]),
+        all_rows = selection_rows(ctx, g)
+        out.append(dict(component=int(comp), name=region_name(g, names),
+                        rows=complete_rows(ctx, all_rows), all_rows=all_rows,
+                        tiles=np.unique(ctx["ood_tile"][all_rows]),
                         tile_names=" ".join(sorted(set(g.tile_50km.astype(str))))))
     return out
 
@@ -398,7 +421,7 @@ def region_exclusion(ctx: dict, region: dict, rule: str) -> np.ndarray:
 
 
 def hardest_rows(ctx: dict, n: int = N_HARDEST, seed: int = 0) -> np.ndarray:
-    """The n Zone A points the 60 test models get wrong most often; ties at the cut in a seeded
+    """The n Zone A points the test models get wrong most often; ties at the cut in a seeded
     random order (report_paper.py averages over random orders instead)."""
     _, _, test = op.model_split(ctx["Z_ood"].shape[0])
     score = 1.0 - ctx["Z_ood"][test].mean(0)
@@ -411,7 +434,7 @@ def halo_sets(ctx: dict, regions: list[dict], selected: np.ndarray, rule: str):
     each HALO_KM of a region; each excludes its own tile and, under region-tiles, the tiles of
     every region it is near."""
     xy = graph.project(ctx["ood"].lon.to_numpy(), ctx["ood"].lat.to_numpy())
-    outside = np.flatnonzero(~selected)
+    outside = np.flatnonzero(~selected & ctx["ood_complete"])
     near = {}
     for region in regions:
         d, _ = cKDTree(xy[region["rows"]]).query(xy[outside], k=1)
@@ -434,29 +457,32 @@ def halo_sets(ctx: dict, regions: list[dict], selected: np.ndarray, rule: str):
 
 def kinds_table(ctx: dict, regions: list[dict], idx_by_comp: dict) -> pd.DataFrame:
     """Positive and negative regions (majority label): the strongest models' FN and FP shares
-    of their errors, corr_te over the 60 test models and over those below INTERPOLATES training
-    accuracy, and the pooled unmatched share and eta."""
+    of their errors, corr_te over the test models and over those below INTERPOLATES training
+    accuracy (all region points), and the pooled unmatched share and eta (the points with every
+    feature)."""
     _, _, test = op.model_split(ctx["Z_ood"].shape[0])
     models = ctx["cell"].models
     held_out = test[models.acc_train_sub.to_numpy()[test] < INTERPOLATES]
     y = ctx["ood"].label.to_numpy()
     rows = []
     for kind in ("positive", "negative"):
-        members = [r for r in regions if (y[r["rows"]].mean() >= 0.5) == (kind == "positive")]
+        members = [r for r in regions
+                   if (y[r["all_rows"]].mean() >= 0.5) == (kind == "positive")]
         if not members:
             continue
-        cols = np.concatenate([r["rows"] for r in members])
+        cols = np.concatenate([r["rows"] for r in members])           # matched queries
+        every = np.concatenate([r["all_rows"] for r in members])      # all region points
         idx = np.concatenate([idx_by_comp[r["component"]] for r in members])
         mask = np.zeros(len(y), bool)
-        mask[cols] = True
-        wrong = ctx["Z_ood"][ctx["strong"]][:, cols] == 0
-        fn = int((wrong & (y[cols] == 1)).sum())
-        fp = int((wrong & (y[cols] == 0)).sum())
-        S = len(cols)
+        mask[every] = True
+        wrong = ctx["Z_ood"][ctx["strong"]][:, every] == 0
+        fn = int((wrong & (y[every] == 1)).sum())
+        fp = int((wrong & (y[every] == 0)).sum())
+        S = len(every)
         rows.append(dict(
             kind=kind, regions=len(members), points=S,
             names=", ".join(r["name"] for r in members),
-            pos_points=float(y[cols].mean()),
+            pos_points=float(y[every].mean()),
             unmatched=float((idx[:, 0] < 0).mean()), eta=eta(y[cols], idx, ctx["pool"].y),
             pos_matches=float(np.nanmean(match_means(ctx["pool"].y.astype(float), idx))),
             errors15=fn + fp, fn_share=fn / max(fn + fp, 1), fp_share=fp / max(fn + fp, 1),
@@ -485,6 +511,10 @@ def run(a) -> dict:
           f"{int((~np.isfinite(nearest)).sum())} with no candidate in their class")
     print(f"caliper eps = {eps:.4f} standardized units ({a.caliper_pct:g}th percentile of the "
           f"nearest-candidate distance); exclusion rule {a.exclude}; at most {k} matches")
+    n_ood_dropped = int((~ctx["ood_complete"]).sum())
+    if n_ood_dropped:
+        print(f"Zone A test points left out for a missing feature: {n_ood_dropped:,} of "
+              f"{len(ctx['ood']):,} ({ctx['ood_missing']})")
 
     rows = []
     idx_b, dist_b = match(pool, pool.z, pool.landcover, own, self_index, k=k, eps=eps)
@@ -498,6 +528,7 @@ def run(a) -> dict:
     region_rows = []
     for region in regions:
         q = queries(ctx, region["rows"])
+        q["n_missing"] = len(region["all_rows"]) - len(region["rows"])
         idx, dist = match(pool, q["z"], q["landcover"], region_exclusion(ctx, region, a.exclude),
                           k=k, eps=eps)
         idx_by_comp[region["component"]], dist_by_comp[region["component"]] = idx, dist
@@ -507,6 +538,7 @@ def run(a) -> dict:
     if regions:
         # Each region keeps its own exclusions; the pooled row only stacks the matches.
         q = queries(ctx, np.concatenate([r["rows"] for r in regions]))
+        q["n_missing"] = sum(len(r["all_rows"]) - len(r["rows"]) for r in regions)
         idx = np.concatenate([idx_by_comp[r["component"]] for r in regions])
         dist = np.concatenate([dist_by_comp[r["component"]] for r in regions])
         rows.append(set_row(f"All regions ({len(regions)})", "pooled", q, idx, dist, ctx))
@@ -533,6 +565,7 @@ def run(a) -> dict:
         label = str(extra.variant.iloc[0]) if "variant" in extra else Path(path).stem
         for region in regions_of(ctx, extra, a.min_size, names):
             q = queries(ctx, region["rows"])
+            q["n_missing"] = len(region["all_rows"]) - len(region["rows"])
             idx, dist = match(pool, q["z"], q["landcover"],
                               region_exclusion(ctx, region, a.exclude), k=k, eps=eps)
             row = set_row(f"{label}: {region['name']}", "extra_region", q, idx, dist, ctx)
@@ -551,6 +584,9 @@ def run(a) -> dict:
                    strongest=ctx["strong"].tolist(),
                    standardization=dict(mean=ctx["mean"].round(6).to_dict(),
                                         sd=ctx["sd"].round(6).to_dict()))
+    if not ctx["ood_complete"].all():
+        summary.update(ood_points=len(ctx["ood"]), ood_dropped=int((~ctx["ood_complete"]).sum()),
+                       ood_missing=ctx["ood_missing"])
     return dict(table=table, kinds=kinds, sensitivity=sensitivity, summary=summary)
 
 
