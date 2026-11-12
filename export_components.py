@@ -64,10 +64,13 @@ DICTIONARY = [
              "points."),
     ("label", "1 = inside a FEMA Zone A polygon (a sampled positive); 0 = a negative sampled 500 m to 5 km outside "
               "any mapped 1% annual chance floodplain."),
-    ("fema_polygon_id", "FLD_AR_ID of the National Flood Hazard Layer flood-hazard polygon the point was sampled "
-                        "from (for a negative: the polygon whose 500 m to 5 km band produced it)."),
-    ("dfirm_id", "DFIRM_ID of the FEMA flood insurance rate map database the polygon belongs to."),
-    ("county, county_fips", "The county the point lies in (Census TIGER county polygons) and its 5-digit FIPS code."),
+    ("fema_polygon_id", "FLD_AR_ID of the National Flood Hazard Layer flood-hazard polygon a positive (label 1) was "
+                        "sampled inside; empty for a negative (label 0), which lies outside every floodplain."),
+    ("dfirm_id", "DFIRM_ID of the FEMA flood map database of that polygon (for a negative: of the Zone A polygon "
+                 "whose 500 m to 5 km band produced it)."),
+    ("county, county_fips", "The county the point lies in (Census TIGER county polygons) and its 5-digit FIPS code. "
+                            "For about 14% of negatives this differs from the county of their dfirm_id, the map "
+                            "of the polygon they were sampled around."),
     ("tile_50km", "The 50 km tile of the train/test split, '<i>_<j>' = floor(x_5070 / 50,000)_floor(y_5070 / 50,000)."),
     ("landcover", "NLCD 2021 land cover class code of the 30 m cell holding the point (one-hot encoded for the "
                   "models); landcover_name is the NLCD legend name."),
