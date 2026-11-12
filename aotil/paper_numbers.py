@@ -689,8 +689,12 @@ def checks(R) -> list[tuple[str, bool, str]]:
     add("run settings are the paper's (T, steps, patience, k, c, mu, seed, S, penalty)", not diff,
         "; ".join(f"{k}: run {a} vs paper {b}" for k, (a, b) in diff.items()) or "all equal")
     git = man.get("git", {})
-    add("the run's code was committed (no uncommitted change)", not git.get("dirty_files"),
-        f"commit {git.get('commit', '?')[:10]}; uncommitted: {', '.join(git.get('dirty_files', [])[:8]) or 'none'}")
+    inv = man.get("invocations", [])
+    commits = sorted({i["commit"][:10] for i in inv}) or [git.get("commit", "?")[:10]]
+    dirty = sorted({f for i in inv for f in i.get("dirty_files", [])} | set(git.get("dirty_files", [])))
+    add("the run's code was committed (no uncommitted code change in any invocation)", not dirty,
+        f"commit(s) {', '.join(commits)}; uncommitted: {', '.join(dirty[:8]) or 'none'}")
+    add("every invocation of the run used the same commit", len(commits) == 1, ", ".join(commits))
     z = R.get("zoo")
     if z:
         add("zoo: kept + degenerate + duplicate + unusable = settings",

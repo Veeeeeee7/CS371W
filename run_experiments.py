@@ -145,7 +145,10 @@ def git_info() -> dict:
             return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=True).stdout
         except Exception:
             return ""
-    dirty = [line[3:] for line in run("status", "--porcelain").splitlines() if line.strip()]
+    # Uncommitted code: modified tracked files, and untracked Python or shell files (not docs or outputs).
+    dirty = [line[3:] for line in run("status", "--porcelain", "--untracked-files=no").splitlines() if line.strip()]
+    dirty += [line[3:] for line in run("status", "--porcelain").splitlines()
+              if line.startswith("??") and line.rstrip().endswith((".py", ".sh"))]
     return dict(commit=run("rev-parse", "HEAD").strip(), branch=run("rev-parse", "--abbrev-ref", "HEAD").strip(),
                 dirty_files=dirty)
 
@@ -192,13 +195,19 @@ class Run:
                              analyzed="GTV + smoothing, mu 3, S 500")
         self.path = self.out / "manifest.json"
         self.manifest = json.loads(self.path.read_text()) if self.path.exists() else {}
+        self.git = git_info()                  # the code of this invocation, read once at its start
+        self.started = dt.datetime.now().isoformat(timespec="seconds")
 
     def save(self, **updates) -> None:
         m = self.manifest
         m.setdefault("run", str(self.out))
         m.setdefault("created", dt.datetime.now().isoformat(timespec="seconds"))
         m["updated"] = dt.datetime.now().isoformat(timespec="seconds")
-        m["git"] = git_info()
+        m["git"] = self.git
+        runs = m.setdefault("invocations", [])
+        if not runs or runs[-1].get("started") != self.started:
+            runs.append(dict(started=self.started, commit=self.git["commit"], dirty_files=self.git["dirty_files"],
+                             argv=sys.argv[1:]))
         m["settings"] = self.settings
         m["packages"] = versions()
         m["machine"] = dict(platform=platform.platform(), processor=platform.processor(), cpus=os.cpu_count())
